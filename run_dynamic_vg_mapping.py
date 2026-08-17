@@ -244,9 +244,9 @@ def main():
     video_view_matrix, video_proj_matrix = None, None
     if args.save_video and HAS_PYBULLET:
         video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.25, 0.0, 0.3],
-            distance=1.4,
-            yaw=50,
+            cameraTargetPosition=[0.15, 0.0, 0.25],
+            distance=1.6,
+            yaw=45,
             pitch=-30,
             roll=0,
             upAxisIndex=2
@@ -403,10 +403,12 @@ def main():
                     num_iterations=50
                 )
 
-                # Sync with PyBullet
+                # Sync with PyBullet applying delta to initial position
+                initial_cube_pos = [0.35, 0.0, 0.025]
                 pipeline.step_4_sync_pybullet_physics(
                     pybullet_body_id=cube_body_id if cube_body_id is not None else 1,
-                    T_fine=T_fine
+                    T_fine=T_fine,
+                    initial_position=initial_cube_pos
                 )
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
@@ -429,7 +431,7 @@ def main():
         if HAS_PYBULLET:
             p.stepSimulation()
 
-            # Record frame if requested
+            # Record frame if requested (with 2 simulation sub-steps for smooth video)
             if args.save_video and video_view_matrix is not None:
                 img_data = p.getCameraImage(
                     width=640,
@@ -438,7 +440,6 @@ def main():
                     projectionMatrix=video_proj_matrix,
                     renderer=p.ER_TINY_RENDERER
                 )
-                # img_data[2] is (480, 640, 4) uint8 RGBA array
                 frame_rgb = np.array(img_data[2], dtype=np.uint8)[:, :, :3]
                 recorded_frames.append(frame_rgb)
 

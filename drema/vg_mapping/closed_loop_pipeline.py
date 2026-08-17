@@ -134,9 +134,14 @@ class DREMAClosedLoopVGMappingPipeline:
         )
         return T_fine
 
-    def step_4_sync_pybullet_physics(self, pybullet_body_id: int, T_fine: torch.Tensor):
+    def step_4_sync_pybullet_physics(
+        self,
+        pybullet_body_id: int,
+        T_fine: torch.Tensor,
+        initial_position: Optional[Tuple[float, float, float]] = None
+    ):
         """
-        Step 4: Update PyBullet rigid body pose directly with T_fine = (R_fine, t_fine).
+        Step 4: Update PyBullet rigid body pose by applying estimated delta T_fine to initial world pose.
         """
         if self.p is None:
             print(f"[Warning] PyBullet client not attached. Computed T_fine:\n{T_fine}")
@@ -145,8 +150,14 @@ class DREMAClosedLoopVGMappingPipeline:
         R_fine = T_fine[:3, :3]
         t_fine = T_fine[:3, 3]
 
-        quat = rotation_matrix_to_quaternion(R_fine)
-        pos = (float(t_fine[0]), float(t_fine[1]), float(t_fine[2]))
+        if initial_position is not None:
+            init_pos_tensor = torch.tensor(initial_position, dtype=torch.float32, device=T_fine.device)
+            pos_world = init_pos_tensor + t_fine
+            quat = rotation_matrix_to_quaternion(R_fine)
+            pos = (float(pos_world[0]), float(pos_world[1]), float(pos_world[2]))
+        else:
+            quat = rotation_matrix_to_quaternion(R_fine)
+            pos = (float(t_fine[0]), float(t_fine[1]), float(t_fine[2]))
 
         self.p.resetBasePositionAndOrientation(pybullet_body_id, pos, quat)
-        print(f"✓ PyBullet body ID {pybullet_body_id} synced to pos: {pos}, quat: {quat}")
+        print(f"✓ PyBullet body ID {pybullet_body_id} synced to pos: ({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}), quat: ({quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f})")
