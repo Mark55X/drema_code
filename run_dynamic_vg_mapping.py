@@ -153,13 +153,28 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
-    device = args.device
+    
+    # Device Resolution and Diagnostics
+    if args.device == "cuda" and not torch.cuda.is_available():
+        print("⚠️ [WARNING] CUDA was requested via --device cuda, but torch.cuda.is_available() is False! Falling back to CPU.")
+        device = "cpu"
+    else:
+        device = args.device
 
     print("=" * 70)
     print(" DREMA Dynamic VG-Mapping & RecurGS SE(3) Closed-Loop Runner")
     print("=" * 70)
     print(f"Dataset Path : {args.gs_data_path}")
-    print(f"Device       : {device}")
+    
+    if device.startswith("cuda") and torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
+        vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 2)
+        print(f"Hardware Acc : GPU CUDA ACTIVE ✓ [{gpu_name}]")
+        print(f"VRAM Info    : Total {vram_total:.2f} GB | Currently Allocated: {vram_alloc:.2f} MB")
+    else:
+        print(f"Hardware Acc : CPU (No GPU acceleration)")
+
     print(f"Voxel Size   : {args.voxel_size} m | Grid: {args.grid_dim} | Origin: {args.origin}")
 
     # Discover and sort timesteps
@@ -257,6 +272,7 @@ def main():
         # ---------------------------------------------------------
         # STEP 1: Ingest multi-view Depth into TSDF Voxel Map
         # ---------------------------------------------------------
+        t_ingest_start = time.time()
         for obs in observations:
             pipeline.step_1_ingest_frame(
                 rgb=obs['rgb'],
@@ -264,11 +280,14 @@ def main():
                 intrinsic=obs['K'],
                 camera_pose=obs['pose']
             )
+        t_ingest_ms = (time.time() - t_ingest_start) * 1000.0
 
         # ---------------------------------------------------------
         # STEP 2: Online Mapping (VDC initialization & Morton pruning)
         # ---------------------------------------------------------
+        t_vdc_start = time.time()
         new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc = [], [], [], []
+        total_pruned = 0
         
         for obs in observations:
             # Simple rendered placeholder or point-splatted render
@@ -287,6 +306,7 @@ def main():
 
             # Apply pruning
             if len(prune_mask) > 0 and torch.any(prune_mask):
+                total_pruned += prune_mask.sum().item()
                 keep_mask = ~prune_mask
                 for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
                     scene_gaussians[k] = scene_gaussians[k][keep_mask]
@@ -298,6 +318,7 @@ def main():
                 new_morton_acc.append(new_g['morton'])
 
         # Concatenate newly initialized Gaussians
+        num_added = 0
         if len(new_xyz_acc) > 0:
             added_xyz = torch.cat(new_xyz_acc, dim=0)
             added_rgb = torch.cat(new_rgb_acc, dim=0)
@@ -310,30 +331,43 @@ def main():
             scene_gaussians['scale'] = torch.cat([scene_gaussians['scale'], added_scale], dim=0)
             scene_gaussians['morton'] = torch.cat([scene_gaussians['morton'], added_morton], dim=0)
             scene_gaussians['obj_id'] = torch.cat([scene_gaussians['obj_id'], added_obj_id], dim=0)
+            num_added = len(added_xyz)
 
-        print(f"  • Total scene Gaussians: {len(scene_gaussians['xyz'])}")
+        t_vdc_ms = (time.time() - t_vdc_start) * 1000.0
 
         # ---------------------------------------------------------
         # STEP 3 & 4: RecurGS SE(3) Motion Estimation & PyBullet Sync
         # ---------------------------------------------------------
+        t_se3_ms = 0.0
         if timestep_num > 0 and len(observations) > 0:
+            t_se3_start = time.time()
             # Primary reference camera view for pose refinement
             ref_obs = observations[0]
 
-            # If objects are segmented, perform SE(3) alignment per object
             if len(scene_gaussians['xyz']) > 0:
-                obj_subset = {
-                    'xyz': scene_gaussians['xyz'],
-                    'rgb': scene_gaussians['rgb'],
-                    'scale': scene_gaussians['scale']
-                }
+                # Subsample points for fast, robust SE(3) optimization (max 2048 points)
+                N_pts = len(scene_gaussians['xyz'])
+                if N_pts > 2048:
+                    sub_idx = torch.randperm(N_pts, device=device)[:2048]
+                    obj_subset = {
+                        'xyz': scene_gaussians['xyz'][sub_idx],
+                        'rgb': scene_gaussians['rgb'][sub_idx],
+                        'scale': scene_gaussians['scale'][sub_idx]
+                    }
+                else:
+                    obj_subset = {
+                        'xyz': scene_gaussians['xyz'],
+                        'rgb': scene_gaussians['rgb'],
+                        'scale': scene_gaussians['scale']
+                    }
 
                 T_fine = pipeline.step_3_estimate_se3_motion(
                     object_gaussians_t0=obj_subset,
                     gt_rgb_t1=ref_obs['rgb'],
                     gt_depth_t1=ref_obs['depth'],
                     intrinsic=ref_obs['K'],
-                    camera_pose=ref_obs['pose']
+                    camera_pose=ref_obs['pose'],
+                    num_iterations=50
                 )
 
                 # Sync with PyBullet
@@ -341,6 +375,7 @@ def main():
                     pybullet_body_id=1,
                     T_fine=T_fine
                 )
+            t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
         if HAS_PYBULLET and robot_body_id is not None and trajectory_data is not None:
@@ -358,7 +393,8 @@ def main():
             p.stepSimulation()
 
         t_elapsed = (time.time() - t_start) * 1000.0
-        print(f"  ✓ Timestep {timestep_num} completed in {t_elapsed:.1f} ms")
+        print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
+        print(f"  • Timing Breakdown: TSDF={t_ingest_ms:.1f}ms | VDC={t_vdc_ms:.1f}ms | SE(3)={t_se3_ms:.1f}ms | Total={t_elapsed:.1f}ms")
 
     # -------------------------------------------------------------
     # Final Surface Mesh Extraction via TSDF Marching Cubes
