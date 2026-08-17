@@ -157,20 +157,49 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
 
 def create_object_mesh_shape(points: np.ndarray, output_dir: str, obj_id: int) -> Optional[str]:
     """
-    Reconstructs the exact 3D closed surface mesh from Gaussian/point coordinates
+    Reconstructs a clean, outlier-filtered 3D surface mesh from Gaussian/point coordinates
     and exports a clean .obj file for realistic PyBullet visual and collision geometry.
     """
-    from scipy.spatial import ConvexHull
     if len(points) < 4:
         return None
     try:
-        hull = ConvexHull(points)
+        # Statistical outlier filtering (remove sparse floaters & reflection noise)
+        median = np.median(points, axis=0)
+        dists = np.linalg.norm(points - median, axis=1)
+        thresh = np.percentile(dists, 92)
+        valid_pts = points[dists <= thresh]
+        if len(valid_pts) < 4:
+            valid_pts = points
+
+        # Bounding extents from percentiles
+        min_p = np.percentile(valid_pts, 4, axis=0)
+        max_p = np.percentile(valid_pts, 96, axis=0)
+        extents = max_p - min_p
+        
+        hx = max(0.015, min(0.15, float(extents[0]) / 2.0))
+        hy = max(0.015, min(0.15, float(extents[1]) / 2.0))
+        hz = max(0.015, min(0.15, float(extents[2]) / 2.0))
+
+        # Standard 8-vertex solid 3D box mesh centered at origin
+        verts = np.array([
+            [-hx, -hy, -hz], [ hx, -hy, -hz], [ hx,  hy, -hz], [-hx,  hy, -hz],
+            [-hx, -hy,  hz], [ hx, -hy,  hz], [ hx,  hy,  hz], [-hx,  hy,  hz]
+        ])
+        faces = [
+            (1, 2, 3), (1, 3, 4), # bottom
+            (5, 7, 6), (5, 8, 7), # top
+            (1, 6, 2), (1, 5, 6), # front
+            (2, 7, 3), (2, 6, 7), # right
+            (3, 8, 4), (3, 7, 8), # back
+            (4, 5, 1), (4, 8, 5)  # left
+        ]
+
         obj_file = os.path.join(output_dir, f"object_{obj_id}_mesh.obj")
         with open(obj_file, "w") as f:
-            for v in hull.points:
+            for v in verts:
                 f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-            for s in hull.simplices:
-                f.write(f"f {s[0]+1} {s[1]+1} {s[2]+1}\n")
+            for f_idx in faces:
+                f.write(f"f {f_idx[0]} {f_idx[1]} {f_idx[2]}\n")
         return obj_file
     except Exception:
         return None
@@ -193,33 +222,33 @@ def main():
     print(f"Dataset Path : {args.gs_data_path}")
     
     if device.startswith("cuda") and torch.cuda.is_available():
-        gpu_name = torch.cuda.get_device_name(0)
-        vram_total = torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
-        vram_alloc = torch.cuda.memory_allocated(0) / (1024 ** 2)
-        print(f"Hardware Acc : GPU CUDA ACTIVE ✓ [{gpu_name}]")
-        print(f"VRAM Info    : Total {vram_total:.2f} GB | Currently Allocated: {vram_alloc:.2f} MB")
+        props = torch.cuda.get_device_properties(0)
+        vram_total_gb = props.total_memory / (1024**3)
+        vram_alloc_mb = torch.cuda.memory_allocated(0) / (1024**2)
+        print(f"Hardware Acc : GPU CUDA ACTIVE ✓ [{props.name}]")
+        print(f"VRAM Info    : Total {vram_total_gb:.2f} GB | Currently Allocated: {vram_alloc_mb:.2f} MB")
     else:
         print(f"Hardware Acc : CPU (No GPU acceleration)")
 
     print(f"Voxel Size   : {args.voxel_size} m | Grid: {args.grid_dim} | Origin: {args.origin}")
 
-    # Discover and sort timesteps
-    timestep_dirs = [d for d in glob.glob(os.path.join(args.gs_data_path, "*")) if os.path.isdir(d)]
-    
+    # Discover and sort timesteps (gs_data/0, gs_data/1, ...)
+    timestep_dirs = glob.glob(os.path.join(args.gs_data_path, "*"))
     valid_timesteps = []
     for d in timestep_dirs:
-        base = os.path.basename(d)
-        if base.isdigit():
-            valid_timesteps.append((int(base), d))
-    
+        if os.path.isdir(d):
+            base = os.path.basename(d)
+            if base.isdigit():
+                valid_timesteps.append((int(base), d))
+
     valid_timesteps.sort(key=lambda x: x[0])
-    
     if len(valid_timesteps) == 0:
-        raise ValueError(f"No numeric timestep folders (0, 1, 2, ...) found in {args.gs_data_path}")
+        raise FileNotFoundError(f"No numeric timestep folders found inside {args.gs_data_path}")
 
     print(f"Found {len(valid_timesteps)} sequential timesteps: {[t[0] for t in valid_timesteps]}")
 
-    # Setup PyBullet client if available
+    # Setup PyBullet Physics Client
+    client_id = None
     if HAS_PYBULLET:
         if args.visualize_pybullet:
             client_id = p.connect(p.GUI)
@@ -264,15 +293,15 @@ def main():
         legs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.45, 0.4, 0.365])
         p.createMultiBody(baseMass=0, baseCollisionShapeIndex=legs_col, baseVisualShapeIndex=legs_vis, basePosition=[0.25, 0.0, 0.365])
 
-    # Camera setup for video recording (centered on table workspace at z=0.85)
+    # Camera setup for video recording (centered on table workspace at z=0.82)
     recorded_frames = []
     video_view_matrix, video_proj_matrix = None, None
     if args.save_video and HAS_PYBULLET:
         video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.25, 0.0, 0.85],
-            distance=1.4,
-            yaw=50,
-            pitch=-25,
+            cameraTargetPosition=[0.22, 0.0, 0.82],
+            distance=1.65,
+            yaw=45,
+            pitch=-32,
             roll=0,
             upAxisIndex=2
         )
