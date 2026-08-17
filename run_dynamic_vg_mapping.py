@@ -277,6 +277,36 @@ def main():
     # Tracking object dictionary {obj_label_id: {'pybullet_id': id, 'initial_xyz': ...}}
     tracked_objects = {}
 
+    # Target Object IDs to track (filter out robot links, table, sensors, background)
+    target_object_ids = set()
+    labels_file = args.labels_file
+    if labels_file is None:
+        candidates = [
+            os.path.join(args.gs_data_path, "labels.txt"),
+            os.path.join(args.gs_data_path, "..", "labels.txt"),
+            os.path.join(args.gs_data_path, "..", "..", "labels.txt")
+        ]
+        for c in candidates:
+            if os.path.exists(c):
+                labels_file = c
+                break
+
+    if labels_file and os.path.exists(labels_file):
+        with open(labels_file, "r") as f:
+            for line in f.read().splitlines():
+                if ";" in line:
+                    parts = line.split(";")
+                    if len(parts) >= 2 and parts[1].strip().isdigit():
+                        name, num = parts[0].strip(), int(parts[1].strip())
+                        name_lower = name.lower()
+                        is_robot_or_bg = any(kw in name_lower for kw in [
+                            "panda", "link", "finger", "hand", "joint", "table", "floor", "wall",
+                            "pillar", "sensor", "success", "camera", "head"
+                        ])
+                        if not is_robot_or_bg:
+                            target_object_ids.add(num)
+                            print(f"✓ Target object to track from labels.txt: '{name}' (ID: {num})")
+
     total_start_time = time.time()
 
     # -------------------------------------------------------------
@@ -374,20 +404,35 @@ def main():
             t_se3_start = time.time()
             ref_obs = observations[0]
 
-            # Discover all distinct dynamic objects in the scene (obj_id > 1)
+            # Discover target dynamic objects in the scene
             unique_ids = torch.unique(scene_gaussians['obj_id'])
-            dynamic_obj_ids = [int(oid.item()) for oid in unique_ids if oid.item() > 1]
+            
+            if len(target_object_ids) > 0:
+                dynamic_obj_ids = [int(oid.item()) for oid in unique_ids if int(oid.item()) in target_object_ids]
+            else:
+                # Filter out robot / background by spatial bounding box on table
+                dynamic_obj_ids = []
+                for oid in unique_ids:
+                    val = int(oid.item())
+                    if val <= 1:
+                        continue
+                    pts = scene_gaussians['xyz'][scene_gaussians['obj_id'] == val]
+                    if len(pts) > 0:
+                        c = pts.mean(dim=0)
+                        # Workspace table bounding box
+                        if 0.1 <= c[0] <= 0.65 and -0.45 <= c[1] <= 0.45 and 0.005 <= c[2] <= 0.35:
+                            dynamic_obj_ids.append(val)
 
-            # Fallback if no semantic IDs: track foreground workspace cluster
+            # Fallback if no target IDs: track foreground workspace cluster
             if len(dynamic_obj_ids) == 0:
                 xyz_all = scene_gaussians['xyz']
-                fg_mask = (xyz_all[:, 2] > 0.005) & (xyz_all[:, 0] > 0.1) & (xyz_all[:, 0] < 0.6)
+                fg_mask = (xyz_all[:, 2] > 0.005) & (xyz_all[:, 0] > 0.1) & (xyz_all[:, 0] < 0.65) & (xyz_all[:, 1] > -0.45) & (xyz_all[:, 1] < 0.45)
                 if torch.any(fg_mask):
                     dynamic_obj_ids = [-1]
 
             for oid in dynamic_obj_ids:
                 if oid == -1:
-                    obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.6)
+                    obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.65) & (scene_gaussians['xyz'][:, 1] > -0.45) & (scene_gaussians['xyz'][:, 1] < 0.45)
                 else:
                     obj_mask = (scene_gaussians['obj_id'] == oid)
 
