@@ -86,7 +86,8 @@ class DREMAClosedLoopVGMappingPipeline:
         rendered_depth: torch.Tensor,
         intrinsic: torch.Tensor,
         camera_pose: torch.Tensor,
-        current_morton_codes: torch.Tensor
+        current_morton_codes: torch.Tensor,
+        mask: Optional[torch.Tensor] = None
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Step 2: Variation detection & Morton code raycast pruning.
@@ -107,7 +108,8 @@ class DREMAClosedLoopVGMappingPipeline:
             rendered_depth=rendered_depth,
             intrinsic=intrinsic,
             pose=camera_pose,
-            tsdf_map=self.tsdf_map
+            tsdf_map=self.tsdf_map,
+            mask_obs=mask
         )
 
         return new_gaussians, prune_mask

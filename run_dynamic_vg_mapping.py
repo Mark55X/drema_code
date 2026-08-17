@@ -228,16 +228,11 @@ def main():
             robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
             print(f"✓ Franka Panda robot loaded in PyBullet (ID: {robot_body_id})")
 
-    # Spawn Workspace Table & Visual Moving Cube in PyBullet
-    cube_body_id = None
+    # Spawn Workspace Table in PyBullet
     if HAS_PYBULLET:
-        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
-        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.02])
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.3, 0.0, -0.02])
-
-        cube_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.025, 0.025, 0.025], rgbaColor=[0.9, 0.15, 0.15, 1.0])
-        cube_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.025, 0.025, 0.025])
-        cube_body_id = p.createMultiBody(baseMass=0.1, baseCollisionShapeIndex=cube_col, baseVisualShapeIndex=cube_vis, basePosition=[0.35, 0.0, 0.03])
+        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
+        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.25, 0.0, -0.02])
 
     # Camera setup for video recording (centered on robot workspace)
     recorded_frames = []
@@ -319,11 +314,10 @@ def main():
         # STEP 2: Online Mapping (VDC initialization & Morton pruning)
         # ---------------------------------------------------------
         t_vdc_start = time.time()
-        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc = [], [], [], []
+        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
         total_pruned = 0
         
         for obs in observations:
-            # Simple rendered placeholder or point-splatted render
             rendered_rgb = obs['rgb'].clone()
             rendered_depth = obs['depth'].clone()
 
@@ -334,7 +328,8 @@ def main():
                 rendered_depth=rendered_depth,
                 intrinsic=obs['K'],
                 camera_pose=obs['pose'],
-                current_morton_codes=scene_gaussians['morton']
+                current_morton_codes=scene_gaussians['morton'],
+                mask=obs['mask']
             )
 
             # Apply pruning
@@ -349,6 +344,7 @@ def main():
                 new_rgb_acc.append(new_g['rgb'])
                 new_scale_acc.append(new_g['scale'])
                 new_morton_acc.append(new_g['morton'])
+                new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=device)))
 
         # Concatenate newly initialized Gaussians
         num_added = 0
@@ -357,7 +353,7 @@ def main():
             added_rgb = torch.cat(new_rgb_acc, dim=0)
             added_scale = torch.cat(new_scale_acc, dim=0)
             added_morton = torch.cat(new_morton_acc, dim=0)
-            added_obj_id = torch.zeros(len(added_xyz), dtype=torch.int32, device=device)
+            added_obj_id = torch.cat(new_obj_id_acc, dim=0)
 
             scene_gaussians['xyz'] = torch.cat([scene_gaussians['xyz'], added_xyz], dim=0)
             scene_gaussians['rgb'] = torch.cat([scene_gaussians['rgb'], added_rgb], dim=0)
@@ -369,31 +365,74 @@ def main():
         t_vdc_ms = (time.time() - t_vdc_start) * 1000.0
 
         # ---------------------------------------------------------
-        # STEP 3 & 4: RecurGS SE(3) Motion Estimation & PyBullet Sync
+        # STEP 3 & 4: RecurGS SE(3) Multi-Object Motion Estimation & PyBullet Sync
         # ---------------------------------------------------------
         t_se3_ms = 0.0
         if timestep_num > 0 and len(observations) > 0:
             t_se3_start = time.time()
-            # Primary reference camera view for pose refinement
             ref_obs = observations[0]
 
-            if len(scene_gaussians['xyz']) > 0:
-                # Subsample points for fast, robust SE(3) optimization (max 2048 points)
-                N_pts = len(scene_gaussians['xyz'])
-                if N_pts > 2048:
-                    sub_idx = torch.randperm(N_pts, device=device)[:2048]
+            # Discover all distinct dynamic objects in the scene (obj_id > 1)
+            unique_ids = torch.unique(scene_gaussians['obj_id'])
+            dynamic_obj_ids = [int(oid.item()) for oid in unique_ids if oid.item() > 1]
+
+            # Fallback if no semantic IDs: track foreground workspace cluster
+            if len(dynamic_obj_ids) == 0:
+                xyz_all = scene_gaussians['xyz']
+                fg_mask = (xyz_all[:, 2] > 0.005) & (xyz_all[:, 0] > 0.1) & (xyz_all[:, 0] < 0.6)
+                if torch.any(fg_mask):
+                    dynamic_obj_ids = [-1]
+
+            for oid in dynamic_obj_ids:
+                if oid == -1:
+                    obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.6)
+                else:
+                    obj_mask = (scene_gaussians['obj_id'] == oid)
+
+                if not torch.any(obj_mask):
+                    continue
+
+                obj_xyz = scene_gaussians['xyz'][obj_mask]
+                obj_rgb = scene_gaussians['rgb'][obj_mask]
+                obj_scale = scene_gaussians['scale'][obj_mask]
+
+                # Dynamically register newly discovered object in PyBullet
+                if HAS_PYBULLET and oid not in tracked_objects:
+                    init_pos = obj_xyz.mean(dim=0).cpu().tolist()
+                    avg_color = obj_rgb.mean(dim=0).cpu().tolist() + [1.0] if len(obj_rgb) > 0 else [0.2, 0.6, 0.9, 1.0]
+                    
+                    # Estimate bounding box extents from Gaussians
+                    extents = (obj_xyz.max(dim=0)[0] - obj_xyz.min(dim=0)[0]).cpu().tolist()
+                    half_extents = [max(0.015, min(0.15, e / 2.0)) for e in extents]
+
+                    obj_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=avg_color)
+                    obj_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+                    body_id = p.createMultiBody(baseMass=0.1, baseCollisionShapeIndex=obj_col, baseVisualShapeIndex=obj_vis, basePosition=init_pos)
+                    
+                    tracked_objects[oid] = {
+                        'pybullet_id': body_id,
+                        'initial_pos': init_pos,
+                        'color': avg_color
+                    }
+                    print(f"✓ Discovered object ID {oid}: spawned in PyBullet (Body ID: {body_id}, Pos: {init_pos})")
+
+                # Subsample object Gaussians for fast Lie algebra SE(3) optimization
+                N_pts = len(obj_xyz)
+                if N_pts > 1024:
+                    sub_idx = torch.randperm(N_pts, device=device)[:1024]
                     obj_subset = {
-                        'xyz': scene_gaussians['xyz'][sub_idx],
-                        'rgb': scene_gaussians['rgb'][sub_idx],
-                        'scale': scene_gaussians['scale'][sub_idx]
+                        'xyz': obj_xyz[sub_idx],
+                        'rgb': obj_rgb[sub_idx],
+                        'scale': obj_scale[sub_idx]
                     }
                 else:
                     obj_subset = {
-                        'xyz': scene_gaussians['xyz'],
-                        'rgb': scene_gaussians['rgb'],
-                        'scale': scene_gaussians['scale']
+                        'xyz': obj_xyz,
+                        'rgb': obj_rgb,
+                        'scale': obj_scale
                     }
 
+                # Step 3: Lie algebra pose optimization
                 T_fine = pipeline.step_3_estimate_se3_motion(
                     object_gaussians_t0=obj_subset,
                     gt_rgb_t1=ref_obs['rgb'],
@@ -403,13 +442,16 @@ def main():
                     num_iterations=50
                 )
 
-                # Sync with PyBullet applying delta to initial position
-                initial_cube_pos = [0.35, 0.0, 0.025]
+                # Step 4: Synchronize PyBullet object pose
+                target_body_id = tracked_objects[oid]['pybullet_id'] if oid in tracked_objects else 1
+                target_init_pos = tracked_objects[oid]['initial_pos'] if oid in tracked_objects else obj_xyz.mean(dim=0).cpu().tolist()
+
                 pipeline.step_4_sync_pybullet_physics(
-                    pybullet_body_id=cube_body_id if cube_body_id is not None else 1,
+                    pybullet_body_id=target_body_id,
                     T_fine=T_fine,
-                    initial_position=initial_cube_pos
+                    initial_position=target_init_pos
                 )
+
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
