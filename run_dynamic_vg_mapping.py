@@ -66,7 +66,7 @@ def parse_args():
     parser.add_argument("--origin", type=float, nargs=3, default=[-0.64, -0.64, -0.64], help="TSDF grid origin in world coordinates")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
     parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
-    parser.add_argument("--video_fps", type=int, default=10, help="Frames per second for saved video")
+    parser.add_argument("--video_fps", type=int, default=5, help="Frames per second for saved video (default: 5 fps)")
     parser.add_argument("--output_dir", type=str, default="./output_dynamic_mapping", help="Output directory for saved meshes/logs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
     return parser.parse_args()
@@ -228,15 +228,26 @@ def main():
             robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
             print(f"✓ Franka Panda robot loaded in PyBullet (ID: {robot_body_id})")
 
-    # Camera setup for video recording
+    # Spawn Workspace Table & Visual Moving Cube in PyBullet
+    cube_body_id = None
+    if HAS_PYBULLET:
+        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
+        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.4, 0.5, 0.02])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.3, 0.0, -0.02])
+
+        cube_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.025, 0.025, 0.025], rgbaColor=[0.9, 0.15, 0.15, 1.0])
+        cube_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.025, 0.025, 0.025])
+        cube_body_id = p.createMultiBody(baseMass=0.1, baseCollisionShapeIndex=cube_col, baseVisualShapeIndex=cube_vis, basePosition=[0.35, 0.0, 0.03])
+
+    # Camera setup for video recording (centered on robot workspace)
     recorded_frames = []
     video_view_matrix, video_proj_matrix = None, None
     if args.save_video and HAS_PYBULLET:
         video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.0, 0.0, 0.25],
-            distance=1.2,
-            yaw=45,
-            pitch=-25,
+            cameraTargetPosition=[0.25, 0.0, 0.3],
+            distance=1.4,
+            yaw=50,
+            pitch=-30,
             roll=0,
             upAxisIndex=2
         )
@@ -246,7 +257,7 @@ def main():
             nearVal=0.1,
             farVal=3.5
         )
-        print("✓ Video recorder initialized (640x480 resolution).")
+        print("✓ Video recorder initialized (640x480 resolution, centered on workspace).")
 
     # Initialize DREMA Closed-Loop Pipeline
     pipeline = DREMAClosedLoopVGMappingPipeline(
@@ -394,7 +405,7 @@ def main():
 
                 # Sync with PyBullet
                 pipeline.step_4_sync_pybullet_physics(
-                    pybullet_body_id=1,
+                    pybullet_body_id=cube_body_id if cube_body_id is not None else 1,
                     T_fine=T_fine
                 )
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
