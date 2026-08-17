@@ -13,6 +13,7 @@ import sys
 import glob
 import time
 import argparse
+import pickle
 import numpy as np
 from PIL import Image
 import torch
@@ -58,6 +59,8 @@ def parse_args():
                         help="Path to the gs_data directory containing timestamp folders (0, 1, 2, ...)")
     parser.add_argument("--labels_file", type=str, default=None,
                         help="Path to labels.txt (defaults to gs_data_path/labels.txt if present)")
+    parser.add_argument("--trajectory_file", type=str, default=None,
+                        help="Path to dictionary.pkl (for Franka Panda robot joint trajectory replay in PyBullet)")
     parser.add_argument("--voxel_size", type=float, default=0.01, help="TSDF voxel grid size in meters")
     parser.add_argument("--grid_dim", type=int, nargs=3, default=[128, 128, 128], help="TSDF grid dimensions (nx ny nz)")
     parser.add_argument("--origin", type=float, nargs=3, default=[-0.64, -0.64, -0.64], help="TSDF grid origin in world coordinates")
@@ -67,12 +70,23 @@ def parse_args():
     return parser.parse_args()
 
 
+def find_existing_dir(base_folder, candidates):
+    for c in candidates:
+        p = os.path.join(base_folder, c)
+        if os.path.exists(p) and os.path.isdir(p):
+            return p
+    return os.path.join(base_folder, candidates[0])
+
+
 def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, device):
     """
     Loads RGB, Depth, Mask and Pose for a single camera view.
+    Supports .png, .jpg for images, and .npy / .png for depth.
     """
     img_path = os.path.join(images_dir, f"{view_name}.png")
-    depth_path = os.path.join(depth_dir, f"{view_name}.npy")
+    if not os.path.exists(img_path):
+        img_path = os.path.join(images_dir, f"{view_name}.jpg")
+
     mask_path = os.path.join(masks_dir, f"{view_name}.png")
     pose_path = os.path.join(poses_dir, f"{view_name}.txt")
 
@@ -81,8 +95,34 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
     rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
     rgb = torch.tensor(rgb_np, dtype=torch.float32, device=device).permute(2, 0, 1)
 
-    # Load Depth (1, H, W)
-    depth_np = np.load(depth_path).astype(np.float32)
+    # Load Depth (1, H, W) - flexible .npy / .png detection
+    depth_npy = os.path.join(depth_dir, f"{view_name}.npy")
+    depth_png = os.path.join(depth_dir, f"{view_name}.png")
+    if os.path.exists(depth_npy):
+        depth_np = np.load(depth_npy).astype(np.float32)
+    elif os.path.exists(depth_png):
+        depth_img = np.array(Image.open(depth_png))
+        if depth_img.ndim == 3 and depth_img.shape[2] >= 3:
+            # 24-bit RGB encoded RLBench / CoppeliaSim depth map
+            float_array = np.sum(depth_img[:, :, :3] * [65536, 256, 1], axis=2).astype(np.float32)
+            norm_depth = float_array / float(2**24 - 1)
+            
+            near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
+            if os.path.exists(near_far_file):
+                with open(near_far_file, "r") as f:
+                    nf_parts = f.read().strip().split()
+                    near = float(nf_parts[0])
+                    far = float(nf_parts[1])
+                depth_np = (far - near) * norm_depth + near
+            else:
+                depth_np = norm_depth * 3.0 # fallback scale
+        else:
+            depth_np = depth_img.astype(np.float32)
+            if depth_np.max() > 50.0:
+                depth_np = depth_np / 1000.0
+    else:
+        raise FileNotFoundError(f"Could not find depth file for view '{view_name}' in '{depth_dir}' (.npy or .png)")
+
     depth = torch.tensor(depth_np, dtype=torch.float32, device=device).unsqueeze(0)
 
     # Load Mask (H, W) if available
@@ -153,6 +193,24 @@ def main():
     else:
         print("[Info] PyBullet is not installed in this environment. Physics simulation sync skipped.")
 
+    # Load Robot Trajectory if provided
+    trajectory_data = None
+    robot_body_id = None
+    if args.trajectory_file:
+        if os.path.exists(args.trajectory_file):
+            with open(args.trajectory_file, "rb") as f:
+                trajectory_data = pickle.load(f)
+            print(f"✓ Loaded robot trajectory ({len(trajectory_data)} steps) from {args.trajectory_file}")
+        else:
+            print(f"[Warning] Trajectory file not found: {args.trajectory_file}")
+
+    # Load Franka Panda in PyBullet if available
+    if HAS_PYBULLET and trajectory_data is not None:
+        robot_urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/panda.urdf")
+        if os.path.exists(robot_urdf):
+            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
+            print(f"✓ Franka Panda robot loaded in PyBullet (ID: {robot_body_id})")
+
     # Initialize DREMA Closed-Loop Pipeline
     pipeline = DREMAClosedLoopVGMappingPipeline(
         pybullet_client=p,
@@ -183,12 +241,12 @@ def main():
         t_start = time.time()
         print(f"\n>>> [TIMESTEP {timestep_num}] Loading frames from {os.path.basename(timestep_folder)}...")
 
-        images_dir = os.path.join(timestep_folder, "images")
-        depth_dir = os.path.join(timestep_folder, "depth_scaled")
-        masks_dir = os.path.join(timestep_folder, "object_mask")
-        poses_dir = os.path.join(timestep_folder, "poses")
+        images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
+        depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
+        masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
+        poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
 
-        view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png")])
+        view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
         
         # Load all camera observations for this timestep
         observations = []
@@ -283,6 +341,17 @@ def main():
                     pybullet_body_id=1,
                     T_fine=T_fine
                 )
+
+        # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
+        if HAS_PYBULLET and robot_body_id is not None and trajectory_data is not None:
+            t_clamp = min(timestep_num, len(trajectory_data) - 1)
+            step_info = trajectory_data[t_clamp]
+            if "joint_positions" in step_info:
+                for j_idx, angle in enumerate(step_info["joint_positions"][:7]):
+                    p.resetJointState(robot_body_id, j_idx, float(angle))
+            if "gripper_joint_positions" in step_info:
+                for f_idx, f_val in zip([9, 10], step_info["gripper_joint_positions"]):
+                    p.resetJointState(robot_body_id, f_idx, float(f_val))
 
         # Step PyBullet simulation physics if available
         if HAS_PYBULLET:
