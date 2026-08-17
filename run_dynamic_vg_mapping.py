@@ -65,6 +65,8 @@ def parse_args():
     parser.add_argument("--grid_dim", type=int, nargs=3, default=[128, 128, 128], help="TSDF grid dimensions (nx ny nz)")
     parser.add_argument("--origin", type=float, nargs=3, default=[-0.64, -0.64, -0.64], help="TSDF grid origin in world coordinates")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
+    parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
+    parser.add_argument("--video_fps", type=int, default=10, help="Frames per second for saved video")
     parser.add_argument("--output_dir", type=str, default="./output_dynamic_mapping", help="Output directory for saved meshes/logs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
     return parser.parse_args()
@@ -225,6 +227,26 @@ def main():
         if os.path.exists(robot_urdf):
             robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
             print(f"✓ Franka Panda robot loaded in PyBullet (ID: {robot_body_id})")
+
+    # Camera setup for video recording
+    recorded_frames = []
+    video_view_matrix, video_proj_matrix = None, None
+    if args.save_video and HAS_PYBULLET:
+        video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0.0, 0.0, 0.25],
+            distance=1.2,
+            yaw=45,
+            pitch=-25,
+            roll=0,
+            upAxisIndex=2
+        )
+        video_proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=640.0 / 480.0,
+            nearVal=0.1,
+            farVal=3.5
+        )
+        print("✓ Video recorder initialized (640x480 resolution).")
 
     # Initialize DREMA Closed-Loop Pipeline
     pipeline = DREMAClosedLoopVGMappingPipeline(
@@ -396,9 +418,64 @@ def main():
         if HAS_PYBULLET:
             p.stepSimulation()
 
+            # Record frame if requested
+            if args.save_video and video_view_matrix is not None:
+                img_data = p.getCameraImage(
+                    width=640,
+                    height=480,
+                    viewMatrix=video_view_matrix,
+                    projectionMatrix=video_proj_matrix,
+                    renderer=p.ER_TINY_RENDERER
+                )
+                # img_data[2] is (480, 640, 4) uint8 RGBA array
+                frame_rgb = np.array(img_data[2], dtype=np.uint8)[:, :, :3]
+                recorded_frames.append(frame_rgb)
+
         t_elapsed = (time.time() - t_start) * 1000.0
         print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
         print(f"  • Timing Breakdown: TSDF={t_ingest_ms:.1f}ms | VDC={t_vdc_ms:.1f}ms | SE(3)={t_se3_ms:.1f}ms | Total={t_elapsed:.1f}ms")
+
+    # -------------------------------------------------------------
+    # Export Video Recording if enabled
+    # -------------------------------------------------------------
+    if args.save_video and len(recorded_frames) > 0:
+        print("\n--- Exporting PyBullet Simulation Replay Video ---")
+        video_mp4_path = os.path.join(args.output_dir, "simulation_replay.mp4")
+        video_gif_path = os.path.join(args.output_dir, "simulation_replay.gif")
+        saved = False
+
+        try:
+            import imageio
+            imageio.mimsave(video_mp4_path, recorded_frames, fps=args.video_fps)
+            print(f"✓ Saved simulation video: {video_mp4_path} ({len(recorded_frames)} frames @ {args.video_fps} fps)")
+            saved = True
+        except Exception:
+            pass
+
+        if not saved:
+            try:
+                import cv2
+                fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+                out = cv2.VideoWriter(video_mp4_path, fourcc, args.video_fps, (640, 480))
+                for f in recorded_frames:
+                    out.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+                out.release()
+                print(f"✓ Saved simulation video (cv2): {video_mp4_path}")
+                saved = True
+            except Exception:
+                pass
+
+        if not saved:
+            # Fallback to animated GIF using PIL
+            pil_frames = [Image.fromarray(f) for f in recorded_frames]
+            pil_frames[0].save(
+                video_gif_path,
+                save_all=True,
+                append_images=pil_frames[1:],
+                duration=int(1000 / args.video_fps),
+                loop=0
+            )
+            print(f"✓ Saved simulation replay GIF: {video_gif_path}")
 
     # -------------------------------------------------------------
     # Final Surface Mesh Extraction via TSDF Marching Cubes
