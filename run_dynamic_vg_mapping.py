@@ -15,6 +15,7 @@ import time
 import argparse
 import pickle
 import numpy as np
+from typing import Optional, Tuple, Dict, List
 from PIL import Image
 import torch
 try:
@@ -154,6 +155,27 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
     }
 
 
+def create_object_mesh_shape(points: np.ndarray, output_dir: str, obj_id: int) -> Optional[str]:
+    """
+    Reconstructs the exact 3D closed surface mesh from Gaussian/point coordinates
+    and exports a clean .obj file for realistic PyBullet visual and collision geometry.
+    """
+    from scipy.spatial import ConvexHull
+    if len(points) < 4:
+        return None
+    try:
+        hull = ConvexHull(points)
+        obj_file = os.path.join(output_dir, f"object_{obj_id}_mesh.obj")
+        with open(obj_file, "w") as f:
+            for v in hull.points:
+                f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
+            for s in hull.simplices:
+                f.write(f"f {s[0]+1} {s[1]+1} {s[2]+1}\n")
+        return obj_file
+    except Exception:
+        return None
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -223,28 +245,34 @@ def main():
         else:
             print(f"[Warning] Trajectory file not found: {args.trajectory_file}")
 
-    # Load Franka Panda in PyBullet if available
+    # Load Franka Panda in PyBullet if available (mounted at RLBench table height z=0.75)
     if HAS_PYBULLET and trajectory_data is not None:
         robot_urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/panda.urdf")
         if os.path.exists(robot_urdf):
-            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0], [0, 0, 0, 1], useFixedBase=True)
-            print(f"✓ Franka Panda robot loaded in PyBullet (ID: {robot_body_id})")
+            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0.75], [0, 0, 0, 1], useFixedBase=True)
+            print(f"✓ Franka Panda robot loaded in PyBullet at table surface (ID: {robot_body_id})")
 
-    # Spawn Workspace Table in PyBullet
+    # Spawn Workspace Table in PyBullet (surface at z=0.75m matching RLBench world frame)
     if HAS_PYBULLET:
+        # Table top surface (z=0.75)
         table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
         table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02])
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.25, 0.0, -0.02])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.25, 0.0, 0.73])
 
-    # Camera setup for video recording (centered on robot workspace)
+        # Table legs / pedestal
+        legs_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.45, 0.4, 0.365], rgbaColor=[0.5, 0.5, 0.5, 1.0])
+        legs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.45, 0.4, 0.365])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=legs_col, baseVisualShapeIndex=legs_vis, basePosition=[0.25, 0.0, 0.365])
+
+    # Camera setup for video recording (centered on table workspace at z=0.85)
     recorded_frames = []
     video_view_matrix, video_proj_matrix = None, None
     if args.save_video and HAS_PYBULLET:
         video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.15, 0.0, 0.25],
-            distance=1.6,
-            yaw=45,
-            pitch=-30,
+            cameraTargetPosition=[0.25, 0.0, 0.85],
+            distance=1.4,
+            yaw=50,
+            pitch=-25,
             roll=0,
             upAxisIndex=2
         )
@@ -254,7 +282,7 @@ def main():
             nearVal=0.1,
             farVal=3.5
         )
-        print("✓ Video recorder initialized (640x480 resolution, centered on workspace).")
+        print("✓ Video recorder initialized (640x480 resolution, centered on workspace table).")
 
     # Initialize DREMA Closed-Loop Pipeline
     pipeline = DREMAClosedLoopVGMappingPipeline(
@@ -277,7 +305,7 @@ def main():
     # Tracking object dictionary {obj_label_id: {'pybullet_id': id, 'initial_xyz': ...}}
     tracked_objects = {}
 
-    # Target Object IDs to track (filter out robot links, table, sensors, background)
+    # Target Object IDs to track (filter out robot links, workspace table, sensors, background)
     target_object_ids = set()
     labels_file = args.labels_file
     if labels_file is None:
@@ -300,8 +328,9 @@ def main():
                         name, num = parts[0].strip(), int(parts[1].strip())
                         name_lower = name.lower()
                         is_robot_or_bg = any(kw in name_lower for kw in [
-                            "panda", "link", "finger", "hand", "joint", "table", "floor", "wall",
-                            "pillar", "sensor", "success", "camera", "head"
+                            "panda", "link", "finger", "hand", "joint", "workspace", "table",
+                            "floor", "wall", "pillar", "sensor", "success", "camera", "head",
+                            "target", "waypoint", "detector"
                         ])
                         if not is_robot_or_bg:
                             target_object_ids.add(num)
@@ -443,26 +472,35 @@ def main():
                 obj_rgb = scene_gaussians['rgb'][obj_mask]
                 obj_scale = scene_gaussians['scale'][obj_mask]
 
-                # Dynamically register newly discovered object in PyBullet
+                # Dynamically register newly discovered object in PyBullet with exact 3D mesh
                 if HAS_PYBULLET and oid not in tracked_objects:
                     if obj_xyz.ndim == 2 and len(obj_xyz) > 0:
                         init_pos = [float(v) for v in obj_xyz.mean(dim=0).cpu().numpy()]
-                        min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
-                        max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
-                        extents = (max_xyz - min_xyz).tolist()
-                        half_extents = [max(0.015, min(0.15, float(e) / 2.0)) for e in extents]
+                        pts_centered = (obj_xyz.cpu().numpy() - np.array(init_pos))
                     else:
-                        init_pos = [0.35, 0.0, 0.025]
-                        half_extents = [0.025, 0.025, 0.025]
+                        init_pos = [0.35, 0.0, 0.775]
+                        pts_centered = np.array([[-0.025, -0.025, -0.025], [0.025, 0.025, 0.025]])
 
                     if obj_rgb.ndim == 2 and len(obj_rgb) > 0:
                         m_rgb = obj_rgb.mean(dim=0).cpu().numpy().tolist()
                         avg_color = [float(m_rgb[0]), float(m_rgb[1]), float(m_rgb[2]), 1.0]
                     else:
-                        avg_color = [0.2, 0.6, 0.9, 1.0]
+                        avg_color = [0.8, 0.2, 0.2, 1.0]
 
-                    obj_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=avg_color)
-                    obj_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+                    # Generate exact 3D geometric surface mesh from 3D points
+                    mesh_obj_path = create_object_mesh_shape(pts_centered, args.output_dir, oid)
+
+                    if mesh_obj_path and os.path.exists(mesh_obj_path):
+                        obj_vis = p.createVisualShape(p.GEOM_MESH, fileName=mesh_obj_path, rgbaColor=avg_color)
+                        obj_col = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_obj_path)
+                    else:
+                        min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
+                        max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
+                        extents = (max_xyz - min_xyz).tolist()
+                        half_extents = [max(0.015, min(0.15, float(e) / 2.0)) for e in extents]
+                        obj_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=avg_color)
+                        obj_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+
                     body_id = p.createMultiBody(baseMass=0.1, baseCollisionShapeIndex=obj_col, baseVisualShapeIndex=obj_vis, basePosition=init_pos)
                     
                     tracked_objects[oid] = {
@@ -470,7 +508,7 @@ def main():
                         'initial_pos': init_pos,
                         'color': avg_color
                     }
-                    print(f"✓ Discovered object ID {oid}: spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
+                    print(f"✓ Discovered object ID {oid}: exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
 
                 # Subsample object Gaussians for fast Lie algebra SE(3) optimization
                 N_pts = len(obj_xyz)
