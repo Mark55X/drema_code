@@ -381,11 +381,15 @@ def main():
         if HAS_PYBULLET and robot_body_id is not None and trajectory_data is not None:
             t_clamp = min(timestep_num, len(trajectory_data) - 1)
             step_info = trajectory_data[t_clamp]
-            if "joint_positions" in step_info:
-                for j_idx, angle in enumerate(step_info["joint_positions"][:7]):
+            
+            joint_pos = step_info.get("joint_positions", None) if isinstance(step_info, dict) else getattr(step_info, "joint_positions", None)
+            gripper_pos = step_info.get("gripper_joint_positions", None) if isinstance(step_info, dict) else getattr(step_info, "gripper_joint_positions", None)
+
+            if joint_pos is not None:
+                for j_idx, angle in enumerate(joint_pos[:7]):
                     p.resetJointState(robot_body_id, j_idx, float(angle))
-            if "gripper_joint_positions" in step_info:
-                for f_idx, f_val in zip([9, 10], step_info["gripper_joint_positions"]):
+            if gripper_pos is not None:
+                for f_idx, f_val in zip([9, 10], gripper_pos):
                     p.resetJointState(robot_body_id, f_idx, float(f_val))
 
         # Step PyBullet simulation physics if available
