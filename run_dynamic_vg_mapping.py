@@ -398,12 +398,21 @@ def main():
 
                 # Dynamically register newly discovered object in PyBullet
                 if HAS_PYBULLET and oid not in tracked_objects:
-                    init_pos = obj_xyz.mean(dim=0).cpu().tolist()
-                    avg_color = obj_rgb.mean(dim=0).cpu().tolist() + [1.0] if len(obj_rgb) > 0 else [0.2, 0.6, 0.9, 1.0]
-                    
-                    # Estimate bounding box extents from Gaussians
-                    extents = (obj_xyz.max(dim=0)[0] - obj_xyz.min(dim=0)[0]).cpu().tolist()
-                    half_extents = [max(0.015, min(0.15, e / 2.0)) for e in extents]
+                    if obj_xyz.ndim == 2 and len(obj_xyz) > 0:
+                        init_pos = [float(v) for v in obj_xyz.mean(dim=0).cpu().numpy()]
+                        min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
+                        max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
+                        extents = (max_xyz - min_xyz).tolist()
+                        half_extents = [max(0.015, min(0.15, float(e) / 2.0)) for e in extents]
+                    else:
+                        init_pos = [0.35, 0.0, 0.025]
+                        half_extents = [0.025, 0.025, 0.025]
+
+                    if obj_rgb.ndim == 2 and len(obj_rgb) > 0:
+                        m_rgb = obj_rgb.mean(dim=0).cpu().numpy().tolist()
+                        avg_color = [float(m_rgb[0]), float(m_rgb[1]), float(m_rgb[2]), 1.0]
+                    else:
+                        avg_color = [0.2, 0.6, 0.9, 1.0]
 
                     obj_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=avg_color)
                     obj_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
@@ -414,7 +423,7 @@ def main():
                         'initial_pos': init_pos,
                         'color': avg_color
                     }
-                    print(f"✓ Discovered object ID {oid}: spawned in PyBullet (Body ID: {body_id}, Pos: {init_pos})")
+                    print(f"✓ Discovered object ID {oid}: spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
 
                 # Subsample object Gaussians for fast Lie algebra SE(3) optimization
                 N_pts = len(obj_xyz)
