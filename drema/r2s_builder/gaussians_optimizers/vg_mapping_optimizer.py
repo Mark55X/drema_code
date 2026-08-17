@@ -5,8 +5,8 @@ from drema.drema_scene.interactive_gaussian_model import InteractiveGaussianMode
 from drema.gaussian_renderer.original_gaussian_renderer import render
 from drema.gaussian_splatting_utils.loss_utils import l1_loss, ssim
 from drema.r2s_builder.gaussians_optimizers.base_optimizer import BaseTrainer
-from vg_mapping_recurgs_native.tsdf import TSDFVoxelMap
-from vg_mapping_recurgs_native.vdc import VariationAwareDensityController
+from vgmapping_drema.tsdf import TSDFVoxelMap
+from vgmapping_drema.vdc import VariationAwareDensityController
 
 class VGMappingOptimizer(BaseTrainer):
     """

@@ -2,9 +2,9 @@ import torch
 import numpy as np
 from typing import Dict, Tuple, Optional, List
 
-from vg_mapping_recurgs_native.tsdf import TSDFVoxelMap
-from vg_mapping_recurgs_native.vdc import VariationAwareDensityController
-from vg_mapping_recurgs_native.recurgs_se3 import RecurGSLieAlgebraAligner, exp_se3, icp_coarse_alignment
+from vgmapping_drema.tsdf import TSDFVoxelMap
+from vgmapping_drema.vdc import VariationAwareDensityController
+from vgmapping_drema.recurgs_se3 import RecurGSLieAlgebraAligner, exp_se3, icp_coarse_alignment
 
 def rotation_matrix_to_quaternion(R: torch.Tensor) -> Tuple[float, float, float, float]:
     """
