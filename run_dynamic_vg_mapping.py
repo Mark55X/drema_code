@@ -131,6 +131,8 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
     mask = None
     if os.path.exists(mask_path):
         mask_np = np.array(Image.open(mask_path), dtype=np.int32)
+        if mask_np.ndim == 3:
+            mask_np = mask_np[:, :, 0]
         mask = torch.tensor(mask_np, dtype=torch.int32, device=device)
 
     # Load Pose and Intrinsics
