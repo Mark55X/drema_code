@@ -118,7 +118,8 @@ class DREMAClosedLoopVGMappingPipeline:
         gt_rgb_t1: torch.Tensor,
         gt_depth_t1: torch.Tensor,
         intrinsic: torch.Tensor,
-        camera_pose: torch.Tensor
+        camera_pose: torch.Tensor,
+        num_iterations: int = 50
     ) -> torch.Tensor:
         """
         Step 3: Estimate rigid transformation T_fine in SE(3) using RecurGS Lie algebra optimization.
@@ -129,7 +130,7 @@ class DREMAClosedLoopVGMappingPipeline:
             gt_depth=gt_depth_t1,
             intrinsic=intrinsic,
             camera_pose=camera_pose,
-            num_iterations=200
+            num_iterations=num_iterations
         )
         return T_fine
 
