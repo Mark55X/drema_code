@@ -46,18 +46,23 @@ def create_synthetic_gs_data(base_path):
 
 def run_test():
     test_dir = "/tmp/test_synthetic_gs_data"
+    output_dir = "/tmp/test_output_mapping"
+    shutil.rmtree(output_dir, ignore_errors=True)
     create_synthetic_gs_data(test_dir)
     print("Synthetic dataset created at", test_dir)
     
     python_bin = sys.executable
+    script_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run_dynamic_vg_mapping.py")
     cmd = [
         python_bin,
-        "drema_code/run_dynamic_vg_mapping.py",
+        script_path,
         "--gs_data_path", test_dir,
         "--grid_dim", "32", "32", "32",
         "--voxel_size", "0.02",
         "--origin", "-0.32", "-0.32", "-0.32",
-        "--output_dir", "/tmp/test_output_mapping"
+        "--output_dir", output_dir,
+        "--save_gaussians",
+        "--gaussians_format", "both"
     ]
     
     res = subprocess.run(cmd, capture_output=True, text=True)
@@ -66,8 +71,21 @@ def run_test():
         print("STDERR:\n", res.stderr)
         assert False, f"Runner test failed with code {res.returncode}"
     
+    # Check that Gaussians and manifest were saved
+    manifest_path = os.path.join(output_dir, "sequence_manifest.json")
+    assert os.path.exists(manifest_path), f"Missing {manifest_path}"
+    
+    ply_0 = os.path.join(output_dir, "gaussians", "timestep_0000.ply")
+    pt_0 = os.path.join(output_dir, "gaussians", "timestep_0000.pt")
+    assert os.path.exists(ply_0), f"Missing {ply_0}"
+    assert os.path.exists(pt_0), f"Missing {pt_0}"
+    
+    print(f"✓ Verified sequence manifest: {manifest_path}")
+    print(f"✓ Verified Gaussian PLY: {ply_0} ({os.path.getsize(ply_0)} bytes)")
+    print(f"✓ Verified Gaussian PT: {pt_0} ({os.path.getsize(pt_0)} bytes)")
     print("✓ Dynamic Sequence Runner End-to-End Test PASSED!")
     shutil.rmtree(test_dir, ignore_errors=True)
+    shutil.rmtree(output_dir, ignore_errors=True)
 
 if __name__ == "__main__":
     run_test()

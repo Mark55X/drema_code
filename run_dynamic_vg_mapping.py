@@ -12,6 +12,7 @@ import os
 import sys
 import glob
 import time
+import json
 import argparse
 import pickle
 import numpy as np
@@ -68,6 +69,16 @@ def parse_args():
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
     parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
     parser.add_argument("--video_fps", type=int, default=5, help="Frames per second for saved video (default: 5 fps)")
+    parser.add_argument("--save_gaussians", action="store_true", default=True,
+                        help="Save 3D Gaussian Splatting scene at each timestep (default: True)")
+    parser.add_argument("--no_save_gaussians", dest="save_gaussians", action="store_false",
+                        help="Disable saving 3D Gaussian scenes")
+    parser.add_argument("--gaussians_format", type=str, choices=["ply", "pt", "both"], default="both",
+                        help="Format to save Gaussian scenes: 'ply', 'pt', or 'both' (default: both)")
+    parser.add_argument("--launch_viser", action="store_true",
+                        help="Launch interactive Viser 3D web visualizer after processing")
+    parser.add_argument("--viser_port", type=int, default=8080,
+                        help="Port for Viser web server (default: 8080)")
     parser.add_argument("--output_dir", type=str, default="./output_dynamic_mapping", help="Output directory for saved meshes/logs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
     return parser.parse_args()
@@ -203,6 +214,135 @@ def create_object_mesh_shape(points: np.ndarray, output_dir: str, obj_id: int) -
         return obj_file
     except Exception:
         return None
+
+
+def save_gaussian_scene(
+    output_dir: str,
+    timestep_num: int,
+    scene_gaussians: Dict[str, torch.Tensor],
+    save_ply: bool = True,
+    save_pt: bool = True
+) -> Dict[str, str]:
+    """
+    Saves the 3D Gaussian Splatting scene state at a given timestep.
+    - Saves .ply (standard 3DGS format with SH DC, scale, rotation, opacity, RGB, and obj_id)
+    - Saves .pt (PyTorch dictionary with full tensors)
+    """
+    gaussians_dir = os.path.join(output_dir, "gaussians")
+    os.makedirs(gaussians_dir, exist_ok=True)
+    
+    saved_paths = {}
+    base_name = f"timestep_{timestep_num:04d}"
+    
+    # 1. Save PyTorch tensors (.pt)
+    if save_pt:
+        pt_path = os.path.join(gaussians_dir, f"{base_name}.pt")
+        pt_data = {k: v.detach().cpu() for k, v in scene_gaussians.items()}
+        torch.save(pt_data, pt_path)
+        saved_paths['pt'] = pt_path
+
+    # 2. Save 3DGS PLY format (.ply)
+    if save_ply:
+        ply_path = os.path.join(gaussians_dir, f"{base_name}.ply")
+        xyz = scene_gaussians['xyz'].detach().cpu().numpy()
+        rgb = np.clip(scene_gaussians['rgb'].detach().cpu().numpy(), 0.0, 1.0)
+        scale = scene_gaussians['scale'].detach().cpu().numpy()
+        obj_id = scene_gaussians.get('obj_id', torch.zeros(len(xyz), dtype=torch.int32)).detach().cpu().numpy()
+
+        N = len(xyz)
+        if N > 0:
+            # 3DGS Spherical Harmonics DC coefficients
+            SH_C0 = 0.28209479177387814
+            f_dc = (rgb - 0.5) / SH_C0
+
+            # Direct RGB 8-bit for traditional point cloud viewers (MeshLab, CloudCompare, Blender)
+            red = (rgb[:, 0] * 255).astype(np.uint8)
+            green = (rgb[:, 1] * 255).astype(np.uint8)
+            blue = (rgb[:, 2] * 255).astype(np.uint8)
+
+            # Scales in log-space for standard 3DGS
+            log_scale = np.log(np.maximum(scale, 1e-6))
+
+            # Identity quaternions [1, 0, 0, 0] (rot_0 is real/w, rot_1..3 are imaginary/x,y,z)
+            rot_0 = np.ones(N, dtype=np.float32)
+            rot_1 = np.zeros(N, dtype=np.float32)
+            rot_2 = np.zeros(N, dtype=np.float32)
+            rot_3 = np.zeros(N, dtype=np.float32)
+
+            # Opacity: logit(0.99) ≈ 4.595 for standard 3DGS rasterizers
+            opacity_logit = np.full(N, 4.595, dtype=np.float32)
+
+            dtype_full = [
+                ('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
+                ('nx', 'f4'), ('ny', 'f4'), ('nz', 'f4'),
+                ('red', 'u1'), ('green', 'u1'), ('blue', 'u1'),
+                ('f_dc_0', 'f4'), ('f_dc_1', 'f4'), ('f_dc_2', 'f4'),
+                ('opacity', 'f4'),
+                ('scale_0', 'f4'), ('scale_1', 'f4'), ('scale_2', 'f4'),
+                ('rot_0', 'f4'), ('rot_1', 'f4'), ('rot_2', 'f4'), ('rot_3', 'f4'),
+                ('obj_id', 'i4')
+            ]
+
+            elements = np.empty(N, dtype=dtype_full)
+            elements['x'] = xyz[:, 0]
+            elements['y'] = xyz[:, 1]
+            elements['z'] = xyz[:, 2]
+            elements['nx'] = 0.0
+            elements['ny'] = 0.0
+            elements['nz'] = 0.0
+            elements['red'] = red
+            elements['green'] = green
+            elements['blue'] = blue
+            elements['f_dc_0'] = f_dc[:, 0]
+            elements['f_dc_1'] = f_dc[:, 1]
+            elements['f_dc_2'] = f_dc[:, 2]
+            elements['opacity'] = opacity_logit
+            elements['scale_0'] = log_scale[:, 0]
+            elements['scale_1'] = log_scale[:, 1]
+            elements['scale_2'] = log_scale[:, 2]
+            elements['rot_0'] = rot_0
+            elements['rot_1'] = rot_1
+            elements['rot_2'] = rot_2
+            elements['rot_3'] = rot_3
+            elements['obj_id'] = obj_id
+
+            try:
+                from plyfile import PlyData, PlyElement
+                el = PlyElement.describe(elements, 'vertex')
+                PlyData([el], byte_order='<').write(ply_path)
+            except ImportError:
+                header = (
+                    "ply\n"
+                    "format binary_little_endian 1.0\n"
+                    f"element vertex {N}\n"
+                    "property float x\nproperty float y\nproperty float z\n"
+                    "property float nx\nproperty float ny\nproperty float nz\n"
+                    "property uchar red\nproperty uchar green\nproperty uchar blue\n"
+                    "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n"
+                    "property float opacity\n"
+                    "property float scale_0\nproperty float scale_1\nproperty float scale_2\n"
+                    "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n"
+                    "property int obj_id\n"
+                    "end_header\n"
+                )
+                with open(ply_path, "wb") as f:
+                    f.write(header.encode('ascii'))
+                    elements.tofile(f)
+
+            saved_paths['ply'] = ply_path
+        else:
+            # Handle empty scene (N=0) gracefully
+            try:
+                from plyfile import PlyData, PlyElement
+                dtype_empty = [('x', 'f4'), ('y', 'f4'), ('z', 'f4')]
+                el = PlyElement.describe(np.empty(0, dtype=dtype_empty), 'vertex')
+                PlyData([el], byte_order='<').write(ply_path)
+            except Exception:
+                with open(ply_path, "w") as f:
+                    f.write("ply\nformat ascii 1.0\nelement vertex 0\nproperty float x\nproperty float y\nproperty float z\nend_header\n")
+            saved_paths['ply'] = ply_path
+
+    return saved_paths
 
 
 def main():
@@ -366,6 +506,17 @@ def main():
                             print(f"✓ Target object to track from labels.txt: '{name}' (ID: {num})")
 
     total_start_time = time.time()
+
+    # Manifest tracking sequential Gaussian states
+    seq_manifest = {
+        "dataset_path": os.path.abspath(args.gs_data_path),
+        "total_timesteps": len(valid_timesteps),
+        "voxel_size": args.voxel_size,
+        "grid_dim": list(args.grid_dim),
+        "origin": list(args.origin),
+        "target_object_ids": list(target_object_ids),
+        "timesteps": []
+    }
 
     # -------------------------------------------------------------
     # Iterate through all timesteps t = 0, 1, 2, ...
@@ -612,6 +763,36 @@ def main():
         print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
         print(f"  • Timing Breakdown: TSDF={t_ingest_ms:.1f}ms | VDC={t_vdc_ms:.1f}ms | SE(3)={t_se3_ms:.1f}ms | Total={t_elapsed:.1f}ms")
 
+        # ---------------------------------------------------------
+        # Save 3D Gaussian Splatting Scene for this Timestep
+        # ---------------------------------------------------------
+        if args.save_gaussians:
+            save_ply = args.gaussians_format in ["ply", "both"]
+            save_pt = args.gaussians_format in ["pt", "both"]
+            saved_paths = save_gaussian_scene(
+                output_dir=args.output_dir,
+                timestep_num=timestep_num,
+                scene_gaussians=scene_gaussians,
+                save_ply=save_ply,
+                save_pt=save_pt
+            )
+            obj_ids_present = [int(x) for x in torch.unique(scene_gaussians['obj_id']).cpu().numpy().tolist()] if len(scene_gaussians['obj_id']) > 0 else []
+            seq_manifest["timesteps"].append({
+                "timestep": timestep_num,
+                "num_gaussians": len(scene_gaussians['xyz']),
+                "files": {k: os.path.relpath(v, args.output_dir) for k, v in saved_paths.items()},
+                "unique_obj_ids": obj_ids_present
+            })
+
+    # -------------------------------------------------------------
+    # Export Sequence Manifest JSON
+    # -------------------------------------------------------------
+    if args.save_gaussians and len(seq_manifest["timesteps"]) > 0:
+        manifest_path = os.path.join(args.output_dir, "sequence_manifest.json")
+        with open(manifest_path, "w") as f:
+            json.dump(seq_manifest, f, indent=2)
+        print(f"✓ Saved sequence manifest: {manifest_path} ({len(seq_manifest['timesteps'])} timesteps)")
+
     # -------------------------------------------------------------
     # Export Video Recording if enabled
     # -------------------------------------------------------------
@@ -676,6 +857,17 @@ def main():
 
     if HAS_PYBULLET:
         p.disconnect()
+
+    # -------------------------------------------------------------
+    # Launch Interactive Viser 3D Web Visualizer if requested
+    # -------------------------------------------------------------
+    if args.launch_viser:
+        print("\n--- Launching Interactive 3D Viser Web Visualizer ---")
+        try:
+            from visualize_sequence_viser import launch_viser_server
+            launch_viser_server(data_dir=args.output_dir, port=args.viser_port)
+        except ImportError as e:
+            print(f"⚠️ Could not launch Viser visualizer: {e}")
 
 
 if __name__ == "__main__":
