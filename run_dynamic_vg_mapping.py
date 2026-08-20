@@ -414,11 +414,11 @@ def main():
         else:
             print(f"[Warning] Trajectory file not found: {args.trajectory_file}")
 
-    # Load Franka Panda in PyBullet if available (mounted at RLBench table height z=0.75)
+    # Load Franka Panda in PyBullet if available (mounted at RLBench table height)
     if HAS_PYBULLET and trajectory_data is not None:
         robot_urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/panda.urdf")
         if os.path.exists(robot_urdf):
-            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0.75], [0, 0, 0, 1], useFixedBase=True)
+            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0.0], [0, 0, 0, 1], useFixedBase=True)
             print(f"✓ Franka Panda robot loaded in PyBullet at table surface (ID: {robot_body_id})")
 
     # Spawn Workspace Table in PyBullet (surface at z=0.75m matching RLBench world frame)
@@ -718,12 +718,12 @@ def main():
 
                 # Step 4: Synchronize PyBullet object pose
                 target_body_id = tracked_objects[oid]['pybullet_id'] if oid in tracked_objects else 1
-                target_init_pos = tracked_objects[oid]['initial_pos'] if oid in tracked_objects else obj_xyz.mean(dim=0).cpu().tolist()
+                target_current_pos = [float(v) for v in obj_xyz.mean(dim=0).cpu().numpy()]
 
                 pipeline.step_4_sync_pybullet_physics(
                     pybullet_body_id=target_body_id,
                     T_fine=T_fine,
-                    initial_position=target_init_pos
+                    initial_position=target_current_pos
                 )
 
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
