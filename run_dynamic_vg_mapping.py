@@ -728,11 +728,10 @@ def main():
 
                 # Update 3D Gaussian positions of the tracked dynamic object
                 if oid in tracked_objects:
-                    if 'initial_xyz' not in tracked_objects[oid]:
-                        tracked_objects[oid]['initial_xyz'] = obj_xyz.clone()
                     R_fine = T_fine[:3, :3].to(device)
                     t_fine = T_fine[:3, 3].to(device)
-                    transformed_pts = tracked_objects[oid]['initial_xyz'] @ R_fine.T + t_fine
+                    current_obj_pts = scene_gaussians['xyz'][obj_mask]
+                    transformed_pts = current_obj_pts @ R_fine.T + t_fine
                     scene_gaussians['xyz'][obj_mask] = transformed_pts
                     scene_gaussians['morton'][obj_mask] = pipeline.tsdf_map.point_to_morton(transformed_pts)
 
