@@ -726,15 +726,6 @@ def main():
                     initial_position=target_init_pos
                 )
 
-                # Update 3D Gaussian positions of the tracked dynamic object
-                if oid in tracked_objects:
-                    R_fine = T_fine[:3, :3].to(device)
-                    t_fine = T_fine[:3, 3].to(device)
-                    current_obj_pts = scene_gaussians['xyz'][obj_mask]
-                    transformed_pts = current_obj_pts @ R_fine.T + t_fine
-                    scene_gaussians['xyz'][obj_mask] = transformed_pts
-                    scene_gaussians['morton'][obj_mask] = pipeline.tsdf_map.point_to_morton(transformed_pts)
-
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
