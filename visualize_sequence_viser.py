@@ -255,103 +255,106 @@ def launch_viser_server(
 
     markdown_info = None
 
+    render_lock = threading.Lock()
+
     # -------------------------------------------------------------
     # Render Function
     # -------------------------------------------------------------
     def render_current_frame():
-        t = state['current_t']
-        if t not in sequence_cache:
+        if not render_lock.acquire(blocking=False):
             return
+        try:
+            t = state['current_t']
+            if t not in sequence_cache:
+                return
 
-        frame_data = sequence_cache[t]
-        xyz = frame_data['xyz']
-        rgb = frame_data['rgb']
-        scale = frame_data['scale']
-        obj_id = frame_data['obj_id']
+            frame_data = sequence_cache[t]
+            xyz = frame_data['xyz']
+            rgb = frame_data['rgb']
+            scale = frame_data['scale']
+            obj_id = frame_data['obj_id']
 
-        N = len(xyz)
-        if N == 0:
-            return
+            N = len(xyz)
+            if N == 0:
+                return
 
-        # Apply semantic object filtering mask
-        if len(obj_id) == N:
-            keep_mask = np.array([state['active_objects'].get(int(oid), True) for oid in obj_id], dtype=bool)
-            filtered_xyz = xyz[keep_mask]
-            filtered_rgb = rgb[keep_mask]
-            filtered_scale = scale[keep_mask]
-            filtered_obj_id = obj_id[keep_mask]
-        else:
-            filtered_xyz, filtered_rgb, filtered_scale, filtered_obj_id = xyz, rgb, scale, obj_id
+            # Apply semantic object filtering mask
+            if len(obj_id) == N:
+                keep_mask = np.array([state['active_objects'].get(int(oid), True) for oid in obj_id], dtype=bool)
+                filtered_xyz = xyz[keep_mask]
+                filtered_rgb = rgb[keep_mask]
+                filtered_scale = scale[keep_mask]
+                filtered_obj_id = obj_id[keep_mask]
+            else:
+                filtered_xyz, filtered_rgb, filtered_scale, filtered_obj_id = xyz, rgb, scale, obj_id
 
-        if len(filtered_xyz) == 0:
-            return
+            if len(filtered_xyz) == 0:
+                return
 
-        # Determine colors based on selected mode
-        mode = state['color_mode']
-        if mode == "RGB (Photorealistic)":
-            colors = filtered_rgb
-        elif mode == "Semantic Segmentation (Object ID)":
-            colors = np.zeros_like(filtered_xyz)
-            for oid in np.unique(filtered_obj_id):
-                c = palette.get(int(oid), np.array([0.7, 0.7, 0.7], dtype=np.float32))
-                colors[filtered_obj_id == oid] = c
-        elif mode == "Height Map (Z-axis)":
-            z_vals = filtered_xyz[:, 2]
-            z_min, z_max = np.percentile(z_vals, 2), np.percentile(z_vals, 98)
-            z_norm = np.clip((z_vals - z_min) / max(1e-5, (z_max - z_min)), 0.0, 1.0)
-            # Turbomap / Plasma approximation
-            colors = np.stack([
-                np.clip(1.5 * z_norm, 0.0, 1.0),
-                np.clip(1.0 - np.abs(z_norm - 0.5) * 2.0, 0.0, 1.0),
-                np.clip(1.5 * (1.0 - z_norm), 0.0, 1.0)
-            ], axis=1)
-        else:
-            colors = np.ones_like(filtered_xyz) * 0.85
+            # Determine colors based on selected mode
+            mode = state['color_mode']
+            if mode == "RGB (Photorealistic)":
+                colors = filtered_rgb
+            elif mode == "Semantic Segmentation (Object ID)":
+                colors = np.zeros_like(filtered_xyz)
+                for oid in np.unique(filtered_obj_id):
+                    c = palette.get(int(oid), np.array([0.7, 0.7, 0.7], dtype=np.float32))
+                    colors[filtered_obj_id == oid] = c
+            elif mode == "Height Map (Z-axis)":
+                z_vals = filtered_xyz[:, 2]
+                z_min, z_max = np.percentile(z_vals, 2), np.percentile(z_vals, 98)
+                z_norm = np.clip((z_vals - z_min) / max(1e-5, (z_max - z_min)), 0.0, 1.0)
+                # Turbomap / Plasma approximation
+                colors = np.stack([
+                    np.clip(1.5 * z_norm, 0.0, 1.0),
+                    np.clip(1.0 - np.abs(z_norm - 0.5) * 2.0, 0.0, 1.0),
+                    np.clip(1.5 * (1.0 - z_norm), 0.0, 1.0)
+                ], axis=1)
+            else:
+                colors = np.ones_like(filtered_xyz) * 0.85
 
-        # Render either as Gaussian Splats or Fast Point Cloud
-        if state['render_mode'] == "Gaussian Splats (3DGS)":
+            # Render either as Gaussian Splats or Fast Point Cloud
             try:
-                # Diagonal covariance from scales
-                covariances = np.zeros((len(filtered_xyz), 3, 3), dtype=np.float32)
-                covariances[:, 0, 0] = np.square(np.maximum(filtered_scale[:, 0], 1e-4))
-                covariances[:, 1, 1] = np.square(np.maximum(filtered_scale[:, 1], 1e-4))
-                covariances[:, 2, 2] = np.square(np.maximum(filtered_scale[:, 2], 1e-4))
-                opacities = np.full((len(filtered_xyz), 1), 0.95, dtype=np.float32)
+                if state['render_mode'] == "Gaussian Splats (3DGS)":
+                    covariances = np.zeros((len(filtered_xyz), 3, 3), dtype=np.float32)
+                    covariances[:, 0, 0] = np.square(np.maximum(filtered_scale[:, 0], 1e-4))
+                    covariances[:, 1, 1] = np.square(np.maximum(filtered_scale[:, 1], 1e-4))
+                    covariances[:, 2, 2] = np.square(np.maximum(filtered_scale[:, 2], 1e-4))
+                    opacities = np.full((len(filtered_xyz), 1), 0.95, dtype=np.float32)
 
-                server.scene.add_gaussian_splats(
-                    name="/scene/gaussians",
-                    centers=filtered_xyz,
-                    covariances=covariances,
-                    rgbs=colors,
-                    opacities=opacities,
-                    scale=state['point_size'] / 0.005
-                )
+                    server.scene.add_gaussian_splats(
+                        name="/scene/gaussians",
+                        centers=filtered_xyz,
+                        covariances=covariances,
+                        rgbs=colors,
+                        opacities=opacities,
+                        scale=state['point_size'] / 0.005
+                    )
+                else:
+                    server.scene.add_point_cloud(
+                        name="/scene/gaussians",
+                        points=filtered_xyz,
+                        colors=colors,
+                        point_size=state['point_size'],
+                        point_shape="circle"
+                    )
             except Exception:
-                server.scene.add_point_cloud(
-                    name="/scene/gaussians",
-                    points=filtered_xyz,
-                    colors=colors,
-                    point_size=state['point_size'],
-                    point_shape="circle"
-                )
-        else:
-            server.scene.add_point_cloud(
-                name="/scene/gaussians",
-                points=filtered_xyz,
-                colors=colors,
-                point_size=state['point_size'],
-                point_shape="circle"
-            )
+                pass
 
-        # Update info text
-        if markdown_info is not None:
-            unique_active_ids = np.unique(filtered_obj_id).tolist() if len(filtered_obj_id) > 0 else []
-            markdown_info.content = (
-                f"### 📍 Timestep `{t}` / `{timesteps[-1][0]}`\n"
-                f"- **Gaussians Count**: `{len(filtered_xyz):,}` / `{N:,}`\n"
-                f"- **Visible Objects**: `{unique_active_ids}`\n"
-                f"- **Color Mode**: `{mode}`"
-            )
+            # Update info text
+            if markdown_info is not None:
+                try:
+                    unique_active_ids = np.unique(filtered_obj_id).tolist() if len(filtered_obj_id) > 0 else []
+                    markdown_info.content = (
+                        f"### 📍 Timestep `{t}` / `{timesteps[-1][0]}`\n"
+                        f"- **Gaussians Count**: `{len(filtered_xyz):,}` / `{N:,}`\n"
+                        f"- **Visible Objects**: `{unique_active_ids}`\n"
+                        f"- **Color Mode**: `{mode}`"
+                    )
+                except Exception:
+                    pass
+        finally:
+            render_lock.release()
 
     # -------------------------------------------------------------
     # GUI Layout
