@@ -178,6 +178,7 @@ def launch_viser_server(
     port: int = 8080,
     host: str = "0.0.0.0",
     point_size: float = 0.006,
+    share: bool = False,
     block: bool = True
 ):
     """
@@ -220,13 +221,20 @@ def launch_viser_server(
     server = viser.ViserServer(host=host, port=port)
     server.scene.set_up_direction("+z")
 
+    if share:
+        try:
+            share_url = server.request_share_url()
+            print(f"🔗 Public Share URL: {share_url}")
+        except Exception as e:
+            print(f"⚠️ Could not generate share URL: {e}")
+
     # App State
     state = {
         'current_t': timesteps[0][0],
         'is_playing': False,
         'fps': 5,
         'color_mode': "RGB (Photorealistic)",
-        'render_mode': "Gaussian Splats (3DGS)",
+        'render_mode': "Point Cloud (Fast)",
         'point_size': point_size,
         'active_objects': {oid: True for oid in sorted_obj_ids},
         'show_workspace_bounds': True,
@@ -244,6 +252,8 @@ def launch_viser_server(
             print(f"✓ Found TSDF Marching Cubes mesh: {tsdf_mesh_path}")
         except Exception:
             pass
+
+    markdown_info = None
 
     # -------------------------------------------------------------
     # Render Function
@@ -300,21 +310,30 @@ def launch_viser_server(
 
         # Render either as Gaussian Splats or Fast Point Cloud
         if state['render_mode'] == "Gaussian Splats (3DGS)":
-            # Diagonal covariance from scales
-            covariances = np.zeros((len(filtered_xyz), 3, 3), dtype=np.float32)
-            covariances[:, 0, 0] = np.square(np.maximum(filtered_scale[:, 0], 1e-4))
-            covariances[:, 1, 1] = np.square(np.maximum(filtered_scale[:, 1], 1e-4))
-            covariances[:, 2, 2] = np.square(np.maximum(filtered_scale[:, 2], 1e-4))
-            opacities = np.full((len(filtered_xyz), 1), 0.95, dtype=np.float32)
+            try:
+                # Diagonal covariance from scales
+                covariances = np.zeros((len(filtered_xyz), 3, 3), dtype=np.float32)
+                covariances[:, 0, 0] = np.square(np.maximum(filtered_scale[:, 0], 1e-4))
+                covariances[:, 1, 1] = np.square(np.maximum(filtered_scale[:, 1], 1e-4))
+                covariances[:, 2, 2] = np.square(np.maximum(filtered_scale[:, 2], 1e-4))
+                opacities = np.full((len(filtered_xyz), 1), 0.95, dtype=np.float32)
 
-            server.scene.add_gaussian_splats(
-                name="/scene/gaussians",
-                centers=filtered_xyz,
-                covariances=covariances,
-                rgbs=colors,
-                opacities=opacities,
-                scale=state['point_size'] / 0.005
-            )
+                server.scene.add_gaussian_splats(
+                    name="/scene/gaussians",
+                    centers=filtered_xyz,
+                    covariances=covariances,
+                    rgbs=colors,
+                    opacities=opacities,
+                    scale=state['point_size'] / 0.005
+                )
+            except Exception:
+                server.scene.add_point_cloud(
+                    name="/scene/gaussians",
+                    points=filtered_xyz,
+                    colors=colors,
+                    point_size=state['point_size'],
+                    point_shape="circle"
+                )
         else:
             server.scene.add_point_cloud(
                 name="/scene/gaussians",
@@ -325,13 +344,14 @@ def launch_viser_server(
             )
 
         # Update info text
-        unique_active_ids = np.unique(filtered_obj_id).tolist() if len(filtered_obj_id) > 0 else []
-        markdown_info.content = (
-            f"### 📍 Timestep `{t}` / `{timesteps[-1][0]}`\n"
-            f"- **Gaussians Count**: `{len(filtered_xyz):,}` / `{N:,}`\n"
-            f"- **Visible Objects**: `{unique_active_ids}`\n"
-            f"- **Color Mode**: `{mode}`"
-        )
+        if markdown_info is not None:
+            unique_active_ids = np.unique(filtered_obj_id).tolist() if len(filtered_obj_id) > 0 else []
+            markdown_info.content = (
+                f"### 📍 Timestep `{t}` / `{timesteps[-1][0]}`\n"
+                f"- **Gaussians Count**: `{len(filtered_xyz):,}` / `{N:,}`\n"
+                f"- **Visible Objects**: `{unique_active_ids}`\n"
+                f"- **Color Mode**: `{mode}`"
+            )
 
     # -------------------------------------------------------------
     # GUI Layout
@@ -361,7 +381,7 @@ def launch_viser_server(
         )
         render_dropdown = server.gui.add_dropdown(
             "Render Type",
-            ("Gaussian Splats (3DGS)", "Point Cloud (Fast)"),
+            ("Point Cloud (Fast)", "Gaussian Splats (3DGS)"),
             initial_value=state['render_mode']
         )
         point_size_slider = server.gui.add_slider(
@@ -536,6 +556,10 @@ def launch_viser_server(
     # Initial frame render
     render_current_frame()
 
+    @server.on_client_connect
+    def _(client: viser.ClientHandle) -> None:
+        render_current_frame()
+
     # Background Playback Thread
     def playback_loop():
         while True:
@@ -575,6 +599,7 @@ def parse_args():
     parser.add_argument("--port", type=int, default=8080, help="Web server port (default: 8080)")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host binding (default: 0.0.0.0)")
     parser.add_argument("--point_size", type=float, default=0.006, help="Initial particle radius in meters")
+    parser.add_argument("--share", action="store_true", help="Request a public shareable URL from share.viser.studio")
     return parser.parse_args()
 
 
@@ -585,6 +610,7 @@ def main():
         port=args.port,
         host=args.host,
         point_size=args.point_size,
+        share=args.share,
         block=True
     )
 
