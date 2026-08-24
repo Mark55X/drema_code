@@ -65,7 +65,7 @@ def parse_args():
                         help="Path to dictionary.pkl (for Franka Panda robot joint trajectory replay in PyBullet)")
     parser.add_argument("--voxel_size", type=float, default=0.01, help="TSDF voxel grid size in meters")
     parser.add_argument("--grid_dim", type=int, nargs=3, default=[128, 128, 128], help="TSDF grid dimensions (nx ny nz)")
-    parser.add_argument("--origin", type=float, nargs=3, default=[-0.64, -0.64, -0.64], help="TSDF grid origin in world coordinates")
+    parser.add_argument("--origin", type=float, nargs=3, default=[-0.26, -0.64, 0.26], help="TSDF grid origin in world coordinates (default: centered on tabletop workspace [0.38, 0.0, 0.90])")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
     parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
     parser.add_argument("--video_fps", type=int, default=5, help="Frames per second for saved video (default: 5 fps)")
