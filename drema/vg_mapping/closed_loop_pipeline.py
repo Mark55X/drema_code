@@ -1,6 +1,6 @@
 import torch
 import numpy as np
-from typing import Dict, Tuple, Optional, List
+from typing import Dict, Tuple, Optional, List, Set
 
 from vgmapping_drema.tsdf import TSDFVoxelMap
 from vgmapping_drema.vdc import VariationAwareDensityController
@@ -90,7 +90,9 @@ class DREMAClosedLoopVGMappingPipeline:
         mask: Optional[torch.Tensor] = None,
         workspace_bounds: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         is_initial_timestep: bool = False,
-        num_views: int = 1
+        num_views: int = 1,
+        robot_ids: Optional[Set[int]] = None,
+        target_object_ids: Optional[Set[int]] = None
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Step 2: Variation detection & Morton code raycast pruning.
@@ -115,7 +117,9 @@ class DREMAClosedLoopVGMappingPipeline:
             mask_obs=mask,
             workspace_bounds=workspace_bounds,
             is_initial_timestep=is_initial_timestep,
-            num_views=num_views
+            num_views=num_views,
+            robot_ids=robot_ids,
+            target_object_ids=target_object_ids
         )
 
         return new_gaussians, prune_mask

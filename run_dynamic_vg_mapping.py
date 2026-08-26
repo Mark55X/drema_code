@@ -525,8 +525,9 @@ def main():
     else:
         print("[Info] PyBullet is not installed in this environment. Physics simulation sync skipped.")
 
-    # Target Object IDs to track (filter out robot links, workspace table, sensors, background)
+    # Target Object IDs and Robot Link IDs (filter out robot from 3D Gaussian generation)
     target_object_ids = set()
+    robot_ids = set()
     labels_file = args.labels_file
     if labels_file is None:
         candidates = [
@@ -547,6 +548,9 @@ def main():
                     if len(parts) >= 2 and parts[1].strip().isdigit():
                         name, num = parts[0].strip(), int(parts[1].strip())
                         name_lower = name.lower()
+                        if any(kw in name_lower for kw in ["panda", "link", "finger", "hand", "joint", "arm", "gripper"]):
+                            robot_ids.add(num)
+
                         is_robot_or_bg = any(kw in name_lower for kw in [
                             "panda", "link", "finger", "hand", "joint", "workspace", "table",
                             "floor", "wall", "pillar", "sensor", "success", "camera", "head",
@@ -555,6 +559,7 @@ def main():
                         if not is_robot_or_bg:
                             target_object_ids.add(num)
                             print(f"✓ Target object to track from labels.txt: '{name}' (ID: {num})")
+        print(f"✓ Robot links filtered from 3DGS ({len(robot_ids)} IDs): {sorted(list(robot_ids))}")
 
     # Pre-load timestep 0 observations for automatic table workspace ROI discovery
     images_dir_0 = find_existing_dir(valid_timesteps[0][1], ["images", "rgb", "rgbs"])
@@ -752,7 +757,9 @@ def main():
                 mask=obs['mask'],
                 workspace_bounds=workspace_bounds,
                 is_initial_timestep=(t_idx == 0),
-                num_views=len(observations)
+                num_views=len(observations),
+                robot_ids=robot_ids,
+                target_object_ids=target_object_ids
             )
 
             # Apply pruning
