@@ -751,7 +751,8 @@ def main():
                 current_morton_codes=scene_gaussians['morton'],
                 mask=obs['mask'],
                 workspace_bounds=workspace_bounds,
-                is_initial_timestep=(t_idx == 0)
+                is_initial_timestep=(t_idx == 0),
+                num_views=len(observations)
             )
 
             # Apply pruning
