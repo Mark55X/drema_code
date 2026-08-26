@@ -66,6 +66,8 @@ def parse_args():
     parser.add_argument("--voxel_size", type=float, default=0.01, help="TSDF voxel grid size in meters")
     parser.add_argument("--grid_dim", type=int, nargs=3, default=[128, 128, 128], help="TSDF grid dimensions (nx ny nz)")
     parser.add_argument("--origin", type=float, nargs=3, default=[-0.26, -0.64, 0.26], help="TSDF grid origin in world coordinates (default: centered on tabletop workspace [0.38, 0.0, 0.90])")
+    parser.add_argument("--no_auto_workspace", action="store_true",
+                        help="Disable automatic table workspace ROI detection and force manual --origin / --grid_dim")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
     parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
     parser.add_argument("--video_fps", type=int, default=5, help="Frames per second for saved video (default: 5 fps)")
@@ -164,6 +166,126 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
         'K': K,
         'pose': pose
     }
+
+
+def auto_detect_table_workspace_bounds(
+    observations: List[Dict[str, torch.Tensor]],
+    labels_file: Optional[str],
+    voxel_size: float,
+    device: str,
+    default_origin: Tuple[float, float, float] = (-0.26, -0.64, 0.26),
+    default_grid_dim: Tuple[int, int, int] = (128, 128, 128)
+) -> Tuple[Tuple[float, float, float], Tuple[int, int, int], Tuple[torch.Tensor, torch.Tensor], float]:
+    """
+    Automatically detects the tabletop workspace ROI (Region of Interest) at timestep t=0:
+    - Finds the table semantic ID from labels.txt (matching keywords like 'table', 'workspace', 'desk', 'stand')
+    - Back-projects table depth pixels from multi-view cameras into 3D world coordinates
+    - Computes robust spatial bounds: [X_min, X_max], [Y_min, Y_max], [Z_table_surface]
+    - Sets Z_min = Z_table - 0.06m (includes table thickness) and Z_max = Z_table + 0.65m (manipulation volume)
+    - Dynamically computes TSDF grid origin (x_min, y_min, z_min) and grid_dim (nx, ny, nz)
+    """
+    table_ids = set()
+    if labels_file and os.path.exists(labels_file):
+        with open(labels_file, "r") as f:
+            for line in f.read().splitlines():
+                if ";" in line:
+                    parts = line.split(";")
+                    if len(parts) >= 2 and parts[1].strip().isdigit():
+                        name, num = parts[0].strip().lower(), int(parts[1].strip())
+                        if any(kw in name for kw in ["table", "workspace", "stand", "pedestal", "desk", "surface"]):
+                            if not any(bad in name for bad in ["floor", "wall", "room", "camera"]):
+                                table_ids.add(num)
+
+    all_table_pts = []
+    for obs in observations:
+        mask = obs.get('mask', None)
+        depth = obs['depth']
+        K = obs['K']
+        pose = obs['pose']
+
+        if mask is None:
+            continue
+
+        if len(table_ids) > 0:
+            t_ids_tensor = torch.tensor(list(table_ids), device=device, dtype=mask.dtype)
+            is_table = torch.isin(mask, t_ids_tensor)
+        else:
+            # Fallback to standard RLBench diningTable / workspace IDs (52, 48)
+            is_table = (mask == 52) | (mask == 48)
+
+        v_idx, u_idx = torch.where(is_table)
+        if len(v_idx) == 0:
+            continue
+
+        d_vals = depth[0, v_idx, u_idx]
+        valid = (d_vals > 0.1) & (d_vals < 3.0)
+        v_valid = v_idx[valid]
+        u_valid = u_idx[valid]
+        d_valid = d_vals[valid]
+
+        if len(d_valid) == 0:
+            continue
+
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+        R_c2w = pose[:3, :3]
+        t_c2w = pose[:3, 3]
+
+        x_cam = (u_valid.float() - cx) * d_valid / fx
+        y_cam = (v_valid.float() - cy) * d_valid / fy
+        p_cam = torch.stack([x_cam, y_cam, d_valid], dim=-1)
+        p_world = p_cam @ R_c2w.T + t_c2w
+        all_table_pts.append(p_world)
+
+    if len(all_table_pts) > 0:
+        cat_pts = torch.cat(all_table_pts, dim=0).cpu().numpy()
+        x_p1, x_p99 = np.percentile(cat_pts[:, 0], 1), np.percentile(cat_pts[:, 0], 99)
+        y_p1, y_p99 = np.percentile(cat_pts[:, 1], 1), np.percentile(cat_pts[:, 1], 99)
+        z_table = float(np.percentile(cat_pts[:, 2], 95))
+
+        # Add 5cm padding on X and Y, and set Z range around table surface
+        x_min = float(x_p1 - 0.05)
+        x_max = float(x_p99 + 0.05)
+        y_min = float(y_p1 - 0.05)
+        y_max = float(y_p99 + 0.05)
+        z_min = float(z_table - 0.06)
+        z_max = float(z_table + 0.65)
+
+        ext_x = x_max - x_min
+        ext_y = y_max - y_min
+        ext_z = z_max - z_min
+
+        nx = max(32, int(np.ceil(ext_x / voxel_size)))
+        ny = max(32, int(np.ceil(ext_y / voxel_size)))
+        nz = max(32, int(np.ceil(ext_z / voxel_size)))
+
+        # Align to multiple of 8 for optimal GPU memory coalescing
+        nx = ((nx + 7) // 8) * 8
+        ny = ((ny + 7) // 8) * 8
+        nz = ((nz + 7) // 8) * 8
+
+        x_max = x_min + nx * voxel_size
+        y_max = y_min + ny * voxel_size
+        z_max = z_min + nz * voxel_size
+
+        origin = (round(x_min, 4), round(y_min, 4), round(z_min, 4))
+        grid_dim = (nx, ny, nz)
+        min_bound = torch.tensor([x_min, y_min, z_min], dtype=torch.float32, device=device)
+        max_bound = torch.tensor([x_max, y_max, z_max], dtype=torch.float32, device=device)
+
+        print(f"✓ [Auto-ROI] Table surface detected at Z = {z_table:.3f} m")
+        print(f"✓ [Auto-ROI] Computed Workspace Bounds: X [{x_min:.3f}, {x_max:.3f}], Y [{y_min:.3f}, {y_max:.3f}], Z [{z_min:.3f}, {z_max:.3f}]")
+        print(f"✓ [Auto-ROI] Dynamic TSDF Grid: origin={origin}, grid_dim={grid_dim} ({nx*voxel_size:.2f}m x {ny*voxel_size:.2f}m x {nz*voxel_size:.2f}m)")
+
+        return origin, grid_dim, (min_bound, max_bound), z_table
+    else:
+        # Fallback default
+        origin = default_origin
+        grid_dim = default_grid_dim
+        ext = [grid_dim[i] * voxel_size for i in range(3)]
+        min_bound = torch.tensor(origin, dtype=torch.float32, device=device)
+        max_bound = torch.tensor([origin[i] + ext[i] for i in range(3)], dtype=torch.float32, device=device)
+        return origin, grid_dim, (min_bound, max_bound), 0.75
 
 
 def create_object_mesh_shape(points: np.ndarray, output_dir: str, obj_id: int) -> Optional[str]:
@@ -403,77 +525,6 @@ def main():
     else:
         print("[Info] PyBullet is not installed in this environment. Physics simulation sync skipped.")
 
-    # Load Robot Trajectory if provided
-    trajectory_data = None
-    robot_body_id = None
-    if args.trajectory_file:
-        if os.path.exists(args.trajectory_file):
-            with open(args.trajectory_file, "rb") as f:
-                trajectory_data = pickle.load(f)
-            print(f"✓ Loaded robot trajectory ({len(trajectory_data)} steps) from {args.trajectory_file}")
-        else:
-            print(f"[Warning] Trajectory file not found: {args.trajectory_file}")
-
-    # Load Franka Panda in PyBullet if available (mounted at RLBench table height)
-    if HAS_PYBULLET and trajectory_data is not None:
-        robot_urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/panda.urdf")
-        if os.path.exists(robot_urdf):
-            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0.0], [0, 0, 0, 1], useFixedBase=True)
-            print(f"✓ Franka Panda robot loaded in PyBullet at table surface (ID: {robot_body_id})")
-
-    # Spawn Workspace Table in PyBullet (surface at z=0.75m matching RLBench world frame)
-    if HAS_PYBULLET:
-        # Table top surface (z=0.75)
-        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
-        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.5, 0.45, 0.02])
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[0.25, 0.0, 0.73])
-
-        # Table legs / pedestal
-        legs_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[0.45, 0.4, 0.365], rgbaColor=[0.5, 0.5, 0.5, 1.0])
-        legs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[0.45, 0.4, 0.365])
-        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=legs_col, baseVisualShapeIndex=legs_vis, basePosition=[0.25, 0.0, 0.365])
-
-    # Camera setup for video recording (centered on table workspace at z=0.82)
-    recorded_frames = []
-    video_view_matrix, video_proj_matrix = None, None
-    if args.save_video and HAS_PYBULLET:
-        video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
-            cameraTargetPosition=[0.22, 0.0, 0.82],
-            distance=1.65,
-            yaw=45,
-            pitch=-32,
-            roll=0,
-            upAxisIndex=2
-        )
-        video_proj_matrix = p.computeProjectionMatrixFOV(
-            fov=60,
-            aspect=640.0 / 480.0,
-            nearVal=0.1,
-            farVal=3.5
-        )
-        print("✓ Video recorder initialized (640x480 resolution, centered on workspace table).")
-
-    # Initialize DREMA Closed-Loop Pipeline
-    pipeline = DREMAClosedLoopVGMappingPipeline(
-        pybullet_client=p,
-        voxel_size=args.voxel_size,
-        grid_dim=tuple(args.grid_dim),
-        origin=tuple(args.origin),
-        device=device
-    )
-
-    # Scene Gaussian state dictionary
-    scene_gaussians = {
-        'xyz': torch.empty((0, 3), dtype=torch.float32, device=device),
-        'rgb': torch.empty((0, 3), dtype=torch.float32, device=device),
-        'scale': torch.empty((0, 3), dtype=torch.float32, device=device),
-        'morton': torch.empty((0,), dtype=torch.int64, device=device),
-        'obj_id': torch.empty((0,), dtype=torch.int32, device=device)
-    }
-
-    # Tracking object dictionary {obj_label_id: {'pybullet_id': id, 'initial_xyz': ...}}
-    tracked_objects = {}
-
     # Target Object IDs to track (filter out robot links, workspace table, sensors, background)
     target_object_ids = set()
     labels_file = args.labels_file
@@ -505,6 +556,130 @@ def main():
                             target_object_ids.add(num)
                             print(f"✓ Target object to track from labels.txt: '{name}' (ID: {num})")
 
+    # Pre-load timestep 0 observations for automatic table workspace ROI discovery
+    images_dir_0 = find_existing_dir(valid_timesteps[0][1], ["images", "rgb", "rgbs"])
+    depth_dir_0 = find_existing_dir(valid_timesteps[0][1], ["depth_scaled", "depth", "depths"])
+    masks_dir_0 = find_existing_dir(valid_timesteps[0][1], ["object_mask", "masks", "mask"])
+    poses_dir_0 = find_existing_dir(valid_timesteps[0][1], ["poses", "pose"])
+    view_files_0 = sorted([f.split(".")[0] for f in os.listdir(images_dir_0) if f.endswith(".png") or f.endswith(".jpg")])
+    obs_timestep_0 = [load_view_data(v, images_dir_0, depth_dir_0, masks_dir_0, poses_dir_0, device) for v in view_files_0]
+
+    if not args.no_auto_workspace:
+        print("\n--- Automatic Table Workspace ROI Detection (Strategy 2) ---")
+        grid_origin, grid_dim, workspace_bounds, z_table = auto_detect_table_workspace_bounds(
+            observations=obs_timestep_0,
+            labels_file=labels_file,
+            voxel_size=args.voxel_size,
+            device=device,
+            default_origin=tuple(args.origin),
+            default_grid_dim=tuple(args.grid_dim)
+        )
+    else:
+        grid_origin = tuple(args.origin)
+        grid_dim = tuple(args.grid_dim)
+        ext = [grid_dim[i] * args.voxel_size for i in range(3)]
+        workspace_bounds = (
+            torch.tensor(grid_origin, dtype=torch.float32, device=device),
+            torch.tensor([grid_origin[i] + ext[i] for i in range(3)], dtype=torch.float32, device=device)
+        )
+        z_table = 0.75
+
+    print(f"Voxel Size   : {args.voxel_size} m | Grid: {grid_dim} | Origin: {grid_origin}")
+
+    # Setup PyBullet Physics Client
+    client_id = None
+    if HAS_PYBULLET:
+        if args.visualize_pybullet:
+            client_id = p.connect(p.GUI)
+            p.setAdditionalSearchPath(pybullet_data.getDataPath())
+            p.resetDebugVisualizerCamera(3, 90, -30, [0.0, 0.0, 0.0])
+            p.setGravity(0, 0, -9.81)
+            p.loadURDF("plane.urdf")
+            print("✓ PyBullet GUI initialized successfully.")
+        else:
+            client_id = p.connect(p.DIRECT)
+            p.setGravity(0, 0, -9.81)
+    else:
+        print("[Info] PyBullet is not installed in this environment. Physics simulation sync skipped.")
+
+    # Load Robot Trajectory if provided
+    trajectory_data = None
+    robot_body_id = None
+    if args.trajectory_file:
+        if os.path.exists(args.trajectory_file):
+            with open(args.trajectory_file, "rb") as f:
+                trajectory_data = pickle.load(f)
+            print(f"✓ Loaded robot trajectory ({len(trajectory_data)} steps) from {args.trajectory_file}")
+        else:
+            print(f"[Warning] Trajectory file not found: {args.trajectory_file}")
+
+    # Load Franka Panda in PyBullet if available (mounted at RLBench table height)
+    if HAS_PYBULLET and trajectory_data is not None:
+        robot_urdf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/panda.urdf")
+        if os.path.exists(robot_urdf):
+            robot_body_id = p.loadURDF(robot_urdf, [0, 0, 0.0], [0, 0, 0, 1], useFixedBase=True)
+            print(f"✓ Franka Panda robot loaded in PyBullet at table surface (ID: {robot_body_id})")
+
+    # Spawn Workspace Table in PyBullet (surface matching detected z_table)
+    if HAS_PYBULLET:
+        wb_min = workspace_bounds[0].cpu().numpy()
+        wb_max = workspace_bounds[1].cpu().numpy()
+        t_center_x = float((wb_min[0] + wb_max[0]) / 2.0)
+        t_center_y = float((wb_min[1] + wb_max[1]) / 2.0)
+        hx = max(0.3, float((wb_max[0] - wb_min[0]) / 2.0))
+        hy = max(0.3, float((wb_max[1] - wb_min[1]) / 2.0))
+
+        # Table top surface
+        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, 0.02], rgbaColor=[0.75, 0.75, 0.75, 1.0])
+        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, 0.02])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=table_col, baseVisualShapeIndex=table_vis, basePosition=[t_center_x, t_center_y, z_table - 0.02])
+
+        # Table pedestal / base
+        legs_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx * 0.9, hy * 0.9, (z_table - 0.04) / 2.0], rgbaColor=[0.5, 0.5, 0.5, 1.0])
+        legs_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx * 0.9, hy * 0.9, (z_table - 0.04) / 2.0])
+        p.createMultiBody(baseMass=0, baseCollisionShapeIndex=legs_col, baseVisualShapeIndex=legs_vis, basePosition=[t_center_x, t_center_y, (z_table - 0.04) / 2.0])
+
+    # Camera setup for video recording (centered on table workspace)
+    recorded_frames = []
+    video_view_matrix, video_proj_matrix = None, None
+    if args.save_video and HAS_PYBULLET:
+        video_view_matrix = p.computeViewMatrixFromYawPitchRoll(
+            cameraTargetPosition=[0.22, 0.0, z_table + 0.07],
+            distance=1.65,
+            yaw=45,
+            pitch=-32,
+            roll=0,
+            upAxisIndex=2
+        )
+        video_proj_matrix = p.computeProjectionMatrixFOV(
+            fov=60,
+            aspect=640.0 / 480.0,
+            nearVal=0.1,
+            farVal=3.5
+        )
+        print("✓ Video recorder initialized (640x480 resolution, centered on workspace table).")
+
+    # Initialize DREMA Closed-Loop Pipeline with dynamic workspace geometry
+    pipeline = DREMAClosedLoopVGMappingPipeline(
+        pybullet_client=p,
+        voxel_size=args.voxel_size,
+        grid_dim=grid_dim,
+        origin=grid_origin,
+        device=device
+    )
+
+    # Scene Gaussian state dictionary
+    scene_gaussians = {
+        'xyz': torch.empty((0, 3), dtype=torch.float32, device=device),
+        'rgb': torch.empty((0, 3), dtype=torch.float32, device=device),
+        'scale': torch.empty((0, 3), dtype=torch.float32, device=device),
+        'morton': torch.empty((0,), dtype=torch.int64, device=device),
+        'obj_id': torch.empty((0,), dtype=torch.int32, device=device)
+    }
+
+    # Tracking object dictionary {obj_label_id: {'pybullet_id': id, 'initial_xyz': ...}}
+    tracked_objects = {}
+
     total_start_time = time.time()
 
     # Manifest tracking sequential Gaussian states
@@ -512,8 +687,9 @@ def main():
         "dataset_path": os.path.abspath(args.gs_data_path),
         "total_timesteps": len(valid_timesteps),
         "voxel_size": args.voxel_size,
-        "grid_dim": list(args.grid_dim),
-        "origin": list(args.origin),
+        "grid_dim": list(grid_dim),
+        "origin": list(grid_origin),
+        "workspace_bounds": [workspace_bounds[0].cpu().numpy().tolist(), workspace_bounds[1].cpu().numpy().tolist()],
         "target_object_ids": list(target_object_ids),
         "timesteps": []
     }
@@ -525,18 +701,21 @@ def main():
         t_start = time.time()
         print(f"\n>>> [TIMESTEP {timestep_num}] Loading frames from {os.path.basename(timestep_folder)}...")
 
-        images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
-        depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
-        masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
-        poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
+        if t_idx == 0 and 'obs_timestep_0' in locals() and len(obs_timestep_0) > 0:
+            observations = obs_timestep_0
+        else:
+            images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
+            depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
+            masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
+            poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
 
-        view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
-        
-        # Load all camera observations for this timestep
-        observations = []
-        for v in view_files:
-            obs = load_view_data(v, images_dir, depth_dir, masks_dir, poses_dir, device)
-            observations.append(obs)
+            view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
+            
+            # Load all camera observations for this timestep
+            observations = []
+            for v in view_files:
+                obs = load_view_data(v, images_dir, depth_dir, masks_dir, poses_dir, device)
+                observations.append(obs)
 
         # ---------------------------------------------------------
         # STEP 1: Ingest multi-view Depth into TSDF Voxel Map
@@ -570,7 +749,9 @@ def main():
                 intrinsic=obs['K'],
                 camera_pose=obs['pose'],
                 current_morton_codes=scene_gaussians['morton'],
-                mask=obs['mask']
+                mask=obs['mask'],
+                workspace_bounds=workspace_bounds,
+                is_initial_timestep=(t_idx == 0)
             )
 
             # Apply pruning

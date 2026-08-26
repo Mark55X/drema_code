@@ -427,9 +427,32 @@ def launch_viser_server(
     # Coordinate grid
     server.scene.add_grid("/environment/grid", width=2.0, height=2.0, plane="xy", cell_size=0.1)
 
-    # Workspace bounding box [0.1, 0.65] x [-0.45, 0.45] x [0.005, 0.35]
-    table_center = ((0.1 + 0.65) / 2.0, (-0.45 + 0.45) / 2.0, (0.005 + 0.35) / 2.0 + 0.75)
-    table_dims = (0.65 - 0.1, 0.45 - (-0.45), 0.35 - 0.005)
+    # Dynamic workspace bounding box from sequence manifest
+    manifest_path = os.path.join(data_dir, "sequence_manifest.json")
+    manifest_data = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest_data = json.load(f)
+        except Exception:
+            pass
+
+    if "workspace_bounds" in manifest_data:
+        wb = manifest_data["workspace_bounds"]
+        b_min = np.array(wb[0])
+        b_max = np.array(wb[1])
+        table_center = tuple((b_min + b_max) / 2.0)
+        table_dims = tuple(b_max - b_min)
+    elif "origin" in manifest_data and "grid_dim" in manifest_data:
+        orig = np.array(manifest_data["origin"])
+        g_dim = np.array(manifest_data["grid_dim"])
+        v_size = manifest_data.get("voxel_size", 0.01)
+        ext = g_dim * v_size
+        table_center = tuple(orig + ext / 2.0)
+        table_dims = tuple(ext)
+    else:
+        table_center = ((0.1 + 0.65) / 2.0, (-0.45 + 0.45) / 2.0, (0.005 + 0.35) / 2.0 + 0.75)
+        table_dims = (0.65 - 0.1, 0.45 - (-0.45), 0.35 - 0.005)
     
     workspace_box_handle = server.scene.add_box(
         name="/environment/workspace_box",
