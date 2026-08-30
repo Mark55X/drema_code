@@ -706,6 +706,10 @@ def main():
         t_start = time.time()
         print(f"\n>>> [TIMESTEP {timestep_num}] Loading frames from {os.path.basename(timestep_folder)}...")
 
+        # ---------------------------------------------------------
+        # STEP 0: Load Multi-View Observations (Disk I/O & GPU transfer)
+        # ---------------------------------------------------------
+        t_io_start = time.time()
         if t_idx == 0 and 'obs_timestep_0' in locals() and len(obs_timestep_0) > 0:
             observations = obs_timestep_0
         else:
@@ -721,6 +725,9 @@ def main():
             for v in view_files:
                 obs = load_view_data(v, images_dir, depth_dir, masks_dir, poses_dir, device)
                 observations.append(obs)
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
+        t_io_ms = (time.time() - t_io_start) * 1000.0
 
         # ---------------------------------------------------------
         # STEP 1: Ingest multi-view Depth into TSDF Voxel Map
@@ -733,6 +740,8 @@ def main():
                 intrinsic=obs['K'],
                 camera_pose=obs['pose']
             )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
         t_ingest_ms = (time.time() - t_ingest_start) * 1000.0
 
         # ---------------------------------------------------------
@@ -792,6 +801,8 @@ def main():
             scene_gaussians['obj_id'] = torch.cat([scene_gaussians['obj_id'], added_obj_id], dim=0)
             num_added = len(added_xyz)
 
+        if device.startswith("cuda"):
+            torch.cuda.synchronize()
         t_vdc_ms = (time.time() - t_vdc_start) * 1000.0
 
         # ---------------------------------------------------------
@@ -915,9 +926,13 @@ def main():
                     initial_position=target_current_pos
                 )
 
+            if device.startswith("cuda"):
+                torch.cuda.synchronize()
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
+        t_sim_start = time.time()
+        t_render_ms = 0.0
         if HAS_PYBULLET and robot_body_id is not None and trajectory_data is not None:
             t_clamp = min(timestep_num, len(trajectory_data) - 1)
             step_info = trajectory_data[t_clamp]
@@ -936,8 +951,9 @@ def main():
         if HAS_PYBULLET:
             p.stepSimulation()
 
-            # Record frame if requested (with 2 simulation sub-steps for smooth video)
+            # Record frame if requested
             if args.save_video and video_view_matrix is not None:
+                t_render_start = time.time()
                 img_data = p.getCameraImage(
                     width=640,
                     height=480,
@@ -947,14 +963,14 @@ def main():
                 )
                 frame_rgb = np.array(img_data[2], dtype=np.uint8)[:, :, :3]
                 recorded_frames.append(frame_rgb)
+                t_render_ms = (time.time() - t_render_start) * 1000.0
 
-        t_elapsed = (time.time() - t_start) * 1000.0
-        print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
-        print(f"  • Timing Breakdown: TSDF={t_ingest_ms:.1f}ms | VDC={t_vdc_ms:.1f}ms | SE(3)={t_se3_ms:.1f}ms | Total={t_elapsed:.1f}ms")
+        t_sim_ms = (time.time() - t_sim_start) * 1000.0
 
         # ---------------------------------------------------------
         # Save 3D Gaussian Splatting Scene for this Timestep
         # ---------------------------------------------------------
+        t_save_start = time.time()
         if args.save_gaussians:
             save_ply = args.gaussians_format in ["ply", "both"]
             save_pt = args.gaussians_format in ["pt", "both"]
@@ -972,6 +988,25 @@ def main():
                 "files": {k: os.path.relpath(v, args.output_dir) for k, v in saved_paths.items()},
                 "unique_obj_ids": obj_ids_present
             })
+        t_save_ms = (time.time() - t_save_start) * 1000.0
+
+        t_elapsed = (time.time() - t_start) * 1000.0
+        print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
+        
+        timing_parts = [
+            f"IO={t_io_ms:.1f}ms",
+            f"TSDF={t_ingest_ms:.1f}ms",
+            f"VDC={t_vdc_ms:.1f}ms",
+            f"SE(3)={t_se3_ms:.1f}ms",
+            f"Sim={t_sim_ms:.1f}ms"
+        ]
+        if args.save_video:
+            timing_parts.append(f"Render={t_render_ms:.1f}ms")
+        if args.save_gaussians:
+            timing_parts.append(f"SaveGS={t_save_ms:.1f}ms")
+        timing_parts.append(f"Total={t_elapsed:.1f}ms")
+
+        print(f"  • Timing Breakdown: {' | '.join(timing_parts)}")
 
     # -------------------------------------------------------------
     # Export Sequence Manifest JSON
