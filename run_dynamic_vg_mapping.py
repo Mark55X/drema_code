@@ -923,7 +923,7 @@ def main():
                 new_morton_acc.append(new_g['morton'])
                 new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=device)))
 
-        # Concatenate newly initialized Gaussians
+        # Concatenate newly initialized Gaussians with Voxel Deduplication
         num_added = 0
         if len(new_xyz_acc) > 0:
             added_xyz = torch.cat(new_xyz_acc, dim=0)
@@ -931,6 +931,30 @@ def main():
             added_scale = torch.cat(new_scale_acc, dim=0)
             added_morton = torch.cat(new_morton_acc, dim=0)
             added_obj_id = torch.cat(new_obj_id_acc, dim=0)
+
+            # Intra-batch spatial deduplication by Morton code (1 Gaussian per 1cm voxel surface)
+            if len(added_morton) > 0:
+                perm = torch.argsort(added_morton)
+                sorted_morton = added_morton[perm]
+                uniq_mask = torch.ones_like(sorted_morton, dtype=torch.bool)
+                uniq_mask[1:] = (sorted_morton[1:] != sorted_morton[:-1])
+                keep_idx = perm[uniq_mask]
+
+                added_xyz = added_xyz[keep_idx]
+                added_rgb = added_rgb[keep_idx]
+                added_scale = added_scale[keep_idx]
+                added_morton = added_morton[keep_idx]
+                added_obj_id = added_obj_id[keep_idx]
+
+                # If t > 0, prevent adding redundant duplicates to already-occupied scene voxels
+                if t_idx > 0 and len(scene_gaussians['morton']) > 0:
+                    occupied = torch.isin(added_morton, scene_gaussians['morton'])
+                    non_dup = ~occupied
+                    added_xyz = added_xyz[non_dup]
+                    added_rgb = added_rgb[non_dup]
+                    added_scale = added_scale[non_dup]
+                    added_morton = added_morton[non_dup]
+                    added_obj_id = added_obj_id[non_dup]
 
             scene_gaussians['xyz'] = torch.cat([scene_gaussians['xyz'], added_xyz], dim=0)
             scene_gaussians['rgb'] = torch.cat([scene_gaussians['rgb'], added_rgb], dim=0)
