@@ -70,17 +70,24 @@ def load_gaussian_timestep(file_path: str) -> Dict[str, np.ndarray]:
     """
     if file_path.endswith(".pt"):
         try:
-            data = torch.load(file_path, map_location="cpu", weights_only=False)
-        except TypeError:
-            data = torch.load(file_path, map_location="cpu")
-        xyz = data['xyz'].numpy() if isinstance(data['xyz'], torch.Tensor) else np.array(data['xyz'])
-        rgb = data['rgb'].numpy() if isinstance(data['rgb'], torch.Tensor) else np.array(data['rgb'])
-        scale = data['scale'].numpy() if isinstance(data['scale'], torch.Tensor) else np.array(data['scale'])
-        if 'obj_id' in data:
-            obj_id = data['obj_id'].numpy() if isinstance(data['obj_id'], torch.Tensor) else np.array(data['obj_id'])
-        else:
-            obj_id = np.zeros(len(xyz), dtype=np.int32)
-        return {'xyz': xyz, 'rgb': np.clip(rgb, 0.0, 1.0), 'scale': scale, 'obj_id': obj_id}
+            try:
+                data = torch.load(file_path, map_location="cpu", weights_only=False)
+            except TypeError:
+                data = torch.load(file_path, map_location="cpu")
+            xyz = data['xyz'].numpy() if isinstance(data['xyz'], torch.Tensor) else np.array(data['xyz'])
+            rgb = data['rgb'].numpy() if isinstance(data['rgb'], torch.Tensor) else np.array(data['rgb'])
+            scale = data['scale'].numpy() if isinstance(data['scale'], torch.Tensor) else np.array(data['scale'])
+            if 'obj_id' in data:
+                obj_id = data['obj_id'].numpy() if isinstance(data['obj_id'], torch.Tensor) else np.array(data['obj_id'])
+            else:
+                obj_id = np.zeros(len(xyz), dtype=np.int32)
+            return {'xyz': xyz, 'rgb': np.clip(rgb, 0.0, 1.0), 'scale': scale, 'obj_id': obj_id}
+        except Exception as e:
+            ply_alt = file_path.replace(".pt", ".ply")
+            if os.path.exists(ply_alt):
+                return load_gaussian_timestep(ply_alt)
+            print(f"[Warning] Failed to load {file_path}: {e}")
+            return {'xyz': np.empty((0, 3), dtype=np.float32), 'rgb': np.empty((0, 3), dtype=np.float32), 'scale': np.empty((0, 3), dtype=np.float32), 'obj_id': np.empty((0,), dtype=np.int32)}
 
     elif file_path.endswith(".ply"):
         try:
