@@ -15,10 +15,18 @@ import time
 import json
 import argparse
 import pickle
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 from typing import Optional, Tuple, Dict, List
 from PIL import Image
 import torch
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
 try:
     import pybullet as p
     import pybullet_data
@@ -94,10 +102,10 @@ def find_existing_dir(base_folder, candidates):
     return os.path.join(base_folder, candidates[0])
 
 
-def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, device):
+def load_view_data_cpu(view_name, images_dir, depth_dir, masks_dir, poses_dir, pin_memory=False):
     """
-    Loads RGB, Depth, Mask and Pose for a single camera view.
-    Supports .png, .jpg for images, and .npy / .png for depth.
+    Loads RGB, Depth, Mask and Pose for a single camera view into CPU memory.
+    Uses OpenCV C++ decoder if available for high-throughput decoding.
     """
     img_path = os.path.join(images_dir, f"{view_name}.png")
     if not os.path.exists(img_path):
@@ -107,9 +115,18 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
     pose_path = os.path.join(poses_dir, f"{view_name}.txt")
 
     # Load RGB (3, H, W) normalized to [0, 1]
-    rgb_img = Image.open(img_path).convert("RGB")
-    rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
-    rgb = torch.tensor(rgb_np, dtype=torch.float32, device=device).permute(2, 0, 1)
+    if HAS_CV2:
+        bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
+        if bgr is not None:
+            rgb_np = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
+        else:
+            rgb_img = Image.open(img_path).convert("RGB")
+            rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
+    else:
+        rgb_img = Image.open(img_path).convert("RGB")
+        rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
+
+    rgb = torch.from_numpy(rgb_np).permute(2, 0, 1)
 
     # Load Depth (1, H, W) - flexible .npy / .png detection
     depth_npy = os.path.join(depth_dir, f"{view_name}.npy")
@@ -117,46 +134,86 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
     if os.path.exists(depth_npy):
         depth_np = np.load(depth_npy).astype(np.float32)
     elif os.path.exists(depth_png):
-        depth_img = np.array(Image.open(depth_png))
-        if depth_img.ndim == 3 and depth_img.shape[2] >= 3:
-            # 24-bit RGB encoded RLBench / CoppeliaSim depth map
-            float_array = np.sum(depth_img[:, :, :3] * [65536, 256, 1], axis=2).astype(np.float32)
-            norm_depth = float_array / float(2**24 - 1)
-            
-            near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
-            if os.path.exists(near_far_file):
-                with open(near_far_file, "r") as f:
-                    nf_parts = f.read().strip().split()
-                    near = float(nf_parts[0])
-                    far = float(nf_parts[1])
-                depth_np = (far - near) * norm_depth + near
+        if HAS_CV2:
+            depth_bgr = cv2.imread(depth_png, cv2.IMREAD_UNCHANGED)
+            if depth_bgr is not None and depth_bgr.ndim == 3 and depth_bgr.shape[2] >= 3:
+                float_array = (depth_bgr[:, :, 2].astype(np.float32) * 65536.0 +
+                               depth_bgr[:, :, 1].astype(np.float32) * 256.0 +
+                               depth_bgr[:, :, 0].astype(np.float32))
+                norm_depth = float_array / float(2**24 - 1)
+                near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
+                if os.path.exists(near_far_file):
+                    with open(near_far_file, "r") as f:
+                        nf_parts = f.read().strip().split()
+                        near, far = float(nf_parts[0]), float(nf_parts[1])
+                    depth_np = (far - near) * norm_depth + near
+                else:
+                    depth_np = norm_depth * 3.0
+            elif depth_bgr is not None:
+                depth_np = depth_bgr.astype(np.float32)
+                if depth_np.max() > 50.0:
+                    depth_np = depth_np / 1000.0
             else:
-                depth_np = norm_depth * 3.0 # fallback scale
+                depth_img = np.array(Image.open(depth_png))
+                depth_np = depth_img.astype(np.float32)
+                if depth_np.max() > 50.0:
+                    depth_np = depth_np / 1000.0
         else:
-            depth_np = depth_img.astype(np.float32)
-            if depth_np.max() > 50.0:
-                depth_np = depth_np / 1000.0
+            depth_img = np.array(Image.open(depth_png))
+            if depth_img.ndim == 3 and depth_img.shape[2] >= 3:
+                float_array = np.sum(depth_img[:, :, :3] * [65536, 256, 1], axis=2).astype(np.float32)
+                norm_depth = float_array / float(2**24 - 1)
+                near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
+                if os.path.exists(near_far_file):
+                    with open(near_far_file, "r") as f:
+                        nf_parts = f.read().strip().split()
+                        near = float(nf_parts[0]), float(nf_parts[1])
+                    depth_np = (far - near) * norm_depth + near
+                else:
+                    depth_np = norm_depth * 3.0
+            else:
+                depth_np = depth_img.astype(np.float32)
+                if depth_np.max() > 50.0:
+                    depth_np = depth_np / 1000.0
     else:
         raise FileNotFoundError(f"Could not find depth file for view '{view_name}' in '{depth_dir}' (.npy or .png)")
 
-    depth = torch.tensor(depth_np, dtype=torch.float32, device=device).unsqueeze(0)
+    depth = torch.from_numpy(depth_np).unsqueeze(0)
 
     # Load Mask (H, W) if available
     mask = None
     if os.path.exists(mask_path):
-        mask_np = np.array(Image.open(mask_path), dtype=np.int32)
-        if mask_np.ndim == 3:
-            mask_np = mask_np[:, :, 0]
-        mask = torch.tensor(mask_np, dtype=torch.int32, device=device)
+        if HAS_CV2:
+            mask_np = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
+            if mask_np is not None:
+                if mask_np.ndim == 3:
+                    mask_np = mask_np[:, :, 0]
+                mask = torch.from_numpy(mask_np.astype(np.int32))
+            else:
+                mask_np = np.array(Image.open(mask_path), dtype=np.int32)
+                if mask_np.ndim == 3:
+                    mask_np = mask_np[:, :, 0]
+                mask = torch.from_numpy(mask_np)
+        else:
+            mask_np = np.array(Image.open(mask_path), dtype=np.int32)
+            if mask_np.ndim == 3:
+                mask_np = mask_np[:, :, 0]
+            mask = torch.from_numpy(mask_np)
 
     # Load Pose and Intrinsics
     rotation, translation, intrinsics = read_pose_file(pose_path)
-    
-    K = torch.tensor(intrinsics, dtype=torch.float32, device=device)
-    
-    pose = torch.eye(4, dtype=torch.float32, device=device)
-    pose[:3, :3] = torch.tensor(rotation, dtype=torch.float32, device=device)
-    pose[:3, 3] = torch.tensor(translation, dtype=torch.float32, device=device)
+    K = torch.from_numpy(intrinsics.astype(np.float32))
+    pose = torch.eye(4, dtype=torch.float32)
+    pose[:3, :3] = torch.from_numpy(rotation.astype(np.float32))
+    pose[:3, 3] = torch.from_numpy(translation.astype(np.float32))
+
+    if pin_memory and torch.cuda.is_available():
+        rgb = rgb.pin_memory()
+        depth = depth.pin_memory()
+        if mask is not None:
+            mask = mask.pin_memory()
+        K = K.pin_memory()
+        pose = pose.pin_memory()
 
     return {
         'name': view_name,
@@ -166,6 +223,82 @@ def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, devic
         'K': K,
         'pose': pose
     }
+
+
+def to_device_obs(obs_cpu, device):
+    """
+    Transfers observation dictionary from CPU (pinned memory) to GPU asynchronously.
+    """
+    return {
+        'name': obs_cpu['name'],
+        'rgb': obs_cpu['rgb'].to(device, non_blocking=True),
+        'depth': obs_cpu['depth'].to(device, non_blocking=True),
+        'mask': obs_cpu['mask'].to(device, non_blocking=True) if obs_cpu['mask'] is not None else None,
+        'K': obs_cpu['K'].to(device, non_blocking=True),
+        'pose': obs_cpu['pose'].to(device, non_blocking=True)
+    }
+
+
+def load_view_data(view_name, images_dir, depth_dir, masks_dir, poses_dir, device):
+    """
+    Synchronously loads a single view data and transfers to device.
+    """
+    obs_cpu = load_view_data_cpu(view_name, images_dir, depth_dir, masks_dir, poses_dir, pin_memory=False)
+    return to_device_obs(obs_cpu, device)
+
+
+class AsyncTimestepPrefetcher:
+    """
+    Background multithreaded prefetcher that loads multi-view RGB-D observations
+    for upcoming timesteps asynchronously from disk into pinned host memory.
+    Overlaps Disk I/O with GPU execution, virtually eliminating I/O wait in the main loop.
+    """
+    def __init__(self, timesteps, device="cuda", max_prefetch=3, num_io_workers=4):
+        self.timesteps = timesteps
+        self.device = device
+        self.pin_memory = (device.startswith("cuda") and torch.cuda.is_available())
+        self.queue = queue.Queue(maxsize=max_prefetch)
+        self.pool = ThreadPoolExecutor(max_workers=num_io_workers)
+        self.stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._producer_loop, daemon=True)
+        self.worker_thread.start()
+
+    def _load_single_timestep(self, timestep_folder):
+        images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
+        depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
+        masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
+        poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
+
+        view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
+
+        def load_fn(v):
+            return load_view_data_cpu(v, images_dir, depth_dir, masks_dir, poses_dir, pin_memory=self.pin_memory)
+
+        futures = [self.pool.submit(load_fn, v) for v in view_files]
+        observations = [f.result() for f in futures]
+        return observations
+
+    def _producer_loop(self):
+        for ts_num, ts_folder in self.timesteps:
+            if self.stop_event.is_set():
+                break
+            try:
+                obs_cpu = self._load_single_timestep(ts_folder)
+                self.queue.put((ts_num, obs_cpu))
+            except Exception as e:
+                self.queue.put((ts_num, e))
+                break
+
+    def get_next(self):
+        ts_num, data = self.queue.get()
+        if isinstance(data, Exception):
+            raise data
+        obs_gpu = [to_device_obs(v, self.device) for v in data]
+        return ts_num, obs_gpu
+
+    def close(self):
+        self.stop_event.set()
+        self.pool.shutdown(wait=False)
 
 
 def auto_detect_table_workspace_bounds(
@@ -702,29 +835,36 @@ def main():
     # -------------------------------------------------------------
     # Iterate through all timesteps t = 0, 1, 2, ...
     # -------------------------------------------------------------
+    # Initialize background asynchronous prefetcher for timesteps 1, 2, ...
+    prefetcher = None
+    if len(valid_timesteps) > 1:
+        prefetcher = AsyncTimestepPrefetcher(
+            timesteps=valid_timesteps[1:],
+            device=device,
+            max_prefetch=3,
+            num_io_workers=4
+        )
+
     for t_idx, (timestep_num, timestep_folder) in enumerate(valid_timesteps):
         t_start = time.time()
         print(f"\n>>> [TIMESTEP {timestep_num}] Loading frames from {os.path.basename(timestep_folder)}...")
 
         # ---------------------------------------------------------
-        # STEP 0: Load Multi-View Observations (Disk I/O & GPU transfer)
+        # STEP 0: Load Multi-View Observations (Prefetched DMA transfer)
         # ---------------------------------------------------------
         t_io_start = time.time()
         if t_idx == 0 and 'obs_timestep_0' in locals() and len(obs_timestep_0) > 0:
             observations = obs_timestep_0
         else:
-            images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
-            depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
-            masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
-            poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
-
-            view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
-            
-            # Load all camera observations for this timestep
-            observations = []
-            for v in view_files:
-                obs = load_view_data(v, images_dir, depth_dir, masks_dir, poses_dir, device)
-                observations.append(obs)
+            if prefetcher is not None:
+                _, observations = prefetcher.get_next()
+            else:
+                images_dir = find_existing_dir(timestep_folder, ["images", "rgb", "rgbs"])
+                depth_dir = find_existing_dir(timestep_folder, ["depth_scaled", "depth", "depths"])
+                masks_dir = find_existing_dir(timestep_folder, ["object_mask", "masks", "mask"])
+                poses_dir = find_existing_dir(timestep_folder, ["poses", "pose"])
+                view_files = sorted([f.split(".")[0] for f in os.listdir(images_dir) if f.endswith(".png") or f.endswith(".jpg")])
+                observations = [load_view_data(v, images_dir, depth_dir, masks_dir, poses_dir, device) for v in view_files]
         if device.startswith("cuda"):
             torch.cuda.synchronize()
         t_io_ms = (time.time() - t_io_start) * 1000.0
@@ -1007,6 +1147,9 @@ def main():
         timing_parts.append(f"Total={t_elapsed:.1f}ms")
 
         print(f"  • Timing Breakdown: {' | '.join(timing_parts)}")
+
+    if prefetcher is not None:
+        prefetcher.close()
 
     # -------------------------------------------------------------
     # Export Sequence Manifest JSON
