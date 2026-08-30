@@ -79,8 +79,8 @@ def parse_args():
     parser.add_argument("--visualize_pybullet", action="store_true", help="Launch PyBullet GUI for real-time visualization")
     parser.add_argument("--save_video", action="store_true", help="Record and save PyBullet simulation replay video (MP4/GIF)")
     parser.add_argument("--video_fps", type=int, default=5, help="Frames per second for saved video (default: 5 fps)")
-    parser.add_argument("--save_gaussians", action="store_true", default=True,
-                        help="Save 3D Gaussian Splatting scene at each timestep (default: True)")
+    parser.add_argument("--save_gaussians", action="store_true", default=False,
+                        help="Save 3D Gaussian Splatting scene at each timestep (default: False)")
     parser.add_argument("--no_save_gaussians", dest="save_gaussians", action="store_false",
                         help="Disable saving 3D Gaussian scenes")
     parser.add_argument("--gaussians_format", type=str, choices=["ply", "pt", "both"], default="both",
@@ -105,7 +105,7 @@ def find_existing_dir(base_folder, candidates):
 def load_view_data_cpu(view_name, images_dir, depth_dir, masks_dir, poses_dir, pin_memory=False):
     """
     Loads RGB, Depth, Mask and Pose for a single camera view into CPU memory.
-    Uses OpenCV C++ decoder if available for high-throughput decoding.
+    Uses PIL to guarantee exact RGB channel alignment and exact object mask label IDs.
     """
     img_path = os.path.join(images_dir, f"{view_name}.png")
     if not os.path.exists(img_path):
@@ -115,17 +115,8 @@ def load_view_data_cpu(view_name, images_dir, depth_dir, masks_dir, poses_dir, p
     pose_path = os.path.join(poses_dir, f"{view_name}.txt")
 
     # Load RGB (3, H, W) normalized to [0, 1]
-    if HAS_CV2:
-        bgr = cv2.imread(img_path, cv2.IMREAD_COLOR)
-        if bgr is not None:
-            rgb_np = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB).astype(np.float32) / 255.0
-        else:
-            rgb_img = Image.open(img_path).convert("RGB")
-            rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
-    else:
-        rgb_img = Image.open(img_path).convert("RGB")
-        rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
-
+    rgb_img = Image.open(img_path).convert("RGB")
+    rgb_np = np.array(rgb_img, dtype=np.float32) / 255.0
     rgb = torch.from_numpy(rgb_np).permute(2, 0, 1)
 
     # Load Depth (1, H, W) - flexible .npy / .png detection
@@ -134,71 +125,37 @@ def load_view_data_cpu(view_name, images_dir, depth_dir, masks_dir, poses_dir, p
     if os.path.exists(depth_npy):
         depth_np = np.load(depth_npy).astype(np.float32)
     elif os.path.exists(depth_png):
-        if HAS_CV2:
-            depth_bgr = cv2.imread(depth_png, cv2.IMREAD_UNCHANGED)
-            if depth_bgr is not None and depth_bgr.ndim == 3 and depth_bgr.shape[2] >= 3:
-                float_array = (depth_bgr[:, :, 2].astype(np.float32) * 65536.0 +
-                               depth_bgr[:, :, 1].astype(np.float32) * 256.0 +
-                               depth_bgr[:, :, 0].astype(np.float32))
-                norm_depth = float_array / float(2**24 - 1)
-                near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
-                if os.path.exists(near_far_file):
-                    with open(near_far_file, "r") as f:
-                        nf_parts = f.read().strip().split()
-                        near, far = float(nf_parts[0]), float(nf_parts[1])
-                    depth_np = (far - near) * norm_depth + near
-                else:
-                    depth_np = norm_depth * 3.0
-            elif depth_bgr is not None:
-                depth_np = depth_bgr.astype(np.float32)
-                if depth_np.max() > 50.0:
-                    depth_np = depth_np / 1000.0
+        depth_img = np.array(Image.open(depth_png))
+        if depth_img.ndim == 3 and depth_img.shape[2] >= 3:
+            # 24-bit RGB encoded RLBench / CoppeliaSim depth map
+            float_array = np.sum(depth_img[:, :, :3] * [65536, 256, 1], axis=2).astype(np.float32)
+            norm_depth = float_array / float(2**24 - 1)
+            
+            near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
+            if os.path.exists(near_far_file):
+                with open(near_far_file, "r") as f:
+                    nf_parts = f.read().strip().split()
+                    near = float(nf_parts[0])
+                    far = float(nf_parts[1])
+                depth_np = (far - near) * norm_depth + near
             else:
-                depth_img = np.array(Image.open(depth_png))
-                depth_np = depth_img.astype(np.float32)
-                if depth_np.max() > 50.0:
-                    depth_np = depth_np / 1000.0
+                depth_np = norm_depth * 3.0 # fallback scale
         else:
-            depth_img = np.array(Image.open(depth_png))
-            if depth_img.ndim == 3 and depth_img.shape[2] >= 3:
-                float_array = np.sum(depth_img[:, :, :3] * [65536, 256, 1], axis=2).astype(np.float32)
-                norm_depth = float_array / float(2**24 - 1)
-                near_far_file = os.path.join(poses_dir, f"{view_name}_near_far.txt")
-                if os.path.exists(near_far_file):
-                    with open(near_far_file, "r") as f:
-                        nf_parts = f.read().strip().split()
-                        near = float(nf_parts[0]), float(nf_parts[1])
-                    depth_np = (far - near) * norm_depth + near
-                else:
-                    depth_np = norm_depth * 3.0
-            else:
-                depth_np = depth_img.astype(np.float32)
-                if depth_np.max() > 50.0:
-                    depth_np = depth_np / 1000.0
+            depth_np = depth_img.astype(np.float32)
+            if depth_np.max() > 50.0:
+                depth_np = depth_np / 1000.0
     else:
         raise FileNotFoundError(f"Could not find depth file for view '{view_name}' in '{depth_dir}' (.npy or .png)")
 
     depth = torch.from_numpy(depth_np).unsqueeze(0)
 
-    # Load Mask (H, W) if available
+    # Load Mask (H, W) if available (channel 0 in RGB contains exact object ID)
     mask = None
     if os.path.exists(mask_path):
-        if HAS_CV2:
-            mask_np = cv2.imread(mask_path, cv2.IMREAD_UNCHANGED)
-            if mask_np is not None:
-                if mask_np.ndim == 3:
-                    mask_np = mask_np[:, :, 0]
-                mask = torch.from_numpy(mask_np.astype(np.int32))
-            else:
-                mask_np = np.array(Image.open(mask_path), dtype=np.int32)
-                if mask_np.ndim == 3:
-                    mask_np = mask_np[:, :, 0]
-                mask = torch.from_numpy(mask_np)
-        else:
-            mask_np = np.array(Image.open(mask_path), dtype=np.int32)
-            if mask_np.ndim == 3:
-                mask_np = mask_np[:, :, 0]
-            mask = torch.from_numpy(mask_np)
+        mask_np = np.array(Image.open(mask_path), dtype=np.int32)
+        if mask_np.ndim == 3:
+            mask_np = mask_np[:, :, 0]
+        mask = torch.from_numpy(mask_np)
 
     # Load Pose and Intrinsics
     rotation, translation, intrinsics = read_pose_file(pose_path)
@@ -299,6 +256,34 @@ class AsyncTimestepPrefetcher:
     def close(self):
         self.stop_event.set()
         self.pool.shutdown(wait=False)
+
+
+class AsyncGaussianSaver:
+    """
+    Background worker that saves 3D Gaussian scenes (.ply / .pt) asynchronously,
+    preventing disk write latency from stalling the main loop.
+    """
+    def __init__(self, output_dir, max_workers=2):
+        self.output_dir = output_dir
+        self.pool = ThreadPoolExecutor(max_workers=max_workers)
+        self.futures = []
+
+    def submit_save(self, timestep_num, scene_gaussians, save_ply=True, save_pt=True):
+        cpu_scene = {k: v.detach().cpu().clone() for k, v in scene_gaussians.items()}
+        f = self.pool.submit(
+            save_gaussian_scene,
+            output_dir=self.output_dir,
+            timestep_num=timestep_num,
+            scene_gaussians=cpu_scene,
+            save_ply=save_ply,
+            save_pt=save_pt
+        )
+        self.futures.append(f)
+
+    def wait_all(self):
+        for f in self.futures:
+            f.result()
+        self.pool.shutdown(wait=True)
 
 
 def auto_detect_table_workspace_bounds(
@@ -845,6 +830,11 @@ def main():
             num_io_workers=4
         )
 
+    # Initialize background asynchronous Gaussian scene saver
+    gaussian_saver = None
+    if args.save_gaussians:
+        gaussian_saver = AsyncGaussianSaver(output_dir=args.output_dir, max_workers=2)
+
     for t_idx, (timestep_num, timestep_folder) in enumerate(valid_timesteps):
         t_start = time.time()
         print(f"\n>>> [TIMESTEP {timestep_num}] Loading frames from {os.path.basename(timestep_folder)}...")
@@ -1108,24 +1098,29 @@ def main():
         t_sim_ms = (time.time() - t_sim_start) * 1000.0
 
         # ---------------------------------------------------------
-        # Save 3D Gaussian Splatting Scene for this Timestep
+        # Save 3D Gaussian Splatting Scene for this Timestep (Asynchronous)
         # ---------------------------------------------------------
         t_save_start = time.time()
-        if args.save_gaussians:
+        if args.save_gaussians and gaussian_saver is not None:
             save_ply = args.gaussians_format in ["ply", "both"]
             save_pt = args.gaussians_format in ["pt", "both"]
-            saved_paths = save_gaussian_scene(
-                output_dir=args.output_dir,
+            gaussian_saver.submit_save(
                 timestep_num=timestep_num,
                 scene_gaussians=scene_gaussians,
                 save_ply=save_ply,
                 save_pt=save_pt
             )
             obj_ids_present = [int(x) for x in torch.unique(scene_gaussians['obj_id']).cpu().numpy().tolist()] if len(scene_gaussians['obj_id']) > 0 else []
+            saved_files = {}
+            base_name = f"timestep_{timestep_num:04d}"
+            if save_ply:
+                saved_files['ply'] = f"gaussians/{base_name}.ply"
+            if save_pt:
+                saved_files['pt'] = f"gaussians/{base_name}.pt"
             seq_manifest["timesteps"].append({
                 "timestep": timestep_num,
                 "num_gaussians": len(scene_gaussians['xyz']),
-                "files": {k: os.path.relpath(v, args.output_dir) for k, v in saved_paths.items()},
+                "files": saved_files,
                 "unique_obj_ids": obj_ids_present
             })
         t_save_ms = (time.time() - t_save_start) * 1000.0
@@ -1150,6 +1145,9 @@ def main():
 
     if prefetcher is not None:
         prefetcher.close()
+
+    if gaussian_saver is not None:
+        gaussian_saver.wait_all()
 
     # -------------------------------------------------------------
     # Export Sequence Manifest JSON
