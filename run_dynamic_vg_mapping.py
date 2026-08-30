@@ -85,10 +85,10 @@ def parse_args():
                         help="Disable saving 3D Gaussian scenes")
     parser.add_argument("--gaussians_format", type=str, choices=["ply", "pt", "both"], default="both",
                         help="Format to save Gaussian scenes: 'ply', 'pt', or 'both' (default: both)")
-    parser.add_argument("--launch_viser", action="store_true",
-                        help="Launch interactive Viser 3D web visualizer after processing")
-    parser.add_argument("--viser_port", type=int, default=8080,
-                        help="Port for Viser web server (default: 8080)")
+    parser.add_argument("--raycast_stride", type=int, default=2,
+                        help="Raycasting pixel stride for VDC free-space pruning (default: 2)")
+    parser.add_argument("--raycast_steps", type=int, default=256,
+                        help="Number of sampling steps along each ray for VDC free-space pruning (default: 256)")
     parser.add_argument("--output_dir", type=str, default="./output_dynamic_mapping", help="Output directory for saved meshes/logs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
     return parser.parse_args()
@@ -900,7 +900,9 @@ def main():
                 is_initial_timestep=(t_idx == 0),
                 num_views=len(observations),
                 robot_ids=robot_ids,
-                target_object_ids=target_object_ids
+                target_object_ids=target_object_ids,
+                raycast_stride=args.raycast_stride,
+                raycast_steps=args.raycast_steps
             )
 
             # Apply pruning

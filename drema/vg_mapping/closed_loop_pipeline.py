@@ -92,7 +92,9 @@ class DREMAClosedLoopVGMappingPipeline:
         is_initial_timestep: bool = False,
         num_views: int = 1,
         robot_ids: Optional[Set[int]] = None,
-        target_object_ids: Optional[Set[int]] = None
+        target_object_ids: Optional[Set[int]] = None,
+        raycast_stride: int = 2,
+        raycast_steps: int = 256
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Step 2: Variation detection & Morton code raycast pruning.
@@ -103,7 +105,9 @@ class DREMAClosedLoopVGMappingPipeline:
             intrinsic=intrinsic,
             pose=camera_pose,
             tsdf_map=self.tsdf_map,
-            gaussian_morton_codes=current_morton_codes
+            gaussian_morton_codes=current_morton_codes,
+            stride=raycast_stride,
+            num_steps=raycast_steps
         )
 
         new_gaussians = self.vdc.detect_and_initialize_gaussians(
