@@ -87,8 +87,8 @@ def parse_args():
                         help="Format to save Gaussian scenes: 'ply', 'pt', or 'both' (default: both)")
     parser.add_argument("--raycast_stride", type=int, default=2,
                         help="Raycasting pixel stride for VDC free-space pruning (default: 2)")
-    parser.add_argument("--raycast_steps", type=int, default=256,
-                        help="Number of sampling steps along each ray for VDC free-space pruning (default: 256)")
+    parser.add_argument("--raycast_steps", type=int, default=None,
+                        help="Number of sampling steps along each ray for VDC free-space pruning (default: None = auto-calculated S=L/(0.5*s))")
     parser.add_argument("--launch_viser", action="store_true",
                         help="Launch interactive Viser 3D web visualizer after processing")
     parser.add_argument("--viser_port", type=int, default=8080,

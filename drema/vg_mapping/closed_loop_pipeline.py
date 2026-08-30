@@ -94,7 +94,7 @@ class DREMAClosedLoopVGMappingPipeline:
         robot_ids: Optional[Set[int]] = None,
         target_object_ids: Optional[Set[int]] = None,
         raycast_stride: int = 2,
-        raycast_steps: int = 256
+        raycast_steps: Optional[int] = None
     ) -> Tuple[Dict[str, torch.Tensor], torch.Tensor]:
         """
         Step 2: Variation detection & Morton code raycast pruning.
