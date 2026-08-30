@@ -643,9 +643,10 @@ def main():
     else:
         print("[Info] PyBullet is not installed in this environment. Physics simulation sync skipped.")
 
-    # Target Object IDs and Robot Link IDs (filter out robot from 3D Gaussian generation)
+    # Target Object IDs and Robot Link IDs (filter out robot from 3DGS generation)
     target_object_ids = set()
     robot_ids = set()
+    id_to_name = {0: "Background", 1: "Table/Workspace", -1: "Workspace_Cluster"}
     labels_file = args.labels_file
     if labels_file is None:
         candidates = [
@@ -665,6 +666,7 @@ def main():
                     parts = line.split(";")
                     if len(parts) >= 2 and parts[1].strip().isdigit():
                         name, num = parts[0].strip(), int(parts[1].strip())
+                        id_to_name[num] = name
                         name_lower = name.lower()
                         if any(kw in name_lower for kw in ["panda", "link", "finger", "hand", "joint", "arm", "gripper"]):
                             robot_ids.add(num)
@@ -936,7 +938,7 @@ def main():
         t_vdc_ms = (time.time() - t_vdc_start) * 1000.0
 
         # ---------------------------------------------------------
-        # STEP 3 & 4: RecurGS SE(3) Multi-Object Motion Estimation & PyBullet Sync
+        # STEP 3 & 4: RecurGS Batched Multi-Object SE(3) Tracking & PyBullet Sync
         # ---------------------------------------------------------
         t_se3_ms = 0.0
         if timestep_num > 0 and len(observations) > 0:
@@ -969,6 +971,7 @@ def main():
                 if torch.any(fg_mask):
                     dynamic_obj_ids = [-1]
 
+            objects_to_track = {}
             for oid in dynamic_obj_ids:
                 if oid == -1:
                     obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.65) & (scene_gaussians['xyz'][:, 1] > -0.45) & (scene_gaussians['xyz'][:, 1] < 0.45)
@@ -1018,12 +1021,12 @@ def main():
                         'initial_pos': init_pos,
                         'color': avg_color
                     }
-                    print(f"✓ Discovered object ID {oid}: exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
+                    print(f"✓ Discovered object ID {oid} ({id_to_name.get(oid, f'Object_{oid}')}): exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
 
-                # Subsample object Gaussians for fast Lie algebra SE(3) optimization
+                # Subsample object Gaussians for fast Lie algebra SE(3) optimization (up to 512 points)
                 N_pts = len(obj_xyz)
-                if N_pts > 1024:
-                    sub_idx = torch.randperm(N_pts, device=device)[:1024]
+                if N_pts > 512:
+                    sub_idx = torch.randperm(N_pts, device=device)[:512]
                     obj_subset = {
                         'xyz': obj_xyz[sub_idx],
                         'rgb': obj_rgb[sub_idx],
@@ -1035,29 +1038,34 @@ def main():
                         'rgb': obj_rgb,
                         'scale': obj_scale
                     }
+                objects_to_track[oid] = obj_subset
 
-                # Step 3: Lie algebra pose optimization
-                T_fine = pipeline.step_3_estimate_se3_motion(
-                    object_gaussians_t0=obj_subset,
+            # Step 3: Batched Multi-Object Lie algebra pose optimization in parallel with early stopping
+            if len(objects_to_track) > 0:
+                T_fine_dict = pipeline.step_3_estimate_multi_se3_motion(
+                    objects_gaussians=objects_to_track,
                     gt_rgb_t1=ref_obs['rgb'],
                     gt_depth_t1=ref_obs['depth'],
                     intrinsic=ref_obs['K'],
                     camera_pose=ref_obs['pose'],
-                    num_iterations=50
+                    num_iterations=50,
+                    tol=1e-4
                 )
 
-                # Step 4: Synchronize PyBullet object pose
-                target_body_id = tracked_objects[oid]['pybullet_id'] if oid in tracked_objects else 1
-                target_current_pos = [float(v) for v in obj_xyz.mean(dim=0).cpu().numpy()]
+                # Step 4: Synchronize PyBullet object poses
+                for oid, T_fine in T_fine_dict.items():
+                    target_body_id = tracked_objects[oid]['pybullet_id'] if oid in tracked_objects else 1
+                    target_current_pos = [float(v) for v in scene_gaussians['xyz'][scene_gaussians['obj_id'] == oid].mean(dim=0).cpu().numpy()] if torch.any(scene_gaussians['obj_id'] == oid) else [0.35, 0.0, 0.775]
 
-                pipeline.step_4_sync_pybullet_physics(
-                    pybullet_body_id=target_body_id,
-                    T_fine=T_fine,
-                    initial_position=target_current_pos
-                )
+                    pipeline.step_4_sync_pybullet_physics(
+                        pybullet_body_id=target_body_id,
+                        T_fine=T_fine,
+                        initial_position=target_current_pos
+                    )
 
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
+            t_se3_ms = (time.time() - t_se3_start) * 1000.0
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
@@ -1126,7 +1134,19 @@ def main():
         t_save_ms = (time.time() - t_save_start) * 1000.0
 
         t_elapsed = (time.time() - t_start) * 1000.0
-        print(f"  • Gaussians: {len(scene_gaussians['xyz'])} (+{num_added}, -{total_pruned})")
+        
+        # Compute breakdown of Gaussians per object ID
+        unique_uids, uid_counts = torch.unique(scene_gaussians['obj_id'], return_counts=True)
+        breakdown_items = []
+        for uid_t, count_t in zip(unique_uids, uid_counts):
+            uid_val = int(uid_t.item())
+            count_val = int(count_t.item())
+            name_val = id_to_name.get(uid_val, f"ID_{uid_val}")
+            breakdown_items.append(f"{name_val} (ID {uid_val}): {count_val:,}")
+        breakdown_str = " | ".join(breakdown_items)
+
+        print(f"  • Gaussians: {len(scene_gaussians['xyz']):,} (+{num_added:,}, -{total_pruned:,})")
+        print(f"  • Gaussian Breakdown: {breakdown_str}")
         
         timing_parts = [
             f"IO={t_io_ms:.1f}ms",

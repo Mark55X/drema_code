@@ -146,6 +146,30 @@ class DREMAClosedLoopVGMappingPipeline:
         )
         return T_fine
 
+    def step_3_estimate_multi_se3_motion(
+        self,
+        objects_gaussians: Dict[int, Dict[str, torch.Tensor]],
+        gt_rgb_t1: torch.Tensor,
+        gt_depth_t1: torch.Tensor,
+        intrinsic: torch.Tensor,
+        camera_pose: torch.Tensor,
+        num_iterations: int = 50,
+        tol: float = 1e-4
+    ) -> Dict[int, torch.Tensor]:
+        """
+        Step 3 (Multi-Object): Simultaneously estimate independent rigid transformations T_fine_k in SE(3)
+        for all K dynamic objects in parallel on GPU.
+        """
+        return self.se3_aligner.optimize_multi_object_se3_pose(
+            objects_gaussians=objects_gaussians,
+            gt_rgb=gt_rgb_t1,
+            gt_depth=gt_depth_t1,
+            intrinsic=intrinsic,
+            camera_pose=camera_pose,
+            num_iterations=num_iterations,
+            tol=tol
+        )
+
     def step_4_sync_pybullet_physics(
         self,
         pybullet_body_id: int,
