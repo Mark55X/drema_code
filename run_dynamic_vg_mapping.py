@@ -1030,14 +1030,16 @@ def main():
     print("\n--- Extracting Final Marching Cubes Surface Mesh from TSDF ---")
     verts, faces = pipeline.tsdf_map.extract_mesh(level=0.0)
     mesh_output_file = os.path.join(args.output_dir, "final_tsdf_mesh.obj")
-    
-    try:
-        import trimesh
-        mesh = trimesh.Trimesh(vertices=verts, faces=faces)
-        mesh.export(mesh_output_file)
-        print(f"✓ Saved final solid surface mesh to: {mesh_output_file} ({len(verts)} vertices, {len(faces)} faces)")
-    except ImportError:
-        print(f"✓ Extracted mesh: {len(verts)} vertices, {len(faces)} faces (trimesh not installed for .obj export).")
+    if verts is not None and len(verts) > 0 and faces is not None and len(faces) > 0:
+        try:
+            import trimesh
+            mesh = trimesh.Trimesh(vertices=verts, faces=faces)
+            mesh.export(mesh_output_file)
+            print(f"✓ Saved final solid surface mesh to: {mesh_output_file} ({len(verts)} vertices, {len(faces)} faces)")
+        except ImportError:
+            print(f"✓ Extracted mesh: {len(verts)} vertices, {len(faces)} faces (trimesh not installed for .obj export).")
+    else:
+        print("ℹ️ TSDF Marching Cubes yielded 0 vertices/faces; no mesh exported.")
 
     total_time = time.time() - total_start_time
     print(f"\n==================================================================")

@@ -3,11 +3,10 @@ numpy==1.23
 open3d
 matplotlib
 object2urdf
-trimesh==3.10
+trimesh>=3.21.7,<4.0.0
 pybullet
 mediapy
 plyfile
-setuptools==49.4
 hydra-core>=1.3.2
 pynput
 viser>=0.2.0

@@ -248,10 +248,21 @@ def launch_viser_server(
     if os.path.exists(tsdf_mesh_path):
         try:
             import trimesh
-            tsdf_mesh_obj = trimesh.load(tsdf_mesh_path)
-            print(f"✓ Found TSDF Marching Cubes mesh: {tsdf_mesh_path}")
-        except Exception:
-            pass
+            loaded_mesh = trimesh.load(tsdf_mesh_path, force='mesh')
+            if isinstance(loaded_mesh, trimesh.Trimesh) and hasattr(loaded_mesh, 'vertices') and len(loaded_mesh.vertices) > 0 and hasattr(loaded_mesh, 'faces') and len(loaded_mesh.faces) > 0:
+                tsdf_mesh_obj = loaded_mesh
+                print(f"✓ Found TSDF Marching Cubes mesh: {tsdf_mesh_path} ({len(tsdf_mesh_obj.vertices)} verts, {len(tsdf_mesh_obj.faces)} faces)")
+            elif isinstance(loaded_mesh, trimesh.Scene):
+                geoms = [g for g in loaded_mesh.geometry.values() if isinstance(g, trimesh.Trimesh) and len(g.vertices) > 0 and len(g.faces) > 0]
+                if len(geoms) > 0:
+                    tsdf_mesh_obj = trimesh.util.concatenate(geoms)
+                    print(f"✓ Found TSDF Marching Cubes mesh: {tsdf_mesh_path} ({len(tsdf_mesh_obj.vertices)} verts, {len(tsdf_mesh_obj.faces)} faces)")
+                else:
+                    print(f"ℹ️ TSDF mesh {tsdf_mesh_path} is empty or has 0 faces. Skipping mesh overlay.")
+            else:
+                print(f"ℹ️ TSDF mesh {tsdf_mesh_path} is empty or invalid. Skipping mesh overlay.")
+        except Exception as e:
+            print(f"⚠️ Could not load TSDF mesh: {e}")
 
     markdown_info = None
 
@@ -467,11 +478,15 @@ def launch_viser_server(
     # TSDF Mesh overlay
     tsdf_mesh_handle = None
     if tsdf_mesh_obj is not None:
-        tsdf_mesh_handle = server.scene.add_mesh_trimesh(
-            name="/environment/tsdf_mesh",
-            mesh=tsdf_mesh_obj,
-            visible=state['show_tsdf_mesh']
-        )
+        try:
+            tsdf_mesh_handle = server.scene.add_mesh_trimesh(
+                name="/environment/tsdf_mesh",
+                mesh=tsdf_mesh_obj,
+                visible=state['show_tsdf_mesh']
+            )
+        except Exception as e:
+            print(f"⚠️ Could not add TSDF mesh to scene: {e}")
+            tsdf_mesh_handle = None
 
     # -------------------------------------------------------------
     # Callbacks & Event Handlers
