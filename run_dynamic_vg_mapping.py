@@ -1178,18 +1178,24 @@ def main():
 
                 if robot_body_id is not None:
                     try:
-                        b_pos, b_quat = p.getBasePositionAndOrientation(robot_body_id)
-                        robot_links["panda_link0"] = {
-                            "pos": [round(float(v), 5) for v in b_pos],
-                            "quat_xyzw": [round(float(v), 5) for v in b_quat]
-                        }
-                        for l_idx in range(p.getNumJoints(robot_body_id)):
-                            info = p.getJointInfo(robot_body_id, l_idx)
-                            link_name = info[12].decode('utf-8')
-                            l_state = p.getLinkState(robot_body_id, l_idx)
+                        v_shapes = p.getVisualShapeData(robot_body_id)
+                        for v in v_shapes:
+                            l_idx = v[1]
+                            local_pos = v[5]
+                            local_orn = v[6]
+                            if l_idx == -1:
+                                link_name = "robot_base"
+                                b_pos, b_quat = p.getBasePositionAndOrientation(robot_body_id)
+                                vis_pos, vis_quat = p.multiplyTransforms(b_pos, b_quat, local_pos, local_orn)
+                            else:
+                                info = p.getJointInfo(robot_body_id, l_idx)
+                                link_name = info[12].decode('utf-8')
+                                l_state = p.getLinkState(robot_body_id, l_idx)
+                                vis_pos, vis_quat = p.multiplyTransforms(l_state[4], l_state[5], local_pos, local_orn)
+
                             robot_links[link_name] = {
-                                "pos": [round(float(v), 5) for v in l_state[4]],
-                                "quat_xyzw": [round(float(v), 5) for v in l_state[5]]
+                                "pos": [round(float(val), 5) for val in vis_pos],
+                                "quat_xyzw": [round(float(val), 5) for val in vis_quat]
                             }
                     except Exception:
                         pass

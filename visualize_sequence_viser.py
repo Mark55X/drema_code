@@ -328,6 +328,36 @@ def launch_viser_server(
 
     render_lock = threading.Lock()
 
+    # Pre-instantiate Robot Mesh Handles ONCE at startup to avoid WebSocket re-transmissions and mesh flashing
+    robot_mesh_handles = {}
+    for l_name, mesh in loaded_franka_meshes.items():
+        try:
+            robot_mesh_handles[l_name] = server.scene.add_mesh_trimesh(
+                name=f"/pybullet/robot/mesh/{l_name}",
+                mesh=mesh,
+                position=(0.0, 0.0, -20.0),
+                visible=False
+            )
+        except Exception:
+            pass
+
+    # Pre-instantiate Tracked Physical Body Handles ONCE at startup
+    body_mesh_handles = {}
+    for oid in sorted_obj_ids:
+        if oid != 0:
+            try:
+                col_rgb = palette.get(oid, np.array([0.85, 0.35, 0.15]))
+                body_mesh_handles[str(oid)] = server.scene.add_box(
+                    name=f"/pybullet/bodies/{oid}",
+                    position=(0.0, 0.0, -20.0),
+                    dimensions=(0.05, 0.05, 0.05),
+                    color=(int(col_rgb[0]*255), int(col_rgb[1]*255), int(col_rgb[2]*255)),
+                    opacity=0.90,
+                    visible=False
+                )
+            except Exception:
+                pass
+
     # -------------------------------------------------------------
     # Render Function
     # -------------------------------------------------------------
@@ -337,58 +367,49 @@ def launch_viser_server(
         try:
             t = state['current_t']
             
-            # 1. Render Photorealistic Franka Panda Robot in 3D
+            # 1. Update Photorealistic Franka Panda Robot Poses (Zero-Flicker Transform Update)
             if t in pybullet_timeline:
                 pb_frame = pybullet_timeline[t]
                 r_links = pb_frame.get("robot_links", {})
-                if state['show_robot'] and len(r_links) > 0:
-                    for l_name, l_data in r_links.items():
-                        pos = tuple(l_data["pos"])
-                        q = l_data["quat_xyzw"]
-                        wxyz = (q[3], q[0], q[1], q[2])
-                        mesh = loaded_franka_meshes.get(l_name, loaded_franka_meshes.get(l_name.lower(), None))
-                        if mesh is not None:
-                            server.scene.add_mesh_trimesh(
-                                name=f"/pybullet/robot/mesh/{l_name}",
-                                mesh=mesh,
-                                position=pos,
-                                wxyz=wxyz,
-                                visible=True
-                            )
-                else:
-                    for l_name in r_links.keys():
+                for l_name, handle in robot_mesh_handles.items():
+                    target_data = r_links.get(l_name, r_links.get(l_name.lower(), None))
+                    if state['show_robot'] and target_data is not None:
+                        q = target_data["quat_xyzw"]
+                        handle.position = tuple(target_data["pos"])
+                        handle.wxyz = (q[3], q[0], q[1], q[2])
+                        handle.visible = True
+                    else:
+                        handle.visible = False
+
+                # 2. Update PyBullet Tracked Bodies (Zero-Flicker Transform Update)
+                pb_bodies = pb_frame.get("bodies", {})
+                # Dynamically create handle if newly discovered
+                for oid_str, b_data in pb_bodies.items():
+                    if oid_str not in body_mesh_handles:
                         try:
-                            server.scene.add_mesh_trimesh(name=f"/pybullet/robot/mesh/{l_name}", mesh=trimesh.Trimesh(), visible=False)
+                            col_rgba = b_data.get("color", [0.9, 0.4, 0.1, 1.0])
+                            body_mesh_handles[oid_str] = server.scene.add_box(
+                                name=f"/pybullet/bodies/{oid_str}",
+                                position=(0.0, 0.0, -20.0),
+                                dimensions=(0.05, 0.05, 0.05),
+                                color=(int(col_rgba[0]*255), int(col_rgba[1]*255), int(col_rgba[2]*255)),
+                                opacity=0.90,
+                                visible=False
+                            )
                         except Exception:
                             pass
 
-                # 2. Render PyBullet Tracked Bodies (Cubes / Parallelepipeds)
-                pb_bodies = pb_frame.get("bodies", {})
-                if state['show_pybullet_bodies'] and len(pb_bodies) > 0:
-                    for oid_str, b_data in pb_bodies.items():
-                        pos = tuple(b_data["pos"])
+                for oid_str, handle in body_mesh_handles.items():
+                    if state['show_pybullet_bodies'] and oid_str in pb_bodies:
+                        b_data = pb_bodies[oid_str]
                         q = b_data["quat_xyzw"]
-                        wxyz = (q[3], q[0], q[1], q[2])
-                        col_rgba = b_data.get("color", [0.9, 0.4, 0.1, 1.0])
-                        col_rgb = (int(col_rgba[0]*255), int(col_rgba[1]*255), int(col_rgba[2]*255))
-                        # Read true 3D dimensions (X, Y, Z)
+                        handle.position = tuple(b_data["pos"])
+                        handle.wxyz = (q[3], q[0], q[1], q[2])
                         raw_dims = b_data.get("dims", [0.05, 0.05, 0.05])
-                        dims = tuple(float(d) for d in raw_dims)
-                        server.scene.add_box(
-                            name=f"/pybullet/bodies/{oid_str}",
-                            position=pos,
-                            wxyz=wxyz,
-                            dimensions=dims,
-                            color=col_rgb,
-                            opacity=0.90,
-                            visible=True
-                        )
-                else:
-                    for oid_str in pb_bodies.keys():
-                        try:
-                            server.scene.add_box(name=f"/pybullet/bodies/{oid_str}", visible=False)
-                        except Exception:
-                            pass
+                        handle.dimensions = tuple(float(d) for d in raw_dims)
+                        handle.visible = True
+                    else:
+                        handle.visible = False
 
             # 3. Render 3D Gaussian Splats
             if not state['show_gaussians'] or t not in sequence_cache:
