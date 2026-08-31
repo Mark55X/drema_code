@@ -1036,6 +1036,8 @@ def main():
                     dims = [max(0.02, min(0.35, float(e))) for e in extents]
                     half_extents = [float(d) / 2.0 for d in dims]
 
+                    mesh_obj_path = create_object_mesh_shape(pts_centered, args.output_dir, oid)
+
                     if mesh_obj_path and os.path.exists(mesh_obj_path):
                         obj_vis = p.createVisualShape(p.GEOM_MESH, fileName=mesh_obj_path, rgbaColor=avg_color)
                         obj_col = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_obj_path)
