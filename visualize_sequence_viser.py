@@ -224,6 +224,19 @@ def launch_viser_server(
     palette = generate_object_palette(max(sorted_obj_ids) if len(sorted_obj_ids) > 0 else 10)
     print(f"✓ Cached {len(sequence_cache)} timesteps. Discovered object IDs: {sorted_obj_ids}")
 
+    # Extract true photorealistic RGB colors for each object from initial Gaussian frame
+    true_object_rgb = {}
+    if len(timesteps) > 0:
+        first_frame = sequence_cache[timesteps[0][0]]
+        for oid in sorted_obj_ids:
+            if oid != 0 and len(first_frame['obj_id']) > 0:
+                mask = (first_frame['obj_id'] == oid)
+                if np.any(mask):
+                    mean_c = first_frame['rgb'][mask].mean(axis=0)
+                    true_object_rgb[oid] = np.clip(mean_c, 0.0, 1.0)
+                else:
+                    true_object_rgb[oid] = np.array([0.85, 0.35, 0.15], dtype=np.float32)
+
     # Start Viser Server
     server = viser.ViserServer(host=host, port=port)
     server.scene.set_up_direction("+z")
@@ -407,6 +420,20 @@ def launch_viser_server(
                         handle.wxyz = (q[3], q[0], q[1], q[2])
                         raw_dims = b_data.get("dims", [0.05, 0.05, 0.05])
                         handle.dimensions = tuple(float(d) for d in raw_dims)
+
+                        # Update body color based on Color Mode (Photorealistic RGB vs Semantic Palette)
+                        oid_int = int(oid_str) if oid_str.isdigit() or (oid_str.startswith('-') and oid_str[1:].isdigit()) else -1
+                        if state['color_mode'] == "Semantic Segmentation (Object ID)":
+                            c_arr = palette.get(oid_int, np.array([0.85, 0.35, 0.15]))
+                        else:
+                            c_raw = b_data.get("color", true_object_rgb.get(oid_int, [0.85, 0.35, 0.15]))
+                            c_arr = np.array(c_raw[:3], dtype=np.float32)
+
+                        handle.color = (
+                            int(np.clip(c_arr[0], 0.0, 1.0) * 255),
+                            int(np.clip(c_arr[1], 0.0, 1.0) * 255),
+                            int(np.clip(c_arr[2], 0.0, 1.0) * 255)
+                        )
                         handle.visible = True
                     else:
                         handle.visible = False
