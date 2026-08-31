@@ -244,10 +244,32 @@ def launch_viser_server(
         'render_mode': "Point Cloud (Fast)",
         'point_size': point_size,
         'active_objects': {oid: True for oid in sorted_obj_ids},
+        'show_gaussians': True,
+        'show_pybullet_bodies': True,
+        'show_robot': True,
         'show_workspace_bounds': True,
         'show_tsdf_mesh': False,
         'loop': True
     }
+
+    # Load sequence manifest for PyBullet metadata
+    manifest_path = os.path.join(data_dir, "sequence_manifest.json")
+    manifest_data = {}
+    pybullet_timeline = {}
+    if os.path.exists(manifest_path):
+        try:
+            with open(manifest_path, "r") as f:
+                manifest_data = json.load(f)
+            for item in manifest_data.get("timesteps", []):
+                t_n = item["timestep"]
+                pybullet_timeline[t_n] = {
+                    "bodies": item.get("pybullet_bodies", {}),
+                    "robot_links": item.get("robot_links", {})
+                }
+            if len(pybullet_timeline) > 0:
+                print(f"✓ Found PyBullet physical simulation telemetry ({len(pybullet_timeline)} timesteps recorded)")
+        except Exception as e:
+            print(f"⚠️ Could not parse sequence_manifest.json for PyBullet telemetry: {e}")
 
     # Load TSDF mesh if available
     tsdf_mesh_path = os.path.join(data_dir, "final_tsdf_mesh.obj")
@@ -275,6 +297,20 @@ def launch_viser_server(
 
     render_lock = threading.Lock()
 
+    # Robot link hierarchy for Franka Panda kinematic bone rendering
+    robot_link_pairs = [
+        ("panda_link0", "panda_link1"),
+        ("panda_link1", "panda_link2"),
+        ("panda_link2", "panda_link3"),
+        ("panda_link3", "panda_link4"),
+        ("panda_link4", "panda_link5"),
+        ("panda_link5", "panda_link6"),
+        ("panda_link6", "panda_link7"),
+        ("panda_link7", "panda_hand"),
+        ("panda_hand", "panda_leftfinger"),
+        ("panda_hand", "panda_rightfinger")
+    ]
+
     # -------------------------------------------------------------
     # Render Function
     # -------------------------------------------------------------
@@ -283,7 +319,88 @@ def launch_viser_server(
             return
         try:
             t = state['current_t']
-            if t not in sequence_cache:
+            
+            # 1. Render PyBullet Robot Kinematics in 3D
+            if t in pybullet_timeline:
+                pb_frame = pybullet_timeline[t]
+                r_links = pb_frame.get("robot_links", {})
+                if state['show_robot'] and len(r_links) > 0:
+                    # Link frames & coordinate axes
+                    for l_name, l_data in r_links.items():
+                        pos = tuple(l_data["pos"])
+                        q = l_data["quat_xyzw"]
+                        wxyz = (q[3], q[0], q[1], q[2])
+                        server.scene.add_frame(
+                            name=f"/pybullet/robot/frames/{l_name}",
+                            position=pos,
+                            wxyz=wxyz,
+                            axes_length=0.035,
+                            axes_radius=0.003,
+                            visible=True
+                        )
+                    # Bone connections between joints
+                    for p_from, p_to in robot_link_pairs:
+                        if p_from in r_links and p_to in r_links:
+                            p_a = np.array(r_links[p_from]["pos"])
+                            p_b = np.array(r_links[p_to]["pos"])
+                            mid_p = tuple((p_a + p_b) / 2.0)
+                            diff = p_b - p_a
+                            dist = float(np.linalg.norm(diff))
+                            if dist > 1e-4:
+                                server.scene.add_box(
+                                    name=f"/pybullet/robot/bones/{p_from}_{p_to}",
+                                    position=mid_p,
+                                    dimensions=(0.04, 0.04, dist),
+                                    color=(220, 225, 230),
+                                    opacity=0.9,
+                                    visible=True
+                                )
+                else:
+                    # Hide robot if unchecked
+                    for l_name in r_links.keys():
+                        try:
+                            server.scene.add_frame(name=f"/pybullet/robot/frames/{l_name}", visible=False)
+                        except Exception:
+                            pass
+                    for p_from, p_to in robot_link_pairs:
+                        try:
+                            server.scene.add_box(name=f"/pybullet/robot/bones/{p_from}_{p_to}", visible=False)
+                        except Exception:
+                            pass
+
+                # 2. Render PyBullet Tracked Bodies (Cubes / Parallelepipeds)
+                pb_bodies = pb_frame.get("bodies", {})
+                if state['show_pybullet_bodies'] and len(pb_bodies) > 0:
+                    for oid_str, b_data in pb_bodies.items():
+                        pos = tuple(b_data["pos"])
+                        q = b_data["quat_xyzw"]
+                        wxyz = (q[3], q[0], q[1], q[2])
+                        col_rgba = b_data.get("color", [0.9, 0.4, 0.1, 1.0])
+                        col_rgb = (int(col_rgba[0]*255), int(col_rgba[1]*255), int(col_rgba[2]*255))
+                        # Default cube size 5x5x5 cm, or elongated for cube_1
+                        dims = (0.05, 0.05, 0.05) if oid_str in ["97", "1"] else (0.05, 0.12, 0.05)
+                        server.scene.add_box(
+                            name=f"/pybullet/bodies/{oid_str}",
+                            position=pos,
+                            wxyz=wxyz,
+                            dimensions=dims,
+                            color=col_rgb,
+                            opacity=0.88,
+                            visible=True
+                        )
+                else:
+                    for oid_str in pb_bodies.keys():
+                        try:
+                            server.scene.add_box(name=f"/pybullet/bodies/{oid_str}", visible=False)
+                        except Exception:
+                            pass
+
+            # 3. Render 3D Gaussian Splats
+            if not state['show_gaussians'] or t not in sequence_cache:
+                try:
+                    server.scene.add_point_cloud(name="/scene/gaussians", points=np.empty((0, 3)), colors=np.empty((0, 3)), visible=False)
+                except Exception:
+                    pass
                 return
 
             frame_data = sequence_cache[t]
@@ -307,6 +424,10 @@ def launch_viser_server(
                 filtered_xyz, filtered_rgb, filtered_scale, filtered_obj_id = xyz, rgb, scale, obj_id
 
             if len(filtered_xyz) == 0:
+                try:
+                    server.scene.add_point_cloud(name="/scene/gaussians", points=np.empty((0, 3)), colors=np.empty((0, 3)), visible=False)
+                except Exception:
+                    pass
                 return
 
             # Determine colors based on selected mode
@@ -346,7 +467,8 @@ def launch_viser_server(
                         covariances=covariances,
                         rgbs=colors,
                         opacities=opacities,
-                        scale=state['point_size'] / 0.005
+                        scale=state['point_size'] / 0.005,
+                        visible=True
                     )
                 else:
                     server.scene.add_point_cloud(
@@ -354,7 +476,8 @@ def launch_viser_server(
                         points=filtered_xyz,
                         colors=colors,
                         point_size=state['point_size'],
-                        point_shape="circle"
+                        point_shape="circle",
+                        visible=True
                     )
             except Exception:
                 pass
@@ -393,6 +516,11 @@ def launch_viser_server(
         
         fps_slider = server.gui.add_slider("Playback FPS", min=1, max=25, step=1, initial_value=state['fps'])
         loop_cb = server.gui.add_checkbox("Loop Sequence", initial_value=True)
+
+    with server.gui.add_folder("🤖 PyBullet Simulation (Interactive 3D)"):
+        show_robot_cb = server.gui.add_checkbox("Show Robot (Franka Panda Kinematics)", initial_value=True)
+        show_pb_bodies_cb = server.gui.add_checkbox("Show Tracked Bodies (Physics Collision)", initial_value=True)
+        show_gaussians_cb = server.gui.add_checkbox("Show 3D Gaussians (VG-Mapping)", initial_value=True)
 
     with server.gui.add_folder("🎨 Appearance & Color"):
         color_dropdown = server.gui.add_dropdown(
@@ -542,6 +670,21 @@ def launch_viser_server(
     @point_size_slider.on_update
     def _(_) -> None:
         state['point_size'] = point_size_slider.value
+        render_current_frame()
+
+    @show_robot_cb.on_update
+    def _(_) -> None:
+        state['show_robot'] = show_robot_cb.value
+        render_current_frame()
+
+    @show_pb_bodies_cb.on_update
+    def _(_) -> None:
+        state['show_pybullet_bodies'] = show_pb_bodies_cb.value
+        render_current_frame()
+
+    @show_gaussians_cb.on_update
+    def _(_) -> None:
+        state['show_gaussians'] = show_gaussians_cb.value
         render_current_frame()
 
     @bounds_cb.on_update

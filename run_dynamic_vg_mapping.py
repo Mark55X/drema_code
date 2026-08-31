@@ -1155,11 +1155,49 @@ def main():
                 saved_files['ply'] = f"gaussians/{base_name}.ply"
             if save_pt:
                 saved_files['pt'] = f"gaussians/{base_name}.pt"
+
+            # Record PyBullet physical simulation state for 3D interactive playback in Viser
+            pb_bodies = {}
+            robot_links = {}
+            if HAS_PYBULLET:
+                for oid, obj_data in tracked_objects.items():
+                    b_id = obj_data.get('pybullet_id', None)
+                    if b_id is not None:
+                        try:
+                            pos, quat = p.getBasePositionAndOrientation(b_id)
+                            pb_bodies[str(oid)] = {
+                                "pos": [round(float(v), 5) for v in pos],
+                                "quat_xyzw": [round(float(v), 5) for v in quat],
+                                "color": obj_data.get('color', [0.85, 0.35, 0.15, 1.0])
+                            }
+                        except Exception:
+                            pass
+
+                if robot_body_id is not None:
+                    try:
+                        b_pos, b_quat = p.getBasePositionAndOrientation(robot_body_id)
+                        robot_links["panda_link0"] = {
+                            "pos": [round(float(v), 5) for v in b_pos],
+                            "quat_xyzw": [round(float(v), 5) for v in b_quat]
+                        }
+                        for l_idx in range(p.getNumJoints(robot_body_id)):
+                            info = p.getJointInfo(robot_body_id, l_idx)
+                            link_name = info[12].decode('utf-8')
+                            l_state = p.getLinkState(robot_body_id, l_idx)
+                            robot_links[link_name] = {
+                                "pos": [round(float(v), 5) for v in l_state[4]],
+                                "quat_xyzw": [round(float(v), 5) for v in l_state[5]]
+                            }
+                    except Exception:
+                        pass
+
             seq_manifest["timesteps"].append({
                 "timestep": timestep_num,
                 "num_gaussians": len(scene_gaussians['xyz']),
                 "files": saved_files,
-                "unique_obj_ids": obj_ids_present
+                "unique_obj_ids": obj_ids_present,
+                "pybullet_bodies": pb_bodies,
+                "robot_links": robot_links
             })
         t_save_ms = (time.time() - t_save_start) * 1000.0
 
