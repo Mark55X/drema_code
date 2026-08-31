@@ -311,6 +311,33 @@ def launch_viser_server(
         ("panda_hand", "panda_rightfinger")
     ]
 
+    def get_link_bone_transform(p1: np.ndarray, p2: np.ndarray):
+        """
+        Computes position (mid-point), orientation quaternion (wxyz for Viser), and length
+        to align a box or cylinder with height along +Z between p1 and p2.
+        """
+        mid_p = (p1 + p2) / 2.0
+        v = p2 - p1
+        length = float(np.linalg.norm(v))
+        if length < 1e-4:
+            return tuple(mid_p), (1.0, 0.0, 0.0, 0.0), 0.0
+        
+        z_unit = np.array([0.0, 0.0, 1.0])
+        v_norm = v / length
+        dot = float(np.dot(z_unit, v_norm))
+        if dot > 0.99999:
+            wxyz = (1.0, 0.0, 0.0, 0.0)
+        elif dot < -0.99999:
+            wxyz = (0.0, 1.0, 0.0, 0.0)
+        else:
+            cross = np.cross(z_unit, v_norm)
+            w = 1.0 + dot
+            q_xyz = cross
+            q_norm = float(np.sqrt(w * w + np.dot(q_xyz, q_xyz)))
+            wxyz = (float(w / q_norm), float(q_xyz[0] / q_norm), float(q_xyz[1] / q_norm), float(q_xyz[2] / q_norm))
+        
+        return tuple(mid_p), wxyz, length
+
     # -------------------------------------------------------------
     # Render Function
     # -------------------------------------------------------------
@@ -325,40 +352,56 @@ def launch_viser_server(
                 pb_frame = pybullet_timeline[t]
                 r_links = pb_frame.get("robot_links", {})
                 if state['show_robot'] and len(r_links) > 0:
-                    # Link frames & coordinate axes
+                    # Render joint collars / dark rings
                     for l_name, l_data in r_links.items():
                         pos = tuple(l_data["pos"])
                         q = l_data["quat_xyzw"]
                         wxyz = (q[3], q[0], q[1], q[2])
+                        # Joint collar node
+                        is_finger = "finger" in l_name
+                        j_dims = (0.015, 0.015, 0.04) if is_finger else (0.055, 0.055, 0.045)
+                        j_col = (30, 32, 35) if not is_finger else (70, 75, 80)
+                        server.scene.add_box(
+                            name=f"/pybullet/robot/joints/{l_name}",
+                            position=pos,
+                            wxyz=wxyz,
+                            dimensions=j_dims,
+                            color=j_col,
+                            opacity=0.98,
+                            visible=True
+                        )
                         server.scene.add_frame(
                             name=f"/pybullet/robot/frames/{l_name}",
                             position=pos,
                             wxyz=wxyz,
-                            axes_length=0.035,
-                            axes_radius=0.003,
+                            axes_length=0.03,
+                            axes_radius=0.0025,
                             visible=True
                         )
-                    # Bone connections between joints
+                    # Render oriented metallic white bone links connecting consecutive joints
                     for p_from, p_to in robot_link_pairs:
                         if p_from in r_links and p_to in r_links:
                             p_a = np.array(r_links[p_from]["pos"])
                             p_b = np.array(r_links[p_to]["pos"])
-                            mid_p = tuple((p_a + p_b) / 2.0)
-                            diff = p_b - p_a
-                            dist = float(np.linalg.norm(diff))
-                            if dist > 1e-4:
+                            mid_p, wxyz_bone, dist = get_link_bone_transform(p_a, p_b)
+                            if dist > 0.005:
+                                is_finger = "finger" in p_to
+                                b_thick = 0.015 if is_finger else 0.046
+                                b_col = (70, 75, 80) if is_finger else (235, 238, 242)
                                 server.scene.add_box(
                                     name=f"/pybullet/robot/bones/{p_from}_{p_to}",
                                     position=mid_p,
-                                    dimensions=(0.04, 0.04, dist),
-                                    color=(220, 225, 230),
-                                    opacity=0.9,
+                                    wxyz=wxyz_bone,
+                                    dimensions=(b_thick, b_thick, dist),
+                                    color=b_col,
+                                    opacity=0.96,
                                     visible=True
                                 )
                 else:
                     # Hide robot if unchecked
                     for l_name in r_links.keys():
                         try:
+                            server.scene.add_box(name=f"/pybullet/robot/joints/{l_name}", visible=False)
                             server.scene.add_frame(name=f"/pybullet/robot/frames/{l_name}", visible=False)
                         except Exception:
                             pass
@@ -377,15 +420,16 @@ def launch_viser_server(
                         wxyz = (q[3], q[0], q[1], q[2])
                         col_rgba = b_data.get("color", [0.9, 0.4, 0.1, 1.0])
                         col_rgb = (int(col_rgba[0]*255), int(col_rgba[1]*255), int(col_rgba[2]*255))
-                        # Default cube size 5x5x5 cm, or elongated for cube_1
-                        dims = (0.05, 0.05, 0.05) if oid_str in ["97", "1"] else (0.05, 0.12, 0.05)
+                        # Read true 3D dimensions (X, Y, Z)
+                        raw_dims = b_data.get("dims", [0.05, 0.05, 0.05])
+                        dims = tuple(float(d) for d in raw_dims)
                         server.scene.add_box(
                             name=f"/pybullet/bodies/{oid_str}",
                             position=pos,
                             wxyz=wxyz,
                             dimensions=dims,
                             color=col_rgb,
-                            opacity=0.88,
+                            opacity=0.90,
                             visible=True
                         )
                 else:
@@ -520,6 +564,7 @@ def launch_viser_server(
     with server.gui.add_folder("🤖 PyBullet Simulation (Interactive 3D)"):
         show_robot_cb = server.gui.add_checkbox("Show Robot (Franka Panda Kinematics)", initial_value=True)
         show_pb_bodies_cb = server.gui.add_checkbox("Show Tracked Bodies (Physics Collision)", initial_value=True)
+        show_table_cb = server.gui.add_checkbox("Show Table Surface (PyBullet)", initial_value=True)
         show_gaussians_cb = server.gui.add_checkbox("Show 3D Gaussians (VG-Mapping)", initial_value=True)
 
     with server.gui.add_folder("🎨 Appearance & Color"):
@@ -573,7 +618,7 @@ def launch_viser_server(
     # Coordinate grid
     server.scene.add_grid("/environment/grid", width=2.0, height=2.0, plane="xy", cell_size=0.1)
 
-    # Dynamic workspace bounding box from sequence manifest
+    # Dynamic workspace bounding box and PyBullet table
     manifest_path = os.path.join(data_dir, "sequence_manifest.json")
     manifest_data = {}
     if os.path.exists(manifest_path):
@@ -583,12 +628,14 @@ def launch_viser_server(
         except Exception:
             pass
 
+    z_table_surf = 0.75
     if "workspace_bounds" in manifest_data:
         wb = manifest_data["workspace_bounds"]
         b_min = np.array(wb[0])
         b_max = np.array(wb[1])
         table_center = tuple((b_min + b_max) / 2.0)
         table_dims = tuple(b_max - b_min)
+        z_table_surf = float(b_min[2] + 0.06)
     elif "origin" in manifest_data and "grid_dim" in manifest_data:
         orig = np.array(manifest_data["origin"])
         g_dim = np.array(manifest_data["grid_dim"])
@@ -596,9 +643,11 @@ def launch_viser_server(
         ext = g_dim * v_size
         table_center = tuple(orig + ext / 2.0)
         table_dims = tuple(ext)
+        z_table_surf = float(orig[2] + 0.06)
     else:
-        table_center = ((0.1 + 0.65) / 2.0, (-0.45 + 0.45) / 2.0, (0.005 + 0.35) / 2.0 + 0.75)
-        table_dims = (0.65 - 0.1, 0.45 - (-0.45), 0.35 - 0.005)
+        table_center = (0.25, 0.0, 0.75)
+        table_dims = (0.8, 0.8, 0.35)
+        z_table_surf = 0.75
     
     workspace_box_handle = server.scene.add_box(
         name="/environment/workspace_box",
@@ -608,6 +657,26 @@ def launch_viser_server(
         color=(60, 140, 220),
         opacity=0.45,
         visible=state['show_workspace_bounds']
+    )
+
+    # PyBullet Table Top Surface (Solid Light Gray Slab)
+    table_top_handle = server.scene.add_box(
+        name="/pybullet/table/top",
+        position=(table_center[0], table_center[1], z_table_surf - 0.02),
+        dimensions=(max(0.85, table_dims[0]), max(0.85, table_dims[1]), 0.04),
+        color=(190, 195, 200),
+        opacity=0.96,
+        visible=state.get('show_table', True)
+    )
+
+    # PyBullet Table Pedestal / Legs (Solid Medium Gray Base)
+    table_pedestal_handle = server.scene.add_box(
+        name="/pybullet/table/pedestal",
+        position=(table_center[0], table_center[1], max(0.01, z_table_surf - 0.04) / 2.0),
+        dimensions=(max(0.75, table_dims[0] * 0.9), max(0.75, table_dims[1] * 0.9), max(0.02, z_table_surf - 0.04)),
+        color=(130, 135, 140),
+        opacity=0.96,
+        visible=state.get('show_table', True)
     )
 
     # TSDF Mesh overlay
@@ -681,6 +750,12 @@ def launch_viser_server(
     def _(_) -> None:
         state['show_pybullet_bodies'] = show_pb_bodies_cb.value
         render_current_frame()
+
+    @show_table_cb.on_update
+    def _(_) -> None:
+        state['show_table'] = show_table_cb.value
+        table_top_handle.visible = show_table_cb.value
+        table_pedestal_handle.visible = show_table_cb.value
 
     @show_gaussians_cb.on_update
     def _(_) -> None:

@@ -1030,17 +1030,16 @@ def main():
                     else:
                         avg_color = [0.8, 0.2, 0.2, 1.0]
 
-                    # Generate exact 3D geometric surface mesh from 3D points
-                    mesh_obj_path = create_object_mesh_shape(pts_centered, args.output_dir, oid)
+                    min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
+                    max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
+                    extents = (max_xyz - min_xyz).tolist()
+                    dims = [max(0.02, min(0.35, float(e))) for e in extents]
+                    half_extents = [float(d) / 2.0 for d in dims]
 
                     if mesh_obj_path and os.path.exists(mesh_obj_path):
                         obj_vis = p.createVisualShape(p.GEOM_MESH, fileName=mesh_obj_path, rgbaColor=avg_color)
                         obj_col = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_obj_path)
                     else:
-                        min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
-                        max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
-                        extents = (max_xyz - min_xyz).tolist()
-                        half_extents = [max(0.015, min(0.15, float(e) / 2.0)) for e in extents]
                         obj_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=avg_color)
                         obj_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
 
@@ -1049,9 +1048,10 @@ def main():
                     tracked_objects[oid] = {
                         'pybullet_id': body_id,
                         'initial_pos': init_pos,
-                        'color': avg_color
+                        'color': avg_color,
+                        'dims': dims
                     }
-                    print(f"✓ Discovered object ID {oid} ({id_to_name.get(oid, f'Object_{oid}')}): exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]})")
+                    print(f"✓ Discovered object ID {oid} ({id_to_name.get(oid, f'Object_{oid}')}): exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]}, Dims: {[round(d, 3) for d in dims]})")
 
                 # Subsample object Gaussians for fast Lie algebra SE(3) optimization (up to 512 points)
                 N_pts = len(obj_xyz)
@@ -1168,7 +1168,8 @@ def main():
                             pb_bodies[str(oid)] = {
                                 "pos": [round(float(v), 5) for v in pos],
                                 "quat_xyzw": [round(float(v), 5) for v in quat],
-                                "color": obj_data.get('color', [0.85, 0.35, 0.15, 1.0])
+                                "color": obj_data.get('color', [0.85, 0.35, 0.15, 1.0]),
+                                "dims": obj_data.get('dims', [0.05, 0.05, 0.05])
                             }
                         except Exception:
                             pass
