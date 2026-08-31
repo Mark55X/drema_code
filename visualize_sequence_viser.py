@@ -293,50 +293,40 @@ def launch_viser_server(
         except Exception as e:
             print(f"⚠️ Could not load TSDF mesh: {e}")
 
+    # Load Franka Panda CAD link meshes for photorealistic 3D robot arm rendering
+    franka_objs_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/franka_panda/objs")
+    loaded_franka_meshes = {}
+    if os.path.exists(franka_objs_dir):
+        try:
+            import trimesh
+            for obj_f in os.listdir(franka_objs_dir):
+                if obj_f.endswith(".obj"):
+                    k = os.path.splitext(obj_f)[0]
+                    p = os.path.join(franka_objs_dir, obj_f)
+                    m = trimesh.load(p, force='mesh')
+                    if isinstance(m, trimesh.Trimesh) and len(m.vertices) > 0:
+                        loaded_franka_meshes[k] = m
+                        k_lower = k.lower()
+                        loaded_franka_meshes[k_lower] = m
+                        if "link1" in k_lower: loaded_franka_meshes["panda_link1"] = m
+                        elif "link2" in k_lower: loaded_franka_meshes["panda_link2"] = m
+                        elif "link3" in k_lower: loaded_franka_meshes["panda_link3"] = m
+                        elif "link4" in k_lower: loaded_franka_meshes["panda_link4"] = m
+                        elif "link5" in k_lower: loaded_franka_meshes["panda_link5"] = m
+                        elif "link6" in k_lower: loaded_franka_meshes["panda_link6"] = m
+                        elif "link7" in k_lower: loaded_franka_meshes["panda_link7"] = m
+                        elif "gripper" in k_lower: loaded_franka_meshes["panda_hand"] = m
+                        elif "leftfinger" in k_lower: loaded_franka_meshes["panda_leftfinger"] = m
+                        elif "rightfinger" in k_lower: loaded_franka_meshes["panda_rightfinger"] = m
+                        elif "base" in k_lower: loaded_franka_meshes["panda_link0"] = m
+            if len(loaded_franka_meshes) > 0:
+                print(f"✓ Loaded {len(loaded_franka_meshes)} Franka Panda CAD link meshes for 3D visual playback")
+        except Exception as e:
+            print(f"⚠️ Could not preload Franka Panda CAD meshes: {e}")
+
     markdown_info = None
 
     render_lock = threading.Lock()
-
-    # Robot link hierarchy for Franka Panda kinematic bone rendering
-    robot_link_pairs = [
-        ("panda_link0", "panda_link1"),
-        ("panda_link1", "panda_link2"),
-        ("panda_link2", "panda_link3"),
-        ("panda_link3", "panda_link4"),
-        ("panda_link4", "panda_link5"),
-        ("panda_link5", "panda_link6"),
-        ("panda_link6", "panda_link7"),
-        ("panda_link7", "panda_hand"),
-        ("panda_hand", "panda_leftfinger"),
-        ("panda_hand", "panda_rightfinger")
-    ]
-
-    def get_link_bone_transform(p1: np.ndarray, p2: np.ndarray):
-        """
-        Computes position (mid-point), orientation quaternion (wxyz for Viser), and length
-        to align a box or cylinder with height along +Z between p1 and p2.
-        """
-        mid_p = (p1 + p2) / 2.0
-        v = p2 - p1
-        length = float(np.linalg.norm(v))
-        if length < 1e-4:
-            return tuple(mid_p), (1.0, 0.0, 0.0, 0.0), 0.0
-        
-        z_unit = np.array([0.0, 0.0, 1.0])
-        v_norm = v / length
-        dot = float(np.dot(z_unit, v_norm))
-        if dot > 0.99999:
-            wxyz = (1.0, 0.0, 0.0, 0.0)
-        elif dot < -0.99999:
-            wxyz = (0.0, 1.0, 0.0, 0.0)
-        else:
-            cross = np.cross(z_unit, v_norm)
-            w = 1.0 + dot
-            q_xyz = cross
-            q_norm = float(np.sqrt(w * w + np.dot(q_xyz, q_xyz)))
-            wxyz = (float(w / q_norm), float(q_xyz[0] / q_norm), float(q_xyz[1] / q_norm), float(q_xyz[2] / q_norm))
-        
-        return tuple(mid_p), wxyz, length
 
     # -------------------------------------------------------------
     # Render Function
@@ -347,67 +337,28 @@ def launch_viser_server(
         try:
             t = state['current_t']
             
-            # 1. Render PyBullet Robot Kinematics in 3D
+            # 1. Render Photorealistic Franka Panda Robot in 3D
             if t in pybullet_timeline:
                 pb_frame = pybullet_timeline[t]
                 r_links = pb_frame.get("robot_links", {})
                 if state['show_robot'] and len(r_links) > 0:
-                    # Render joint collars / dark rings
                     for l_name, l_data in r_links.items():
                         pos = tuple(l_data["pos"])
                         q = l_data["quat_xyzw"]
                         wxyz = (q[3], q[0], q[1], q[2])
-                        # Joint collar node
-                        is_finger = "finger" in l_name
-                        j_dims = (0.015, 0.015, 0.04) if is_finger else (0.055, 0.055, 0.045)
-                        j_col = (30, 32, 35) if not is_finger else (70, 75, 80)
-                        server.scene.add_box(
-                            name=f"/pybullet/robot/joints/{l_name}",
-                            position=pos,
-                            wxyz=wxyz,
-                            dimensions=j_dims,
-                            color=j_col,
-                            opacity=0.98,
-                            visible=True
-                        )
-                        server.scene.add_frame(
-                            name=f"/pybullet/robot/frames/{l_name}",
-                            position=pos,
-                            wxyz=wxyz,
-                            axes_length=0.03,
-                            axes_radius=0.0025,
-                            visible=True
-                        )
-                    # Render oriented metallic white bone links connecting consecutive joints
-                    for p_from, p_to in robot_link_pairs:
-                        if p_from in r_links and p_to in r_links:
-                            p_a = np.array(r_links[p_from]["pos"])
-                            p_b = np.array(r_links[p_to]["pos"])
-                            mid_p, wxyz_bone, dist = get_link_bone_transform(p_a, p_b)
-                            if dist > 0.005:
-                                is_finger = "finger" in p_to
-                                b_thick = 0.015 if is_finger else 0.046
-                                b_col = (70, 75, 80) if is_finger else (235, 238, 242)
-                                server.scene.add_box(
-                                    name=f"/pybullet/robot/bones/{p_from}_{p_to}",
-                                    position=mid_p,
-                                    wxyz=wxyz_bone,
-                                    dimensions=(b_thick, b_thick, dist),
-                                    color=b_col,
-                                    opacity=0.96,
-                                    visible=True
-                                )
+                        mesh = loaded_franka_meshes.get(l_name, loaded_franka_meshes.get(l_name.lower(), None))
+                        if mesh is not None:
+                            server.scene.add_mesh_trimesh(
+                                name=f"/pybullet/robot/mesh/{l_name}",
+                                mesh=mesh,
+                                position=pos,
+                                wxyz=wxyz,
+                                visible=True
+                            )
                 else:
-                    # Hide robot if unchecked
                     for l_name in r_links.keys():
                         try:
-                            server.scene.add_box(name=f"/pybullet/robot/joints/{l_name}", visible=False)
-                            server.scene.add_frame(name=f"/pybullet/robot/frames/{l_name}", visible=False)
-                        except Exception:
-                            pass
-                    for p_from, p_to in robot_link_pairs:
-                        try:
-                            server.scene.add_box(name=f"/pybullet/robot/bones/{p_from}_{p_to}", visible=False)
+                            server.scene.add_mesh_trimesh(name=f"/pybullet/robot/mesh/{l_name}", mesh=trimesh.Trimesh(), visible=False)
                         except Exception:
                             pass
 

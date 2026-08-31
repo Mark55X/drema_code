@@ -12,3 +12,4 @@ pynput
 viser>=0.2.0
 imageio
 imageio-ffmpeg
+pycollada
