@@ -318,22 +318,34 @@ def launch_viser_server(
                     p = os.path.join(franka_objs_dir, obj_f)
                     m = trimesh.load(p, force='mesh')
                     if isinstance(m, trimesh.Trimesh) and len(m.vertices) > 0:
-                        loaded_franka_meshes[k] = m
                         k_lower = k.lower()
-                        loaded_franka_meshes[k_lower] = m
-                        if "link1" in k_lower: loaded_franka_meshes["panda_link1"] = m
-                        elif "link2" in k_lower: loaded_franka_meshes["panda_link2"] = m
-                        elif "link3" in k_lower: loaded_franka_meshes["panda_link3"] = m
-                        elif "link4" in k_lower: loaded_franka_meshes["panda_link4"] = m
-                        elif "link5" in k_lower: loaded_franka_meshes["panda_link5"] = m
-                        elif "link6" in k_lower: loaded_franka_meshes["panda_link6"] = m
-                        elif "link7" in k_lower: loaded_franka_meshes["panda_link7"] = m
-                        elif "gripper" in k_lower: loaded_franka_meshes["panda_hand"] = m
-                        elif "leftfinger" in k_lower: loaded_franka_meshes["panda_leftfinger"] = m
-                        elif "rightfinger" in k_lower: loaded_franka_meshes["panda_rightfinger"] = m
-                        elif "base" in k_lower: loaded_franka_meshes["panda_link0"] = m
+                        if "base" in k_lower:
+                            canon = "robot_base"
+                        elif "link1" in k_lower:
+                            canon = "panda_link1"
+                        elif "link2" in k_lower:
+                            canon = "panda_link2"
+                        elif "link3" in k_lower:
+                            canon = "panda_link3"
+                        elif "link4" in k_lower:
+                            canon = "panda_link4"
+                        elif "link5" in k_lower:
+                            canon = "panda_link5"
+                        elif "link6" in k_lower:
+                            canon = "panda_link6"
+                        elif "link7" in k_lower:
+                            canon = "panda_link7"
+                        elif "gripper" in k_lower or "hand" in k_lower:
+                            canon = "panda_gripper"
+                        elif "leftfinger" in k_lower:
+                            canon = "panda_leftfinger"
+                        elif "rightfinger" in k_lower:
+                            canon = "panda_rightfinger"
+                        else:
+                            canon = k_lower
+                        loaded_franka_meshes[canon] = m
             if len(loaded_franka_meshes) > 0:
-                print(f"✓ Loaded {len(loaded_franka_meshes)} Franka Panda CAD link meshes for 3D visual playback")
+                print(f"✓ Loaded {len(loaded_franka_meshes)} Franka Panda CAD link meshes: {list(loaded_franka_meshes.keys())}")
         except Exception as e:
             print(f"⚠️ Could not preload Franka Panda CAD meshes: {e}")
 
@@ -353,6 +365,27 @@ def launch_viser_server(
             )
         except Exception:
             pass
+
+    # Helper function to match canonical link name with PyBullet recorded telemetry links
+    def get_link_transform_data(canon_name, r_links):
+        if not r_links:
+            return None
+        # Exact match
+        if canon_name in r_links:
+            return r_links[canon_name]
+        # Search by key substrings
+        canon_low = canon_name.lower()
+        for rk, rval in r_links.items():
+            rk_low = rk.lower()
+            if canon_low == rk_low:
+                return rval
+            if canon_low.replace("panda_", "") in rk_low:
+                return rval
+            if canon_low == "panda_gripper" and ("gripper" in rk_low or "hand" in rk_low):
+                return rval
+            if canon_low == "robot_base" and ("base" in rk_low or "link0" in rk_low):
+                return rval
+        return None
 
     # Pre-instantiate Tracked Physical Body Handles ONCE at startup
     body_mesh_handles = {}
@@ -385,7 +418,7 @@ def launch_viser_server(
                 pb_frame = pybullet_timeline[t]
                 r_links = pb_frame.get("robot_links", {})
                 for l_name, handle in robot_mesh_handles.items():
-                    target_data = r_links.get(l_name, r_links.get(l_name.lower(), None))
+                    target_data = get_link_transform_data(l_name, r_links)
                     if state['show_robot'] and target_data is not None:
                         q = target_data["quat_xyzw"]
                         handle.position = tuple(target_data["pos"])
