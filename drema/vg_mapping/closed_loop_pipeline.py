@@ -164,7 +164,9 @@ class DREMAClosedLoopVGMappingPipeline:
         camera_pose: Optional[torch.Tensor] = None,
         initial_T_coarse_dict: Optional[Dict[int, torch.Tensor]] = None,
         z_table: Optional[float] = None,
-        num_iterations: int = 50,
+        num_iterations: int = 15,
+        icp_max_iters: int = 12,
+        lr: float = 3e-3,
         tol: float = 1e-4
     ) -> Dict[int, torch.Tensor]:
         """
@@ -181,6 +183,8 @@ class DREMAClosedLoopVGMappingPipeline:
             initial_T_coarse_dict=initial_T_coarse_dict,
             z_table=z_table,
             num_iterations=num_iterations,
+            icp_max_iters=icp_max_iters,
+            lr=lr,
             tol=tol
         )
 

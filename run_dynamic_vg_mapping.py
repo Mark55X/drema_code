@@ -95,6 +95,20 @@ def parse_args():
                         help="Port for Viser web server (default: 8080)")
     parser.add_argument("--output_dir", type=str, default="./output_dynamic_mapping", help="Output directory for saved meshes/logs")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device to use (cuda/cpu)")
+
+    # RecurGS SE(3) Tracking & Performance Ablation flags
+    parser.add_argument("--se3_iterations", type=int, default=15,
+                        help="Number of Lie algebra Adam optimization iterations for fine pose refinement (default: 15)")
+    parser.add_argument("--se3_icp_iterations", type=int, default=12,
+                        help="Number of ICP coarse alignment iterations (default: 12)")
+    parser.add_argument("--se3_subsample", type=int, default=256,
+                        help="Number of points to subsample per object for SE(3) optimization (default: 256)")
+    parser.add_argument("--se3_use_photometric", action="store_true", default=False,
+                        help="Enable 2D sub-pixel grid_sample photometric & depth loss (default: False, uses pure 3D geometric Huber loss)")
+    parser.add_argument("--se3_lr", type=float, default=3e-3,
+                        help="Learning rate for Lie algebra Adam optimizer (default: 3e-3)")
+    parser.add_argument("--physics_settle_steps", type=int, default=0,
+                        help="Number of physics simulation steps per timestep to let PyBullet settle contacts/gravity (default: 0)")
     return parser.parse_args()
 
 
@@ -1026,9 +1040,22 @@ def main():
                 # Dynamically register newly discovered object in PyBullet with exact 3D mesh
                 if HAS_PYBULLET and oid not in tracked_objects:
                     if len(clean_xyz) > 0:
-                        init_pos = [float(v) for v in clean_xyz.mean(dim=0).cpu().numpy()]
-                        pts_centered = (clean_xyz.cpu().numpy() - np.array(init_pos))
+                        min_xyz = clean_xyz.min(dim=0)[0].cpu().numpy()
+                        max_xyz = clean_xyz.max(dim=0)[0].cpu().numpy()
+                        extents = (max_xyz - min_xyz).tolist()
+                        dims = [max(0.02, min(0.35, float(e))) for e in extents]
+                        half_extents = [float(d) / 2.0 for d in dims]
+
+                        # True 3D geometric center of the bounding box:
+                        # (min_xyz + max_xyz) / 2 ensures that the bottom of the box
+                        # (init_pos[2] - half_extents[2]) aligns exactly with min_xyz[2],
+                        # without floating in the air or assuming the object is on the table!
+                        center_xyz = (min_xyz + max_xyz) / 2.0
+                        init_pos = [float(center_xyz[0]), float(center_xyz[1]), float(center_xyz[2])]
+                        pts_centered = (clean_xyz.cpu().numpy() - center_xyz)
                     else:
+                        dims = [0.05, 0.05, 0.05]
+                        half_extents = [0.025, 0.025, 0.025]
                         init_pos = [0.35, 0.0, z_table + 0.025]
                         pts_centered = np.array([[-0.025, -0.025, -0.025], [0.025, 0.025, 0.025]])
 
@@ -1037,15 +1064,6 @@ def main():
                         avg_color = [float(m_rgb[0]), float(m_rgb[1]), float(m_rgb[2]), 1.0]
                     else:
                         avg_color = [0.8, 0.2, 0.2, 1.0]
-
-                    min_xyz = clean_xyz.min(dim=0)[0].cpu().numpy()
-                    max_xyz = clean_xyz.max(dim=0)[0].cpu().numpy()
-                    extents = (max_xyz - min_xyz).tolist()
-                    dims = [max(0.02, min(0.35, float(e))) for e in extents]
-                    half_extents = [float(d) / 2.0 for d in dims]
-
-                    # Enforce initial tabletop support height
-                    init_pos[2] = max(init_pos[2], z_table + half_extents[2])
 
                     mesh_obj_path = create_object_mesh_shape(pts_centered, args.output_dir, oid)
 
@@ -1102,20 +1120,20 @@ def main():
                         curr_xyz = obj_xyz
                         curr_rgb = obj_rgb
 
-                    # Subsample target points (up to 512)
+                    # Subsample target points (up to args.se3_subsample)
                     N_tgt = len(curr_xyz)
-                    if N_tgt > 512:
-                        sub_idx = torch.randperm(N_tgt, device=device)[:512]
+                    if N_tgt > args.se3_subsample:
+                        sub_idx = torch.randperm(N_tgt, device=device)[:args.se3_subsample]
                         objects_target[oid] = {'xyz': curr_xyz[sub_idx], 'rgb': curr_rgb[sub_idx]}
                     else:
                         objects_target[oid] = {'xyz': curr_xyz, 'rgb': curr_rgb}
 
-                    # Subsample source canonical points (up to 512)
+                    # Subsample source canonical points (up to args.se3_subsample)
                     src_xyz = tracked_objects[oid]['canonical_points']['xyz']
                     src_rgb = tracked_objects[oid]['canonical_points']['rgb']
                     N_src = len(src_xyz)
-                    if N_src > 512:
-                        sub_src = torch.randperm(N_src, device=device)[:512]
+                    if N_src > args.se3_subsample:
+                        sub_src = torch.randperm(N_src, device=device)[:args.se3_subsample]
                         objects_source[oid] = {'xyz': src_xyz[sub_src], 'rgb': src_rgb[sub_src]}
                     else:
                         objects_source[oid] = {'xyz': src_xyz, 'rgb': src_rgb}
@@ -1127,13 +1145,15 @@ def main():
                     T_fine_dict = pipeline.step_3_estimate_multi_se3_motion(
                         objects_source=objects_source,
                         objects_target=objects_target,
-                        gt_rgb_t1=ref_obs['rgb'],
-                        gt_depth_t1=ref_obs['depth'],
-                        intrinsic=ref_obs['K'],
-                        camera_pose=ref_obs['pose'],
+                        gt_rgb_t1=ref_obs['rgb'] if args.se3_use_photometric else None,
+                        gt_depth_t1=ref_obs['depth'] if args.se3_use_photometric else None,
+                        intrinsic=ref_obs['K'] if args.se3_use_photometric else None,
+                        camera_pose=ref_obs['pose'] if args.se3_use_photometric else None,
                         initial_T_coarse_dict=initial_T_coarse_dict,
                         z_table=z_table,
-                        num_iterations=50,
+                        num_iterations=args.se3_iterations,
+                        icp_max_iters=args.se3_icp_iterations,
+                        lr=args.se3_lr,
                         tol=1e-4
                     )
 
@@ -1175,7 +1195,9 @@ def main():
 
         # Step PyBullet simulation physics if available
         if HAS_PYBULLET:
-            p.stepSimulation()
+            sim_steps = max(1, args.physics_settle_steps)
+            for _ in range(sim_steps):
+                p.stepSimulation()
 
             # Record frame if requested
             if args.save_video and video_view_matrix is not None:
