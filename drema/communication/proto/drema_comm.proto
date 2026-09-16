@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package drema;
+
+// Single camera view observation
+message CameraFrame {
+  string name = 1;
+  int32 width = 2;
+  int32 height = 3;
+  int32 channels = 4;
+  bytes rgb_data = 5;       // Raw uint8 RGB buffer (width * height * 3) or PNG bytes
+  bytes depth_data = 6;     // Raw float32 depth buffer (width * height * 4) in meters
+  repeated float extrinsics = 7; // 4x4 row-major transformation matrix (cam to world)
+  repeated float intrinsics = 8; // 3x3 row-major camera matrix [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+}
+
+// Multi-view observation captured at a given timestep
+message FrameObservation {
+  int64 timestep = 1;
+  double timestamp = 2;
+  repeated CameraFrame cameras = 3;
+  bool is_initial_scan = 4;     // True for orbital scanning frames at t=0
+  bool is_scan_finished = 5;    // True when the 200-view initial scan is completed
+  map<string, int32> semantic_labels = 6; // Object name to handle mapping from CoppeliaSim
+}
+
+// Acknowledgment for streamed observations
+message StreamStatus {
+  bool success = 1;
+  string message = 2;
+  int64 received_timestep = 3;
+  bool initial_scan_ready = 4;  // True when initial scene reconstruction (table + obstacles) is ready
+}
+
+// Current kinematic & dynamic state of the robot
+message RobotState {
+  double timestamp = 1;
+  int64 timestep = 2;
+  repeated double joint_positions = 3;  // Franka Panda 7 joints (rad)
+  repeated double joint_velocities = 4; // Franka Panda 7 joint speeds (rad/s)
+  repeated double ee_pose = 5;          // End-effector pose [x, y, z, qx, qy, qz, qw]
+  double gripper_open = 6;              // 1.0 fully open, 0.0 fully closed
+  bool task_active = 7;                 // True if CLI user initiated 'start'
+  repeated double target_pose = 8;      // Target pose [x, y, z, qx, qy, qz, qw] (e.g., PerAct or CoppeliaSim oracle)
+  bool target_available = 9;            // True if target pose is active/tracked
+}
+
+// Action returned by MPC controller to the robot
+message ControlAction {
+  double timestamp = 1;
+  int64 timestep = 2;
+  repeated double joint_velocities = 3; // Target joint velocities [dq1, ..., dq7]
+  double gripper_action = 4;            // Target gripper action (1.0 open, 0.0 close)
+  bool safety_stop = 5;                 // True if controller demands immediate hold/stop
+  string status_message = 6;            // Debug / telemetry message
+}
+
+// Synchronization and episode reset messages
+message ResetRequest {
+  int32 episode_index = 1;
+  string task_name = 2;
+}
+
+message ResetResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+// Heartbeat / ping for connection verification
+message PingRequest {
+  string client_id = 1;
+  double timestamp = 2;
+}
+
+message PingResponse {
+  bool alive = 1;
+  double server_timestamp = 2;
+  string suite_status = 3;
+}
+
+// DREMA Dynamic Inference Service
+service DremaInferenceService {
+  // Streaming endpoint for sensor frames (f_cam ≈ 10-15 Hz)
+  rpc StreamFrames(stream FrameObservation) returns (StreamStatus);
+
+  // Single-frame ingestion endpoint (alternative to stream for simpler stepped mode)
+  rpc SendFrame(FrameObservation) returns (StreamStatus);
+
+  // High-frequency control query endpoint (f_ctrl ≈ 50 Hz)
+  rpc RequestAction(RobotState) returns (ControlAction);
+
+  // Episode lifecycle management
+  rpc ResetEpisode(ResetRequest) returns (ResetResponse);
+
+  // Connection check
+  rpc Ping(PingRequest) returns (PingResponse);
+}
