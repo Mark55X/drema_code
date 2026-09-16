@@ -131,10 +131,12 @@ class DREMAClosedLoopVGMappingPipeline:
     def step_3_estimate_se3_motion(
         self,
         object_gaussians_t0: Dict[str, torch.Tensor],
-        gt_rgb_t1: torch.Tensor,
-        gt_depth_t1: torch.Tensor,
-        intrinsic: torch.Tensor,
-        camera_pose: torch.Tensor,
+        gt_rgb_t1: Optional[torch.Tensor] = None,
+        gt_depth_t1: Optional[torch.Tensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
+        camera_pose: Optional[torch.Tensor] = None,
+        target_gaussians: Optional[Dict[str, torch.Tensor]] = None,
+        z_table: Optional[float] = None,
         num_iterations: int = 50
     ) -> torch.Tensor:
         """
@@ -142,34 +144,42 @@ class DREMAClosedLoopVGMappingPipeline:
         """
         T_fine = self.se3_aligner.optimize_se3_pose(
             object_gaussians=object_gaussians_t0,
+            target_gaussians=target_gaussians,
             gt_rgb=gt_rgb_t1,
             gt_depth=gt_depth_t1,
             intrinsic=intrinsic,
             camera_pose=camera_pose,
+            z_table=z_table,
             num_iterations=num_iterations
         )
         return T_fine
 
     def step_3_estimate_multi_se3_motion(
         self,
-        objects_gaussians: Dict[int, Dict[str, torch.Tensor]],
-        gt_rgb_t1: torch.Tensor,
-        gt_depth_t1: torch.Tensor,
-        intrinsic: torch.Tensor,
-        camera_pose: torch.Tensor,
+        objects_source: Dict[int, Dict[str, torch.Tensor]],
+        objects_target: Optional[Dict[int, Dict[str, torch.Tensor]]] = None,
+        gt_rgb_t1: Optional[torch.Tensor] = None,
+        gt_depth_t1: Optional[torch.Tensor] = None,
+        intrinsic: Optional[torch.Tensor] = None,
+        camera_pose: Optional[torch.Tensor] = None,
+        initial_T_coarse_dict: Optional[Dict[int, torch.Tensor]] = None,
+        z_table: Optional[float] = None,
         num_iterations: int = 50,
         tol: float = 1e-4
     ) -> Dict[int, torch.Tensor]:
         """
         Step 3 (Multi-Object): Simultaneously estimate independent rigid transformations T_fine_k in SE(3)
-        for all K dynamic objects in parallel on GPU.
+        for all K dynamic objects in parallel on GPU using RecurGS ICP + Lie-algebra optimization.
         """
         return self.se3_aligner.optimize_multi_object_se3_pose(
-            objects_gaussians=objects_gaussians,
+            objects_source=objects_source,
+            objects_target=objects_target,
             gt_rgb=gt_rgb_t1,
             gt_depth=gt_depth_t1,
             intrinsic=intrinsic,
             camera_pose=camera_pose,
+            initial_T_coarse_dict=initial_T_coarse_dict,
+            z_table=z_table,
             num_iterations=num_iterations,
             tol=tol
         )
@@ -178,10 +188,13 @@ class DREMAClosedLoopVGMappingPipeline:
         self,
         pybullet_body_id: int,
         T_fine: torch.Tensor,
-        initial_position: Optional[Tuple[float, float, float]] = None
+        canonical_position: Optional[Tuple[float, float, float]] = None,
+        z_table: Optional[float] = None,
+        half_height: float = 0.025
     ):
         """
-        Step 4: Update PyBullet rigid body pose by applying estimated delta T_fine to initial world pose.
+        Step 4: Update PyBullet rigid body pose by applying estimated T_fine to canonical object model,
+        enforcing table plane support constraint (z >= z_table + half_height).
         """
         if self.p is None:
             print(f"[Warning] PyBullet client not attached. Computed T_fine:\n{T_fine}")
@@ -190,14 +203,25 @@ class DREMAClosedLoopVGMappingPipeline:
         R_fine = T_fine[:3, :3]
         t_fine = T_fine[:3, 3]
 
-        if initial_position is not None:
-            init_pos_tensor = torch.tensor(initial_position, dtype=torch.float32, device=T_fine.device)
-            pos_world = init_pos_tensor + t_fine
-            quat = rotation_matrix_to_quaternion(R_fine)
-            pos = (float(pos_world[0]), float(pos_world[1]), float(pos_world[2]))
+        # In PyBullet, body origin is centered at canonical_position C0.
+        # Transformation maps canonical points P_c to P_t = R_fine * P_c + t_fine.
+        # The center of the body is thus P_center = R_fine * C0 + t_fine.
+        if canonical_position is not None:
+            c0 = torch.tensor(canonical_position, dtype=torch.float32, device=T_fine.device)
+            pos_world = R_fine @ c0 + t_fine
         else:
-            quat = rotation_matrix_to_quaternion(R_fine)
-            pos = (float(t_fine[0]), float(t_fine[1]), float(t_fine[2]))
+            pos_world = t_fine
+
+        # Enforce physical tabletop support constraint to prevent sinking into table
+        pos_z = float(pos_world[2].item())
+        if z_table is not None:
+            min_z = float(z_table) + float(half_height)
+            if pos_z < min_z:
+                pos_z = min_z
+
+        pos = (float(pos_world[0].item()), float(pos_world[1].item()), pos_z)
+        quat = rotation_matrix_to_quaternion(R_fine)
 
         self.p.resetBasePositionAndOrientation(pybullet_body_id, pos, quat)
         print(f"✓ PyBullet body ID {pybullet_body_id} synced to pos: ({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f}), quat: ({quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f})")
+

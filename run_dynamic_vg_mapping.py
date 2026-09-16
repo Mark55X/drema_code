@@ -971,7 +971,7 @@ def main():
         # STEP 3 & 4: RecurGS Batched Multi-Object SE(3) Tracking & PyBullet Sync
         # ---------------------------------------------------------
         t_se3_ms = 0.0
-        if timestep_num > 0 and len(observations) > 0:
+        if len(observations) > 0:
             t_se3_start = time.time()
             ref_obs = observations[0]
 
@@ -1001,7 +1001,7 @@ def main():
                 if torch.any(fg_mask):
                     dynamic_obj_ids = [-1]
 
-            objects_to_track = {}
+            # 1. Register newly discovered objects
             for oid in dynamic_obj_ids:
                 if oid == -1:
                     obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.65) & (scene_gaussians['xyz'][:, 1] > -0.45) & (scene_gaussians['xyz'][:, 1] < 0.45)
@@ -1013,28 +1013,39 @@ def main():
 
                 obj_xyz = scene_gaussians['xyz'][obj_mask]
                 obj_rgb = scene_gaussians['rgb'][obj_mask]
-                obj_scale = scene_gaussians['scale'][obj_mask]
+
+                # Outlier rejection: filter out table surface points touching the table
+                clean_mask = obj_xyz[:, 2] > (z_table + 0.004)
+                if torch.any(clean_mask) and clean_mask.sum() >= 4:
+                    clean_xyz = obj_xyz[clean_mask]
+                    clean_rgb = obj_rgb[clean_mask]
+                else:
+                    clean_xyz = obj_xyz
+                    clean_rgb = obj_rgb
 
                 # Dynamically register newly discovered object in PyBullet with exact 3D mesh
                 if HAS_PYBULLET and oid not in tracked_objects:
-                    if obj_xyz.ndim == 2 and len(obj_xyz) > 0:
-                        init_pos = [float(v) for v in obj_xyz.mean(dim=0).cpu().numpy()]
-                        pts_centered = (obj_xyz.cpu().numpy() - np.array(init_pos))
+                    if len(clean_xyz) > 0:
+                        init_pos = [float(v) for v in clean_xyz.mean(dim=0).cpu().numpy()]
+                        pts_centered = (clean_xyz.cpu().numpy() - np.array(init_pos))
                     else:
-                        init_pos = [0.35, 0.0, 0.775]
+                        init_pos = [0.35, 0.0, z_table + 0.025]
                         pts_centered = np.array([[-0.025, -0.025, -0.025], [0.025, 0.025, 0.025]])
 
-                    if obj_rgb.ndim == 2 and len(obj_rgb) > 0:
-                        m_rgb = obj_rgb.mean(dim=0).cpu().numpy().tolist()
+                    if len(clean_rgb) > 0:
+                        m_rgb = clean_rgb.mean(dim=0).cpu().numpy().tolist()
                         avg_color = [float(m_rgb[0]), float(m_rgb[1]), float(m_rgb[2]), 1.0]
                     else:
                         avg_color = [0.8, 0.2, 0.2, 1.0]
 
-                    min_xyz = obj_xyz.min(dim=0)[0].cpu().numpy()
-                    max_xyz = obj_xyz.max(dim=0)[0].cpu().numpy()
+                    min_xyz = clean_xyz.min(dim=0)[0].cpu().numpy()
+                    max_xyz = clean_xyz.max(dim=0)[0].cpu().numpy()
                     extents = (max_xyz - min_xyz).tolist()
                     dims = [max(0.02, min(0.35, float(e))) for e in extents]
                     half_extents = [float(d) / 2.0 for d in dims]
+
+                    # Enforce initial tabletop support height
+                    init_pos[2] = max(init_pos[2], z_table + half_extents[2])
 
                     mesh_obj_path = create_object_mesh_shape(pts_centered, args.output_dir, oid)
 
@@ -1047,57 +1058,102 @@ def main():
 
                     body_id = p.createMultiBody(baseMass=0.1, baseCollisionShapeIndex=obj_col, baseVisualShapeIndex=obj_vis, basePosition=init_pos)
                     
+                    # Store canonical object model
                     tracked_objects[oid] = {
                         'pybullet_id': body_id,
                         'initial_pos': init_pos,
                         'color': avg_color,
-                        'dims': dims
+                        'dims': dims,
+                        'canonical_points': {
+                            'xyz': clean_xyz.clone(),
+                            'rgb': clean_rgb.clone()
+                        },
+                        'last_T': torch.eye(4, device=device)
                     }
                     print(f"✓ Discovered object ID {oid} ({id_to_name.get(oid, f'Object_{oid}')}): exact 3D surface mesh spawned in PyBullet (Body ID: {body_id}, Pos: {[round(x, 4) for x in init_pos]}, Dims: {[round(d, 3) for d in dims]})")
 
-                # Subsample object Gaussians for fast Lie algebra SE(3) optimization (up to 512 points)
-                N_pts = len(obj_xyz)
-                if N_pts > 512:
-                    sub_idx = torch.randperm(N_pts, device=device)[:512]
-                    obj_subset = {
-                        'xyz': obj_xyz[sub_idx],
-                        'rgb': obj_rgb[sub_idx],
-                        'scale': obj_scale[sub_idx]
-                    }
-                else:
-                    obj_subset = {
-                        'xyz': obj_xyz,
-                        'rgb': obj_rgb,
-                        'scale': obj_scale
-                    }
-                objects_to_track[oid] = obj_subset
+            # 2. Tracking at t > 0
+            if timestep_num > 0 and len(tracked_objects) > 0:
+                objects_source = {}
+                objects_target = {}
+                initial_T_coarse_dict = {}
 
-            # Step 3: Batched Multi-Object Lie algebra pose optimization in parallel with early stopping
-            if len(objects_to_track) > 0:
-                T_fine_dict = pipeline.step_3_estimate_multi_se3_motion(
-                    objects_gaussians=objects_to_track,
-                    gt_rgb_t1=ref_obs['rgb'],
-                    gt_depth_t1=ref_obs['depth'],
-                    intrinsic=ref_obs['K'],
-                    camera_pose=ref_obs['pose'],
-                    num_iterations=50,
-                    tol=1e-4
-                )
+                for oid in dynamic_obj_ids:
+                    if oid not in tracked_objects:
+                        continue
 
-                # Step 4: Synchronize PyBullet object poses
-                for oid, T_fine in T_fine_dict.items():
-                    target_body_id = tracked_objects[oid]['pybullet_id'] if oid in tracked_objects else 1
-                    target_current_pos = [float(v) for v in scene_gaussians['xyz'][scene_gaussians['obj_id'] == oid].mean(dim=0).cpu().numpy()] if torch.any(scene_gaussians['obj_id'] == oid) else [0.35, 0.0, 0.775]
+                    if oid == -1:
+                        obj_mask = (scene_gaussians['xyz'][:, 2] > 0.005) & (scene_gaussians['xyz'][:, 0] > 0.1) & (scene_gaussians['xyz'][:, 0] < 0.65) & (scene_gaussians['xyz'][:, 1] > -0.45) & (scene_gaussians['xyz'][:, 1] < 0.45)
+                    else:
+                        obj_mask = (scene_gaussians['obj_id'] == oid)
 
-                    pipeline.step_4_sync_pybullet_physics(
-                        pybullet_body_id=target_body_id,
-                        T_fine=T_fine,
-                        initial_position=target_current_pos
+                    if not torch.any(obj_mask):
+                        continue
+
+                    obj_xyz = scene_gaussians['xyz'][obj_mask]
+                    obj_rgb = scene_gaussians['rgb'][obj_mask]
+
+                    # Filter table surface points
+                    clean_mask = obj_xyz[:, 2] > (z_table + 0.004)
+                    if torch.any(clean_mask) and clean_mask.sum() >= 4:
+                        curr_xyz = obj_xyz[clean_mask]
+                        curr_rgb = obj_rgb[clean_mask]
+                    else:
+                        curr_xyz = obj_xyz
+                        curr_rgb = obj_rgb
+
+                    # Subsample target points (up to 512)
+                    N_tgt = len(curr_xyz)
+                    if N_tgt > 512:
+                        sub_idx = torch.randperm(N_tgt, device=device)[:512]
+                        objects_target[oid] = {'xyz': curr_xyz[sub_idx], 'rgb': curr_rgb[sub_idx]}
+                    else:
+                        objects_target[oid] = {'xyz': curr_xyz, 'rgb': curr_rgb}
+
+                    # Subsample source canonical points (up to 512)
+                    src_xyz = tracked_objects[oid]['canonical_points']['xyz']
+                    src_rgb = tracked_objects[oid]['canonical_points']['rgb']
+                    N_src = len(src_xyz)
+                    if N_src > 512:
+                        sub_src = torch.randperm(N_src, device=device)[:512]
+                        objects_source[oid] = {'xyz': src_xyz[sub_src], 'rgb': src_rgb[sub_src]}
+                    else:
+                        objects_source[oid] = {'xyz': src_xyz, 'rgb': src_rgb}
+
+                    initial_T_coarse_dict[oid] = tracked_objects[oid].get('last_T', torch.eye(4, device=device))
+
+                # Step 3: Batched Multi-Object Lie algebra pose optimization
+                if len(objects_source) > 0 and len(objects_target) > 0:
+                    T_fine_dict = pipeline.step_3_estimate_multi_se3_motion(
+                        objects_source=objects_source,
+                        objects_target=objects_target,
+                        gt_rgb_t1=ref_obs['rgb'],
+                        gt_depth_t1=ref_obs['depth'],
+                        intrinsic=ref_obs['K'],
+                        camera_pose=ref_obs['pose'],
+                        initial_T_coarse_dict=initial_T_coarse_dict,
+                        z_table=z_table,
+                        num_iterations=50,
+                        tol=1e-4
                     )
+
+                    # Step 4: Synchronize PyBullet object poses
+                    for oid, T_fine in T_fine_dict.items():
+                        tracked_objects[oid]['last_T'] = T_fine.detach()
+                        target_body_id = tracked_objects[oid]['pybullet_id']
+                        c0 = tracked_objects[oid]['initial_pos']
+                        half_h = tracked_objects[oid]['dims'][2] / 2.0
+
+                        pipeline.step_4_sync_pybullet_physics(
+                            pybullet_body_id=target_body_id,
+                            T_fine=T_fine,
+                            canonical_position=c0,
+                            z_table=z_table,
+                            half_height=half_h
+                        )
 
             if device.startswith("cuda"):
                 torch.cuda.synchronize()
-            t_se3_ms = (time.time() - t_se3_start) * 1000.0
             t_se3_ms = (time.time() - t_se3_start) * 1000.0
 
         # Update Robot Arm & Gripper Joints in PyBullet if trajectory is available
