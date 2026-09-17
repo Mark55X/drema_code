@@ -12,6 +12,8 @@ message CameraFrame {
   bytes depth_data = 6;     // Raw float32 depth buffer (width * height * 4) in meters
   repeated float extrinsics = 7; // 4x4 row-major transformation matrix (cam to world)
   repeated float intrinsics = 8; // 3x3 row-major camera matrix [fx, 0, cx, 0, fy, cy, 0, 0, 1]
+  float near_clipping = 9;  // Sensor minimum depth / near clipping plane (meters)
+  float far_clipping = 10;  // Sensor maximum depth / far clipping plane (meters)
 }
 
 // Multi-view observation captured at a given timestep
@@ -22,6 +24,8 @@ message FrameObservation {
   bool is_initial_scan = 4;     // True for orbital scanning frames at t=0
   bool is_scan_finished = 5;    // True when the 200-view initial scan is completed
   map<string, int32> semantic_labels = 6; // Object name to handle mapping from CoppeliaSim
+  repeated double robot_base_pos = 7;     // Robot base position [x, y, z] in world coordinates
+  double reachability_radius = 8;         // Robot maximum kinematic reach radius in meters
 }
 
 // Acknowledgment for streamed observations
@@ -43,6 +47,8 @@ message RobotState {
   bool task_active = 7;                 // True if CLI user initiated 'start'
   repeated double target_pose = 8;      // Target pose [x, y, z, qx, qy, qz, qw] (e.g., PerAct or CoppeliaSim oracle)
   bool target_available = 9;            // True if target pose is active/tracked
+  repeated double robot_base_pos = 10;  // Robot base position [x, y, z] in world coordinates
+  double reachability_radius = 11;      // Robot maximum kinematic reach radius in meters
 }
 
 // Action returned by MPC controller to the robot

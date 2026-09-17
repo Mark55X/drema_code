@@ -13,7 +13,7 @@ import sys
 import time
 import queue
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import numpy as np
 import grpc
 
@@ -25,7 +25,9 @@ def pack_camera_frame(
     rgb: np.ndarray,
     depth: np.ndarray,
     extrinsics: np.ndarray,
-    intrinsics: np.ndarray
+    intrinsics: np.ndarray,
+    near_clipping: float = 0.0,
+    far_clipping: float = 0.0
 ) -> drema_comm_pb2.CameraFrame:
     """
     Serializes camera RGB, Depth, Extrinsics, and Intrinsics into a Protobuf CameraFrame.
@@ -33,6 +35,8 @@ def pack_camera_frame(
     depth: float32 array (H, W) in meters
     extrinsics: 4x4 matrix (cam to world)
     intrinsics: 3x3 matrix
+    near_clipping: sensor near clipping limit (meters)
+    far_clipping: sensor far clipping limit (meters)
     """
     h, w = rgb.shape[:2]
     c = rgb.shape[2] if len(rgb.shape) > 2 else 1
@@ -52,21 +56,25 @@ def pack_camera_frame(
         rgb_data=rgb_bytes,
         depth_data=depth_bytes,
         extrinsics=ext_flat,
-        intrinsics=int_flat
+        intrinsics=int_flat,
+        near_clipping=float(near_clipping),
+        far_clipping=float(far_clipping)
     )
 
 
-def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
     """
-    Deserializes a Protobuf CameraFrame into numpy arrays.
-    Returns: (name, rgb (H,W,3 uint8), depth (H,W float32), extrinsics (4,4), intrinsics (3,3))
+    Deserializes a Protobuf CameraFrame into numpy arrays and clipping planes.
+    Returns: (name, rgb (H,W,3 uint8), depth (H,W float32), extrinsics (4,4), intrinsics (3,3), near_clipping, far_clipping)
     """
     h, w, c = frame.height, frame.width, frame.channels
     rgb = np.frombuffer(frame.rgb_data, dtype=np.uint8).reshape((h, w, c))
     depth = np.frombuffer(frame.depth_data, dtype=np.float32).reshape((h, w))
     extrinsics = np.array(frame.extrinsics, dtype=np.float32).reshape((4, 4))
     intrinsics = np.array(frame.intrinsics, dtype=np.float32).reshape((3, 3))
-    return frame.name, rgb, depth, extrinsics, intrinsics
+    near_clip = float(frame.near_clipping) if frame.near_clipping > 0 else 0.01
+    far_clip = float(frame.far_clipping) if frame.far_clipping > 0 else 3.5
+    return frame.name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip
 
 
 class DremaGrpcClient:
@@ -140,11 +148,13 @@ class DremaGrpcClient:
     def push_frame_observation(
         self,
         timestep: int,
-        camera_dict: Dict[str, Dict[str, np.ndarray]],
+        camera_dict: Dict[str, Dict[str, Any]],
         blocking: bool = False,
         is_initial_scan: bool = False,
         is_scan_finished: bool = False,
-        semantic_labels: Optional[Dict[str, int]] = None
+        semantic_labels: Optional[Dict[str, int]] = None,
+        robot_base_pos: Optional[List[float]] = None,
+        reachability_radius: float = 0.95
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes a multi-camera observation into the streaming queue.
@@ -156,7 +166,9 @@ class DremaGrpcClient:
                 rgb=data['rgb'],
                 depth=data['depth'],
                 extrinsics=data['extrinsics'],
-                intrinsics=data['intrinsics']
+                intrinsics=data['intrinsics'],
+                near_clipping=data.get('near_clipping', 0.0),
+                far_clipping=data.get('far_clipping', 0.0)
             )
             frames.append(f)
 
@@ -166,7 +178,9 @@ class DremaGrpcClient:
             cameras=frames,
             is_initial_scan=is_initial_scan,
             is_scan_finished=is_scan_finished,
-            semantic_labels=semantic_labels or {}
+            semantic_labels=semantic_labels or {},
+            robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
+            reachability_radius=float(reachability_radius)
         )
 
         if blocking:
@@ -176,43 +190,6 @@ class DremaGrpcClient:
             except Exception as e:
                 print(f"[GrpcClient Error] SendFrame failed: {e}")
                 return None
-
-    def push_initial_scan_batch(
-        self,
-        cameras_list: List[Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
-        semantic_labels: Optional[Dict[str, int]] = None
-    ) -> Optional[drema_comm_pb2.StreamStatus]:
-        """
-        Pushes the entire 360° orbital scan (all ~200 views) in a single batch to DREMA suite.
-        Each camera tuple: (name, rgb, depth, extrinsics, intrinsics)
-        """
-        frames = []
-        for name, rgb, depth, extrinsics, intrinsics in cameras_list:
-            f = pack_camera_frame(
-                name=name,
-                rgb=rgb,
-                depth=depth,
-                extrinsics=extrinsics,
-                intrinsics=intrinsics
-            )
-            frames.append(f)
-
-        obs = drema_comm_pb2.FrameObservation(
-            timestep=0,
-            timestamp=time.time(),
-            cameras=frames,
-            is_initial_scan=True,
-            is_scan_finished=True,
-            semantic_labels=semantic_labels or {}
-        )
-
-        try:
-            print(f"[GrpcClient] Sending single-batch initial scan ({len(frames)} views, {len(semantic_labels or {})} labels) to DREMA...")
-            res = self.stub.SendFrame(obs, timeout=60.0)
-            return res
-        except Exception as e:
-            print(f"[GrpcClient Error] push_initial_scan_batch failed: {e}")
-            return None
 
         # In non-blocking mode: if queue is full, drop oldest frame to maintain low latency
         if self._frame_queue.full():
@@ -225,6 +202,54 @@ class DremaGrpcClient:
         except queue.Full:
             pass
 
+        return None
+
+    def push_initial_scan_batch(
+        self,
+        cameras_list: List[Any],
+        semantic_labels: Optional[Dict[str, int]] = None,
+        robot_base_pos: Optional[List[float]] = None,
+        reachability_radius: float = 0.95
+    ) -> Optional[drema_comm_pb2.StreamStatus]:
+        """
+        Pushes the entire 360° orbital scan (all ~200 views) in a single batch to DREMA suite.
+        Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip])
+        """
+        frames = []
+        for item in cameras_list:
+            name, rgb, depth, extrinsics, intrinsics = item[0], item[1], item[2], item[3], item[4]
+            near_clip = item[5] if len(item) > 5 else 0.0
+            far_clip = item[6] if len(item) > 6 else 0.0
+            f = pack_camera_frame(
+                name=name,
+                rgb=rgb,
+                depth=depth,
+                extrinsics=extrinsics,
+                intrinsics=intrinsics,
+                near_clipping=near_clip,
+                far_clipping=far_clip
+            )
+            frames.append(f)
+
+        obs = drema_comm_pb2.FrameObservation(
+            timestep=0,
+            timestamp=time.time(),
+            cameras=frames,
+            is_initial_scan=True,
+            is_scan_finished=True,
+            semantic_labels=semantic_labels or {},
+            robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
+            reachability_radius=float(reachability_radius)
+        )
+
+        try:
+            print(f"[GrpcClient] Sending single-batch initial scan ({len(frames)} views, {len(semantic_labels or {})} labels) to DREMA...")
+            res = self.stub.SendFrame(obs, timeout=60.0)
+            return res
+        except Exception as e:
+            print(f"[GrpcClient Error] push_initial_scan_batch failed: {e}")
+            return None
+
     def request_action(
         self,
         timestep: int,
@@ -235,6 +260,8 @@ class DremaGrpcClient:
         task_active: bool,
         target_pose: Optional[List[float]] = None,
         target_available: bool = False,
+        robot_base_pos: Optional[List[float]] = None,
+        reachability_radius: float = 0.95,
         timeout: float = 0.5
     ) -> drema_comm_pb2.ControlAction:
         """
@@ -249,7 +276,9 @@ class DremaGrpcClient:
             gripper_open=gripper_open,
             task_active=task_active,
             target_pose=target_pose if target_pose is not None else [],
-            target_available=target_available
+            target_available=target_available,
+            robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
+            reachability_radius=float(reachability_radius)
         )
         try:
             action = self.stub.RequestAction(state, timeout=timeout)

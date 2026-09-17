@@ -21,7 +21,6 @@ import torch
 from scipy.spatial import ConvexHull, cKDTree
 from scipy.sparse import csgraph
 
-# Ensure local packages and master-thesis workspace packages are importable
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
 
@@ -33,10 +32,12 @@ from drema.controller.mpc_controller import MPCController
 
 try:
     from drema.vg_mapping.closed_loop_pipeline import DREMAClosedLoopVGMappingPipeline, rotation_matrix_to_quaternion
-    HAS_VG_MAPPING = True
 except Exception as e:
-    print(f"[Warning] Could not import DREMAClosedLoopVGMappingPipeline: {e}")
-    HAS_VG_MAPPING = False
+    print("\n" + "=" * 75)
+    print(f"[FATAL ERROR] Could not import DREMAClosedLoopVGMappingPipeline: {e}")
+    print("DREMA requires VG-Mapping & RecurGS for real-time 3D reconstruction and tracking.")
+    print("=" * 75 + "\n")
+    sys.exit(1)
 
 
 def pointcloud_from_depth_and_camera_params(depth: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
@@ -73,24 +74,30 @@ class DremaDynamicSuite:
         self,
         port: int = 50051,
         visualize_pybullet: bool = False,
-        table_z: float = 0.75,
+        table_z_prior: float = 0.75,
+        reachability_radius: float = 0.95,
         voxel_size: float = 0.01,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
     ):
         self.port = port
         self.device = device
-        self.table_z = table_z
+        self.table_z_prior = table_z_prior
+        self.reachability_radius = reachability_radius
         self.voxel_size = voxel_size
+
+        # Robot base & dynamic active workspace (updated via initial scan & gRPC)
+        self.robot_base_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.active_workspace_bounds: Optional[Dict[str, float]] = None
 
         print(f"==================================================")
         print(f"   DREMA Dynamic Inference Suite Starting...     ")
         print(f"   Device: {self.device} | Port: {self.port}       ")
         print(f"==================================================")
 
-        # 1. Initialize Submodule 2: PyBullet Digital Twin (Baseline: robot + table)
+        # 1. Initialize Submodule 2: PyBullet Digital Twin (Ground plane + Robot URDF)
         self.digital_twin = PyBulletDigitalTwin(
             visualize=visualize_pybullet,
-            table_z=table_z
+            table_z=table_z_prior
         )
         print("✓ Submodule 2 (PyBullet Digital Twin) initialized.")
 
@@ -102,20 +109,21 @@ class DremaDynamicSuite:
         )
         print("✓ Submodule 3 (MPC Controller) initialized.")
 
-        # 3. Initialize Submodule 1: VG-Mapping & RecurGS SE(3) Pipeline
-        self.vg_pipeline = None
-        if HAS_VG_MAPPING:
-            try:
-                self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
-                    pybullet_client=None,  # We manage PyBullet directly via digital_twin
-                    voxel_size=voxel_size,
-                    grid_dim=(128, 128, 128),
-                    origin=(-0.26, -0.64, table_z - 0.20),
-                    device=self.device
-                )
-                print("✓ Submodule 1 (VG-Mapping Closed-Loop Pipeline) initialized.")
-            except Exception as e:
-                print(f"[Notice] VG-Mapping pipeline initialization deferred/mock: {e}")
+        # 3. Initialize Submodule 1: VG-Mapping & RecurGS SE(3) Pipeline (Fail-Fast Verification)
+        try:
+            self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
+                pybullet_client=None,
+                voxel_size=voxel_size,
+                grid_dim=(128, 128, 128),
+                origin=(-0.5, -0.5, 0.0),
+                device=self.device
+            )
+            print(f"✓ Submodule 1 (VG-Mapping Closed-Loop Pipeline) successfully verified on {self.device.upper()}.")
+        except Exception as e:
+            print("\n" + "=" * 75)
+            print(f"[FATAL ERROR] Failed to initialize DREMAClosedLoopVGMappingPipeline on {self.device}: {e}")
+            print("=" * 75 + "\n")
+            sys.exit(1)
 
         # Frame ingestion queue & worker thread
         self.frame_queue = queue.Queue(maxsize=3)
@@ -142,70 +150,159 @@ class DremaDynamicSuite:
             on_reset_callback=self.on_reset_episode
         )
 
-    def _process_initial_scene_scan(self, semantic_labels: Optional[Dict[str, int]] = None):
+    def _process_initial_scene_scan(self, semantic_labels: Optional[Dict[str, int]] = None) -> bool:
         """
         Processes the 200 orbital scanning views collected at t=0:
-        1. Segments the dominant horizontal plane to determine exact table elevation z_table and 2D bounds.
-        2. Generates a solid 3D table surface mesh (.obj) via 3D Convex Hull and spawns it in PyBullet.
-        3. Discovers foreground obstacle clusters above the table (e.g. tunnel), builds a 3D mesh,
-           and spawns them in PyBullet with spawn_mesh_object.
-        4. Saves canonical points for online RecurGS SE(3) tracking.
+        1. Strict fail-fast check: aborts if 0 points were accumulated.
+        2. Detects the true horizontal table surface and its spatial extent from the dense point cloud.
+        3. Computes the Active Workspace by intersecting the table surface with the robot reachability cylinder.
+        4. Dynamically initializes the TSDF voxel grid origin and dimensions to cover the Active Workspace.
+        5. Spawns the physical table mesh in PyBullet Digital Twin.
+        6. Discovers tabletop obstacle clusters strictly within the Active Workspace and spawns them.
         """
         print("\n=======================================================")
         print(f"[DREMA Suite] Processing 360° Initial Scene Scan ({len(self.accumulated_scan_points)} view point clouds)...")
         print("=======================================================")
 
+        # Strict Fail-Fast Check: If no points collected, terminate immediately
         if len(self.accumulated_scan_points) == 0:
-            print("[DREMA Suite Warning] No scanning points accumulated. Using default bounds.")
-            self.digital_twin.spawn_scanned_table(table_z=self.table_z, bounds=(-0.50, 1.10, -0.55, 0.55))
-            self.initial_scan_ready = True
-            return
+            print("\n" + "=" * 75)
+            print("[FATAL ERROR] 360° initial scan collected 0 valid points!")
+            print("No depth data was received from CoppeliaSim sensors. Cannot reconstruct table or scene.")
+            print("Pipeline terminating immediately.")
+            print("=" * 75 + "\n")
+            self.stop()
+            sys.exit(1)
 
         all_pts = np.vstack(self.accumulated_scan_points)
         print(f"[DREMA Suite Scan] Accumulated {len(all_pts)} dense 3D surface points across all views.")
 
-        # 1. Table Detection via Z-elevation histogram
-        hist, bin_edges = np.histogram(all_pts[:, 2], bins=50, range=(0.70, 0.80))
-        peak_bin = np.argmax(hist)
-        z_table = float(0.5 * (bin_edges[peak_bin] + bin_edges[peak_bin + 1]))
+        # =========================================================================
+        # Table Detection & Workspace Geometry Configuration
+        # =========================================================================
+        MIN_TABLE_PLANE_POINTS = 400          # Minimum inlier points required to confirm table support
+        TABLE_SURFACE_THICKNESS = 0.008        # Elevation tolerance (±8mm) for surface inliers
+        ACTIVE_WORKSPACE_MARGIN = 0.05         # Reachability safety margin (meters) added to robot workspace
+        TABLE_TSDF_LOWER_PADDING = 0.05        # Vertical volume padding below table surface for TSDF (meters)
+        OBSTACLE_MIN_CLEARANCE_Z = 0.015       # Min clearance (meters) above table to isolate objects from surface noise
+        ROBOT_BASE_RADIUS = 0.12               # Exclusion cylinder radius (meters) around robot base origin
 
-        table_pts_mask = np.abs(all_pts[:, 2] - z_table) <= 0.008
-        table_pts = all_pts[table_pts_mask]
+        # 1. Robust Table Surface Detection via Dominant Horizontal Plane
+        z_vals = all_pts[:, 2]
+        z_min_scan = float(np.percentile(z_vals, 1))
+        z_max_scan = float(np.percentile(z_vals, 99))
+        if z_max_scan - z_min_scan < 0.10:
+            z_min_scan -= 0.10
+            z_max_scan += 0.10
+        num_bins = max(30, int((z_max_scan - z_min_scan) / 0.005))
+        hist, bin_edges = np.histogram(z_vals, bins=num_bins, range=(z_min_scan, z_max_scan))
+        peak_indices = np.argsort(hist)[::-1]
 
-        if len(table_pts) > 100:
-            x_min = float(np.percentile(table_pts[:, 0], 1))
-            x_max = float(np.percentile(table_pts[:, 0], 99))
-            y_min = float(np.percentile(table_pts[:, 1], 1))
-            y_max = float(np.percentile(table_pts[:, 1], 99))
-        else:
-            x_min, x_max = -0.50, 1.10
-            y_min, y_max = -0.55, 0.55
+        found_table = False
+        z_table = 0.0
+        table_pts = None
 
-        table_bounds = (x_min, x_max, y_min, y_max)
-        print(f"[DREMA Discovery] Table surface detected at Z={z_table:.3f}m, bounds: X[{x_min:.3f}, {x_max:.3f}], Y[{y_min:.3f}, {y_max:.3f}]")
+        # The tabletop is the dominant horizontal plane with substantial point support
+        for p_idx in peak_indices[:10]:
+            candidate_z = float(0.5 * (bin_edges[p_idx] + bin_edges[p_idx + 1]))
+            cand_mask = np.abs(z_vals - candidate_z) <= TABLE_SURFACE_THICKNESS
+            cand_pts = all_pts[cand_mask]
 
-        # Spawn solid table in PyBullet Digital Twin (extends from ground Z=0 to Z=z_table)
+            if len(cand_pts) >= MIN_TABLE_PLANE_POINTS:
+                z_table = candidate_z
+                table_pts = cand_pts
+                found_table = True
+                break
+
+        if not found_table or table_pts is None:
+            print("\n" + "=" * 75)
+            print("[FATAL ERROR] Could not detect a valid horizontal table surface in the 360° scan!")
+            print(f"Analyzed {len(all_pts)} points between Z=[{z_min_scan:.2f}, {z_max_scan:.2f}]m.")
+            print(f"No horizontal plane with at least {MIN_TABLE_PLANE_POINTS} points was found.")
+            print("Pipeline terminating immediately.")
+            print("=" * 75 + "\n")
+            self.stop()
+            sys.exit(1)
+
+        # 2. Extract Full Physical Table Bounds directly from point distribution
+        tab_x_min = float(np.percentile(table_pts[:, 0], 1))
+        tab_x_max = float(np.percentile(table_pts[:, 0], 99))
+        tab_y_min = float(np.percentile(table_pts[:, 1], 1))
+        tab_y_max = float(np.percentile(table_pts[:, 1], 99))
+        table_bounds = (tab_x_min, tab_x_max, tab_y_min, tab_y_max)
+        print(f"✓ [DREMA Scan] Table surface detected at Z={z_table:.3f}m, full bounds: X[{tab_x_min:.3f}, {tab_x_max:.3f}], Y[{tab_y_min:.3f}, {tab_y_max:.3f}]")
+
+        # 3. Post-Filtering: Compute Active Workspace (Intersection with Robot Reachability Cylinder)
+        rb_x, rb_y, rb_z = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
+        r_reach = float(self.reachability_radius)
+
+        reach_x_min = rb_x - (r_reach + ACTIVE_WORKSPACE_MARGIN)
+        reach_x_max = rb_x + (r_reach + ACTIVE_WORKSPACE_MARGIN)
+        reach_y_min = rb_y - (r_reach + ACTIVE_WORKSPACE_MARGIN)
+        reach_y_max = rb_y + (r_reach + ACTIVE_WORKSPACE_MARGIN)
+
+        act_x_min = max(tab_x_min, reach_x_min)
+        act_x_max = min(tab_x_max, reach_x_max)
+        act_y_min = max(tab_y_min, reach_y_min)
+        act_y_max = min(tab_y_max, reach_y_max)
+        act_z_min = z_table - TABLE_TSDF_LOWER_PADDING
+        # Upper workspace bound: naturally bounded by robot reachability volume (no arbitrary height ceiling!)
+        act_z_max = z_table + r_reach
+
+        self.active_workspace_bounds = {
+            'x_min': act_x_min, 'x_max': act_x_max,
+            'y_min': act_y_min, 'y_max': act_y_max,
+            'z_min': act_z_min, 'z_max': act_z_max,
+            'z_table': z_table
+        }
+        print(f"✓ [DREMA Reachability] Robot Base: [{rb_x:.2f}, {rb_y:.2f}, {rb_z:.2f}], Reach Radius: {r_reach:.2f}m")
+        print(f"✓ [DREMA Active Workspace] X[{act_x_min:.3f}, {act_x_max:.3f}], Y[{act_y_min:.3f}, {act_y_max:.3f}], Z[{act_z_min:.3f}, {act_z_max:.3f}]")
+
+        # 4. Spawn Solid Table in PyBullet Digital Twin (Full geometry)
         self.digital_twin.spawn_scanned_table(
             table_z=z_table,
             bounds=table_bounds
         )
 
-        # 2. Fast Semantic Clustering for Tabletop Obstacles & Target
-        # Select points above table surface in workspace (X > 0.05 avoids robot arm at X <= -0.05)
-        obj_mask = (all_pts[:, 2] > (z_table + 0.015)) & (all_pts[:, 2] < (z_table + 0.35)) & \
-                   (all_pts[:, 0] > 0.05) & (all_pts[:, 0] < 0.70) & \
-                   (all_pts[:, 1] > -0.50) & (all_pts[:, 1] < 0.50)
+        # 5. Dynamically Initialize TSDF Grid for Active Workspace in Submodule 1
+        ext_x = act_x_max - act_x_min
+        ext_y = act_y_max - act_y_min
+        ext_z = act_z_max - act_z_min
+
+        nx = max(32, int(np.ceil(ext_x / self.voxel_size)))
+        ny = max(32, int(np.ceil(ext_y / self.voxel_size)))
+        nz = max(32, int(np.ceil(ext_z / self.voxel_size)))
+
+        nx = ((nx + 7) // 8) * 8
+        ny = ((ny + 7) // 8) * 8
+        nz = ((nz + 7) // 8) * 8
+
+        grid_origin = (round(act_x_min, 4), round(act_y_min, 4), round(act_z_min, 4))
+        grid_dim = (nx, ny, nz)
+
+        print(f"✓ [VG-Mapping TSDF] Dynamic Grid configured: origin={grid_origin}, dim={grid_dim} ({nx*self.voxel_size:.2f}m x {ny*self.voxel_size:.2f}m x {nz*self.voxel_size:.2f}m)")
+        self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
+            pybullet_client=None,
+            voxel_size=self.voxel_size,
+            grid_dim=grid_dim,
+            origin=grid_origin,
+            device=self.device
+        )
+
+        # 6. Discover Tabletop Obstacles (Strictly within Active Workspace, no arbitrary height ceiling)
+        dist_to_robot = np.sqrt((all_pts[:, 0] - rb_x)**2 + (all_pts[:, 1] - rb_y)**2)
+        obj_mask = (all_pts[:, 2] > (z_table + OBSTACLE_MIN_CLEARANCE_Z)) & (all_pts[:, 2] <= act_z_max) & \
+                   (all_pts[:, 0] >= act_x_min) & (all_pts[:, 0] <= act_x_max) & \
+                   (all_pts[:, 1] >= act_y_min) & (all_pts[:, 1] <= act_y_max) & \
+                   (dist_to_robot <= r_reach) & (dist_to_robot >= ROBOT_BASE_RADIUS)
         obj_pts = all_pts[obj_mask]
-        print(f"[DREMA Discovery] Tabletop object points detected: {len(obj_pts)}")
+        print(f"[DREMA Discovery] Tabletop obstacle points detected in active workspace: {len(obj_pts)}")
 
         if len(obj_pts) >= 30:
-            # Fast voxel downsampling (1cm grid)
-            voxel_size = 0.01
-            voxel_idx = np.floor(obj_pts / voxel_size).astype(int)
+            voxel_idx = np.floor(obj_pts / self.voxel_size).astype(int)
             _, unique_idx = np.unique(voxel_idx, axis=0, return_index=True)
             ds_pts = obj_pts[unique_idx]
 
-            # Fast Euclidean clustering via KDTree connected components (< 2ms)
             tree = cKDTree(ds_pts)
             adj = tree.sparse_distance_matrix(tree, max_distance=0.04)
             n_comp, labels = csgraph.connected_components(adj)
@@ -217,7 +314,7 @@ class DremaDynamicSuite:
                     cluster_list.append(c_pts)
 
             cluster_list.sort(key=lambda c: len(c), reverse=True)
-            print(f"[DREMA Discovery] Found {len(cluster_list)} distinct object cluster(s) above the table.")
+            print(f"[DREMA Discovery] Found {len(cluster_list)} distinct object cluster(s) in active workspace.")
 
             spawned_obstacles = 0
             for c_idx, c_pts in enumerate(cluster_list):
@@ -272,49 +369,40 @@ class DremaDynamicSuite:
                 spawned_obstacles += 1
 
         self.initial_scan_ready = True
-        print(f"\n✓ [DREMA Suite] Initial Scene Setup Complete! Ready for dynamic execution.")
+        print(f"\n✓ [DREMA Suite] Initial Scene Setup Complete! Active Workspace Ready.")
         print("=======================================================\n")
+        return True
 
     def on_frame_received(self, obs: drema_comm_pb2.FrameObservation) -> Optional[drema_comm_pb2.StreamStatus]:
         """gRPC callback triggered when a camera frame arrives from CoppeliaSim."""
+        # Update robot base and reachability radius if transmitted by client
+        if len(obs.robot_base_pos) >= 3:
+            self.robot_base_pos = np.array(obs.robot_base_pos[:3], dtype=np.float32)
+        if obs.reachability_radius > 0:
+            self.reachability_radius = float(obs.reachability_radius)
+
         if obs.is_initial_scan:
             for f in obs.cameras:
-                name, rgb, depth, extrinsics, intrinsics = unpack_camera_frame(f)
-                if self.vg_pipeline is not None:
-                    try:
-                        d_tensor = torch.from_numpy(depth.copy()).to(self.device)
-                        k_tensor = torch.from_numpy(intrinsics.copy()).to(self.device)
-                        t_tensor = torch.from_numpy(extrinsics.copy()).to(self.device)
-                        rgb_tensor = torch.from_numpy(rgb.copy()).float().to(self.device) / 255.0
-                        self.vg_pipeline.step_1_ingest_frame(
-                            rgb=rgb_tensor,
-                            depth=d_tensor,
-                            intrinsic=k_tensor,
-                            camera_pose=t_tensor
-                        )
-                    except Exception:
-                        pass
+                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip = unpack_camera_frame(f)
 
-                # Back-project depth points using exact CoppeliaSim camera projection
+                # Back-project depth points using camera projection
                 pcd = pointcloud_from_depth_and_camera_params(depth, extrinsics, intrinsics)
-                valid = (depth > 0.1) & (depth < 3.5)
+                # Valid points within the physical sensor clipping bounds
+                valid = (depth > near_clip) & (depth < far_clip)
                 pts = pcd[valid]
 
-                # Filter to table workspace: X in [-0.55, 1.15], Y in [-0.65, 0.65], Z in [0.65, 1.50]
-                ws = (pts[:, 0] >= -0.55) & (pts[:, 0] <= 1.15) & \
-                     (pts[:, 1] >= -0.65) & (pts[:, 1] <= 0.65) & \
-                     (pts[:, 2] >= 0.65) & (pts[:, 2] <= 1.50)
-                if np.any(ws):
-                    self.accumulated_scan_points.append(pts[ws])
+                # Accumulate all valid points across all scanning views (no premature arbitrary box cropping)
+                if len(pts) > 0:
+                    self.accumulated_scan_points.append(pts)
 
             if obs.is_scan_finished:
                 semantic_labels = dict(obs.semantic_labels) if obs.semantic_labels else None
-                self._process_initial_scene_scan(semantic_labels=semantic_labels)
+                success = self._process_initial_scene_scan(semantic_labels=semantic_labels)
                 return drema_comm_pb2.StreamStatus(
-                    success=True,
-                    message="Initial 360° scan processed and PyBullet Digital Twin populated",
+                    success=success,
+                    message="Initial 360° scan processed and PyBullet Digital Twin populated" if success else "Scan processing failed",
                     received_timestep=0,
-                    initial_scan_ready=True
+                    initial_scan_ready=self.initial_scan_ready
                 )
             return drema_comm_pb2.StreamStatus(
                 success=True,
@@ -355,18 +443,19 @@ class DremaDynamicSuite:
             # Unpack all camera views
             camera_views = {}
             for f in obs.cameras:
-                name, rgb, depth, extrinsics, intrinsics = unpack_camera_frame(f)
+                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip = unpack_camera_frame(f)
                 camera_views[name] = {
                     'rgb': rgb,
                     'depth': depth,
                     'extrinsics': extrinsics,
-                    'intrinsics': intrinsics
+                    'intrinsics': intrinsics,
+                    'near_clipping': near_clip,
+                    'far_clipping': far_clip
                 }
 
             # If VG-Mapping pipeline is available, integrate depth frames
             if self.vg_pipeline is not None and len(camera_views) > 0:
                 try:
-                    # Ingest first available camera (or all views)
                     first_cam = list(camera_views.values())[0]
                     d_tensor = torch.from_numpy(first_cam['depth'].copy()).to(self.device)
                     k_tensor = torch.from_numpy(first_cam['intrinsics'].copy()).to(self.device)
@@ -382,18 +471,20 @@ class DremaDynamicSuite:
                 except Exception as e:
                     print(f"[VG-Mapping Worker] Exception during frame {timestep} integration: {e}")
 
-            # If obstacle 0 is tracked, update its position via real-time centroid tracking
-            if self.initial_scan_ready and 0 in self.tracked_objects and len(camera_views) > 0:
+            # If obstacle 0 is tracked, update its position via real-time centroid tracking in Active Workspace
+            if self.initial_scan_ready and 0 in self.tracked_objects and len(camera_views) > 0 and self.active_workspace_bounds is not None:
                 try:
                     first_cam = list(camera_views.values())[0]
                     depth_rt = first_cam['depth']
                     ext_rt = first_cam['extrinsics']
                     int_rt = first_cam['intrinsics']
+                    near_c = first_cam['near_clipping']
+                    far_c = first_cam['far_clipping']
 
                     H, W = depth_rt.shape
                     u_g, v_g = np.meshgrid(np.arange(0, W, 4), np.arange(0, H, 4))
                     d_vals = depth_rt[v_g, u_g]
-                    valid = (d_vals > 0.1) & (d_vals < 2.5)
+                    valid = (d_vals > near_c) & (d_vals < far_c)
 
                     u_v, v_v, d_v = u_g[valid], v_g[valid], d_vals[valid]
                     fx, fy = int_rt[0, 0], int_rt[1, 1]
@@ -403,10 +494,15 @@ class DremaDynamicSuite:
                     p_c = np.stack([x_c, y_c, d_v, np.ones_like(d_v)], axis=-1)
                     p_w = (ext_rt @ p_c.T).T[:, :3]
 
-                    z_tab = self.digital_twin.table_z
-                    obs_m = (p_w[:, 2] > (z_tab + 0.008)) & \
-                            (p_w[:, 0] >= 0.05) & (p_w[:, 0] <= 0.65) & \
-                            (p_w[:, 1] >= -0.45) & (p_w[:, 1] <= 0.45)
+                    ws = self.active_workspace_bounds
+                    z_tab = ws['z_table']
+                    rb_x, rb_y = float(self.robot_base_pos[0]), float(self.robot_base_pos[1])
+                    dist_rt = np.sqrt((p_w[:, 0] - rb_x)**2 + (p_w[:, 1] - rb_y)**2)
+
+                    obs_m = (p_w[:, 2] > (z_tab + 0.015)) & (p_w[:, 2] <= ws['z_max']) & \
+                            (p_w[:, 0] >= ws['x_min']) & (p_w[:, 0] <= ws['x_max']) & \
+                            (p_w[:, 1] >= ws['y_min']) & (p_w[:, 1] <= ws['y_max']) & \
+                            (dist_rt <= self.reachability_radius) & (dist_rt >= 0.12)
                     pts_obs_curr = p_w[obs_m]
 
                     if len(pts_obs_curr) >= 20:
@@ -427,6 +523,12 @@ class DremaDynamicSuite:
     def on_request_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
         """gRPC callback triggered when CoppeliaSim requests joint velocity command."""
         self.total_actions_served += 1
+
+        # Update robot base and reachability if provided
+        if len(robot_state.robot_base_pos) >= 3:
+            self.robot_base_pos = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
+        if robot_state.reachability_radius > 0:
+            self.reachability_radius = float(robot_state.reachability_radius)
 
         # 1. Update PyBullet Digital Twin robot joint configuration
         if len(robot_state.joint_positions) > 0:
@@ -459,6 +561,7 @@ class DremaDynamicSuite:
         self.initial_scan_ready = False
         self.accumulated_scan_points = []
         self.tracked_objects = {}
+        self.active_workspace_bounds = None
         self.digital_twin.reset()
         self.mpc_controller.reset()
         return True
@@ -490,7 +593,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run DREMA Dynamic Inference Suite")
     parser.add_argument("--port", type=int, default=50051, help="gRPC Server port (default: 50051)")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Open PyBullet GUI window for real-time visualization")
-    parser.add_argument("--table_z", type=float, default=0.75, help="Table surface Z elevation in meters (default: 0.75)")
+    parser.add_argument("--table_z_prior", type=float, default=0.75, help="Preliminary prior for table Z search in meters (default: 0.75)")
+    parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--voxel_size", type=float, default=0.01, help="TSDF voxel grid resolution (default: 0.01m)")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Computation device (cuda/cpu)")
     return parser.parse_args()
@@ -501,7 +605,8 @@ if __name__ == "__main__":
     suite = DremaDynamicSuite(
         port=args.port,
         visualize_pybullet=args.visualize_pybullet,
-        table_z=args.table_z,
+        table_z_prior=args.table_z_prior,
+        reachability_radius=args.reachability_radius,
         voxel_size=args.voxel_size,
         device=args.device
     )

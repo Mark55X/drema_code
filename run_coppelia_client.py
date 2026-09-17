@@ -48,7 +48,8 @@ class CoppeliaSimulationClient:
         sync_mode: str = "realtime",
         headless: bool = False,
         cam_fps: float = 10.0,
-        ctrl_fps: float = 50.0
+        ctrl_fps: float = 50.0,
+        reachability_radius: float = 0.95
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -56,6 +57,7 @@ class CoppeliaSimulationClient:
         self.headless = headless
         self.cam_fps = cam_fps
         self.ctrl_fps = ctrl_fps
+        self.reachability_radius = reachability_radius
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -166,9 +168,11 @@ class CoppeliaSimulationClient:
                     depth_m = c.capture_depth(in_meters=True).astype(np.float32)
                     ext = np.array(c.get_matrix(), dtype=np.float32).reshape((4, 4))
                     intrinsic = np.array(c.get_intrinsic_matrix(), dtype=np.float32)
+                    near_clip = float(c.get_near_clipping_plane()) if hasattr(c, 'get_near_clipping_plane') else 0.01
+                    far_clip = float(c.get_far_clipping_plane()) if hasattr(c, 'get_far_clipping_plane') else 3.5
 
                     cam_name = f'orbit_{step_idx}_{c_idx}'
-                    all_scan_cameras.append((cam_name, rgb_uint8, depth_m, ext, intrinsic))
+                    all_scan_cameras.append((cam_name, rgb_uint8, depth_m, ext, intrinsic, near_clip, far_clip))
 
                 if (step_idx + 1) % 10 == 0:
                     print(f"[CoppeliaClient Scan] Captured {(step_idx + 1) * 4}/{num_steps * 4} views...")
@@ -178,7 +182,7 @@ class CoppeliaSimulationClient:
             from pyrep.objects.shape import Shape
             handles = sim.simGetObjectsInTree(sim.sim_handle_scene, sim.sim_object_shape_type, 0)
             semantic_labels = {}
-            filter_names = ["DefaultCamera", "ResizableFloor", "workspace", "Wall"]
+            filter_names = ["DefaultCamera", "ResizableFloor", "Floor", "Wall", "Ceiling"]
             for h in handles:
                 try:
                     name = Shape(h).get_name()
@@ -190,8 +194,21 @@ class CoppeliaSimulationClient:
 
             print(f"[CoppeliaClient Scan] Extracted {len(semantic_labels)} semantic labels from CoppeliaSim scene.")
 
-            # Send ALL views in ONE single batch message
-            res = self.client.push_initial_scan_batch(all_scan_cameras, semantic_labels)
+            # Retrieve robot base position
+            robot_base_pos = [0.0, 0.0, 0.0]
+            if hasattr(self, 'task') and hasattr(self.task, '_robot'):
+                try:
+                    robot_base_pos = list(self.task._robot.arm.get_position())
+                except Exception:
+                    pass
+
+            # Send ALL views in ONE single batch message with robot reachability
+            res = self.client.push_initial_scan_batch(
+                all_scan_cameras,
+                semantic_labels=semantic_labels,
+                robot_base_pos=robot_base_pos,
+                reachability_radius=self.reachability_radius
+            )
 
             if res and res.initial_scan_ready:
                 print(f"\n✓ [CoppeliaClient] 360° orbital scan complete! All {len(all_scan_cameras)} views sent in single batch. DREMA scene populated.")
@@ -319,11 +336,16 @@ class CoppeliaSimulationClient:
             # 3x3 Intrinsic matrix
             intrinsic = np.array(cam.get_intrinsic_matrix(), dtype=np.float32)
 
+            near_clip = float(cam.get_near_clipping_plane()) if hasattr(cam, 'get_near_clipping_plane') else 0.01
+            far_clip = float(cam.get_far_clipping_plane()) if hasattr(cam, 'get_far_clipping_plane') else 3.5
+
             cam_dict[name] = {
                 'rgb': rgb_uint8,
                 'depth': depth_m,
                 'extrinsics': ext,
-                'intrinsics': intrinsic
+                'intrinsics': intrinsic,
+                'near_clipping': near_clip,
+                'far_clipping': far_clip
             }
         return cam_dict
 
@@ -378,6 +400,7 @@ class CoppeliaSimulationClient:
                 self.step_counter += 1
 
                 # 1. Perception Step (f_cam ≈ 10 Hz): capture and push frames to gRPC queue if connected
+                robot_base_pos = list(arm.get_position()) if hasattr(arm, 'get_position') else [0.0, 0.0, 0.0]
                 is_cam_step = (self.step_counter % self.cam_decimation == 0)
                 if is_cam_step and self.server_connected:
                     cam_data = self.capture_camera_data()
@@ -385,7 +408,9 @@ class CoppeliaSimulationClient:
                     self.client.push_frame_observation(
                         timestep=self.step_counter,
                         camera_dict=cam_data,
-                        blocking=blocking_send
+                        blocking=blocking_send,
+                        robot_base_pos=robot_base_pos,
+                        reachability_radius=self.reachability_radius
                     )
 
                 # 2. Read Robot State & Scene Target (if defined in task)
@@ -418,6 +443,8 @@ class CoppeliaSimulationClient:
                         task_active=self.task_active,
                         target_pose=target_pose,
                         target_available=target_available,
+                        robot_base_pos=robot_base_pos,
+                        reachability_radius=self.reachability_radius,
                         timeout=0.05 if self.sync_mode == "realtime" else 2.0
                     )
                     # 4. Actuate Robot
@@ -466,6 +493,7 @@ def parse_args():
     parser.add_argument("--sync_mode", type=str, choices=["stepped", "realtime"], default="realtime", help="Simulation sync mode: 'stepped' or 'realtime' (default: realtime)")
     parser.add_argument("--cam_fps", type=float, default=10.0, help="Camera sensor capture and streaming frequency in Hz (default: 10)")
     parser.add_argument("--ctrl_fps", type=float, default=50.0, help="Robot joint velocity control frequency in Hz (default: 50)")
+    parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
     return parser.parse_args()
 
@@ -478,6 +506,7 @@ if __name__ == "__main__":
         sync_mode=args.sync_mode,
         headless=args.headless,
         cam_fps=args.cam_fps,
-        ctrl_fps=args.ctrl_fps
+        ctrl_fps=args.ctrl_fps,
+        reachability_radius=args.reachability_radius
     )
     client.run()

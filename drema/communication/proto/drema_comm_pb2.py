@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x64rema_comm.proto\x12\x05\x64rema\"\x9a\x01\n\x0b\x43\x61meraFrame\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05width\x18\x02 \x01(\x05\x12\x0e\n\x06height\x18\x03 \x01(\x05\x12\x10\n\x08\x63hannels\x18\x04 \x01(\x05\x12\x10\n\x08rgb_data\x18\x05 \x01(\x0c\x12\x12\n\ndepth_data\x18\x06 \x01(\x0c\x12\x12\n\nextrinsics\x18\x07 \x03(\x02\x12\x12\n\nintrinsics\x18\x08 \x03(\x02\"\x8c\x02\n\x10\x46rameObservation\x12\x10\n\x08timestep\x18\x01 \x01(\x03\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\x12#\n\x07\x63\x61meras\x18\x03 \x03(\x0b\x32\x12.drema.CameraFrame\x12\x17\n\x0fis_initial_scan\x18\x04 \x01(\x08\x12\x18\n\x10is_scan_finished\x18\x05 \x01(\x08\x12\x44\n\x0fsemantic_labels\x18\x06 \x03(\x0b\x32+.drema.FrameObservation.SemanticLabelsEntry\x1a\x35\n\x13SemanticLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"g\n\x0cStreamStatus\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x19\n\x11received_timestep\x18\x03 \x01(\x03\x12\x1a\n\x12initial_scan_ready\x18\x04 \x01(\x08\"\xcf\x01\n\nRobotState\x12\x11\n\ttimestamp\x18\x01 \x01(\x01\x12\x10\n\x08timestep\x18\x02 \x01(\x03\x12\x17\n\x0fjoint_positions\x18\x03 \x03(\x01\x12\x18\n\x10joint_velocities\x18\x04 \x03(\x01\x12\x0f\n\x07\x65\x65_pose\x18\x05 \x03(\x01\x12\x14\n\x0cgripper_open\x18\x06 \x01(\x01\x12\x13\n\x0btask_active\x18\x07 \x01(\x08\x12\x13\n\x0btarget_pose\x18\x08 \x03(\x01\x12\x18\n\x10target_available\x18\t \x01(\x08\"\x93\x01\n\rControlAction\x12\x11\n\ttimestamp\x18\x01 \x01(\x01\x12\x10\n\x08timestep\x18\x02 \x01(\x03\x12\x18\n\x10joint_velocities\x18\x03 \x03(\x01\x12\x16\n\x0egripper_action\x18\x04 \x01(\x01\x12\x13\n\x0bsafety_stop\x18\x05 \x01(\x08\x12\x16\n\x0estatus_message\x18\x06 \x01(\t\"8\n\x0cResetRequest\x12\x15\n\repisode_index\x18\x01 \x01(\x05\x12\x11\n\ttask_name\x18\x02 \x01(\t\"1\n\rResetResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"3\n\x0bPingRequest\x12\x11\n\tclient_id\x18\x01 \x01(\t\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\"M\n\x0cPingResponse\x12\r\n\x05\x61live\x18\x01 \x01(\x08\x12\x18\n\x10server_timestamp\x18\x02 \x01(\x01\x12\x14\n\x0csuite_status\x18\x03 \x01(\t2\xb8\x02\n\x15\x44remaInferenceService\x12>\n\x0cStreamFrames\x12\x17.drema.FrameObservation\x1a\x13.drema.StreamStatus(\x01\x12\x39\n\tSendFrame\x12\x17.drema.FrameObservation\x1a\x13.drema.StreamStatus\x12\x38\n\rRequestAction\x12\x11.drema.RobotState\x1a\x14.drema.ControlAction\x12\x39\n\x0cResetEpisode\x12\x13.drema.ResetRequest\x1a\x14.drema.ResetResponse\x12/\n\x04Ping\x12\x12.drema.PingRequest\x1a\x13.drema.PingResponseb\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x10\x64rema_comm.proto\x12\x05\x64rema\"\xc7\x01\n\x0b\x43\x61meraFrame\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\r\n\x05width\x18\x02 \x01(\x05\x12\x0e\n\x06height\x18\x03 \x01(\x05\x12\x10\n\x08\x63hannels\x18\x04 \x01(\x05\x12\x10\n\x08rgb_data\x18\x05 \x01(\x0c\x12\x12\n\ndepth_data\x18\x06 \x01(\x0c\x12\x12\n\nextrinsics\x18\x07 \x03(\x02\x12\x12\n\nintrinsics\x18\x08 \x03(\x02\x12\x15\n\rnear_clipping\x18\t \x01(\x02\x12\x14\n\x0c\x66\x61r_clipping\x18\n \x01(\x02\"\xc1\x02\n\x10\x46rameObservation\x12\x10\n\x08timestep\x18\x01 \x01(\x03\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\x12#\n\x07\x63\x61meras\x18\x03 \x03(\x0b\x32\x12.drema.CameraFrame\x12\x17\n\x0fis_initial_scan\x18\x04 \x01(\x08\x12\x18\n\x10is_scan_finished\x18\x05 \x01(\x08\x12\x44\n\x0fsemantic_labels\x18\x06 \x03(\x0b\x32+.drema.FrameObservation.SemanticLabelsEntry\x12\x16\n\x0erobot_base_pos\x18\x07 \x03(\x01\x12\x1b\n\x13reachability_radius\x18\x08 \x01(\x01\x1a\x35\n\x13SemanticLabelsEntry\x12\x0b\n\x03key\x18\x01 \x01(\t\x12\r\n\x05value\x18\x02 \x01(\x05:\x02\x38\x01\"g\n\x0cStreamStatus\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\x12\x19\n\x11received_timestep\x18\x03 \x01(\x03\x12\x1a\n\x12initial_scan_ready\x18\x04 \x01(\x08\"\x84\x02\n\nRobotState\x12\x11\n\ttimestamp\x18\x01 \x01(\x01\x12\x10\n\x08timestep\x18\x02 \x01(\x03\x12\x17\n\x0fjoint_positions\x18\x03 \x03(\x01\x12\x18\n\x10joint_velocities\x18\x04 \x03(\x01\x12\x0f\n\x07\x65\x65_pose\x18\x05 \x03(\x01\x12\x14\n\x0cgripper_open\x18\x06 \x01(\x01\x12\x13\n\x0btask_active\x18\x07 \x01(\x08\x12\x13\n\x0btarget_pose\x18\x08 \x03(\x01\x12\x18\n\x10target_available\x18\t \x01(\x08\x12\x16\n\x0erobot_base_pos\x18\n \x03(\x01\x12\x1b\n\x13reachability_radius\x18\x0b \x01(\x01\"\x93\x01\n\rControlAction\x12\x11\n\ttimestamp\x18\x01 \x01(\x01\x12\x10\n\x08timestep\x18\x02 \x01(\x03\x12\x18\n\x10joint_velocities\x18\x03 \x03(\x01\x12\x16\n\x0egripper_action\x18\x04 \x01(\x01\x12\x13\n\x0bsafety_stop\x18\x05 \x01(\x08\x12\x16\n\x0estatus_message\x18\x06 \x01(\t\"8\n\x0cResetRequest\x12\x15\n\repisode_index\x18\x01 \x01(\x05\x12\x11\n\ttask_name\x18\x02 \x01(\t\"1\n\rResetResponse\x12\x0f\n\x07success\x18\x01 \x01(\x08\x12\x0f\n\x07message\x18\x02 \x01(\t\"3\n\x0bPingRequest\x12\x11\n\tclient_id\x18\x01 \x01(\t\x12\x11\n\ttimestamp\x18\x02 \x01(\x01\"M\n\x0cPingResponse\x12\r\n\x05\x61live\x18\x01 \x01(\x08\x12\x18\n\x10server_timestamp\x18\x02 \x01(\x01\x12\x14\n\x0csuite_status\x18\x03 \x01(\t2\xb8\x02\n\x15\x44remaInferenceService\x12>\n\x0cStreamFrames\x12\x17.drema.FrameObservation\x1a\x13.drema.StreamStatus(\x01\x12\x39\n\tSendFrame\x12\x17.drema.FrameObservation\x1a\x13.drema.StreamStatus\x12\x38\n\rRequestAction\x12\x11.drema.RobotState\x1a\x14.drema.ControlAction\x12\x39\n\x0cResetEpisode\x12\x13.drema.ResetRequest\x1a\x14.drema.ResetResponse\x12/\n\x04Ping\x12\x12.drema.PingRequest\x1a\x13.drema.PingResponseb\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -34,25 +34,25 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._loaded_options = None
   _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._serialized_options = b'8\001'
   _globals['_CAMERAFRAME']._serialized_start=28
-  _globals['_CAMERAFRAME']._serialized_end=182
-  _globals['_FRAMEOBSERVATION']._serialized_start=185
-  _globals['_FRAMEOBSERVATION']._serialized_end=453
-  _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._serialized_start=400
-  _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._serialized_end=453
-  _globals['_STREAMSTATUS']._serialized_start=455
-  _globals['_STREAMSTATUS']._serialized_end=558
-  _globals['_ROBOTSTATE']._serialized_start=561
-  _globals['_ROBOTSTATE']._serialized_end=768
-  _globals['_CONTROLACTION']._serialized_start=771
-  _globals['_CONTROLACTION']._serialized_end=918
-  _globals['_RESETREQUEST']._serialized_start=920
-  _globals['_RESETREQUEST']._serialized_end=976
-  _globals['_RESETRESPONSE']._serialized_start=978
-  _globals['_RESETRESPONSE']._serialized_end=1027
-  _globals['_PINGREQUEST']._serialized_start=1029
-  _globals['_PINGREQUEST']._serialized_end=1080
-  _globals['_PINGRESPONSE']._serialized_start=1082
-  _globals['_PINGRESPONSE']._serialized_end=1159
-  _globals['_DREMAINFERENCESERVICE']._serialized_start=1162
-  _globals['_DREMAINFERENCESERVICE']._serialized_end=1474
+  _globals['_CAMERAFRAME']._serialized_end=227
+  _globals['_FRAMEOBSERVATION']._serialized_start=230
+  _globals['_FRAMEOBSERVATION']._serialized_end=551
+  _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._serialized_start=498
+  _globals['_FRAMEOBSERVATION_SEMANTICLABELSENTRY']._serialized_end=551
+  _globals['_STREAMSTATUS']._serialized_start=553
+  _globals['_STREAMSTATUS']._serialized_end=656
+  _globals['_ROBOTSTATE']._serialized_start=659
+  _globals['_ROBOTSTATE']._serialized_end=919
+  _globals['_CONTROLACTION']._serialized_start=922
+  _globals['_CONTROLACTION']._serialized_end=1069
+  _globals['_RESETREQUEST']._serialized_start=1071
+  _globals['_RESETREQUEST']._serialized_end=1127
+  _globals['_RESETRESPONSE']._serialized_start=1129
+  _globals['_RESETRESPONSE']._serialized_end=1178
+  _globals['_PINGREQUEST']._serialized_start=1180
+  _globals['_PINGREQUEST']._serialized_end=1231
+  _globals['_PINGRESPONSE']._serialized_start=1233
+  _globals['_PINGRESPONSE']._serialized_end=1310
+  _globals['_DREMAINFERENCESERVICE']._serialized_start=1313
+  _globals['_DREMAINFERENCESERVICE']._serialized_end=1625
 # @@protoc_insertion_point(module_scope)

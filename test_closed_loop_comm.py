@@ -40,18 +40,26 @@ def run_test():
 
         # 2. Test Initial 360 Scan Ingestion (Single-Batch with Semantic Labels)
         print("\n--- Testing Initial 360° Scan Ingestion (Single Batch) ---")
+        intr = np.array([[128.0, 0.0, 64.0], [0.0, 128.0, 64.0], [0.0, 0.0, 1.0]], dtype=np.float32)
         scan_list = [
             (
                 'orbit_0_0',
                 (np.random.rand(128, 128, 3) * 255).astype(np.uint8),
                 np.ones((128, 128), dtype=np.float32) * 0.75,
                 np.eye(4, dtype=np.float32),
-                np.eye(3, dtype=np.float32)
+                intr,
+                0.01,
+                3.5
             )
         ]
         labels = {'diningTable_visible': 1, 'dynamic_tunnel': 2, 'target': 3}
-        res_scan = client.push_initial_scan_batch(scan_list, semantic_labels=labels)
-        assert res_scan is not None and res_scan.initial_scan_ready, "Expected initial_scan_ready=True"
+        res_scan = client.push_initial_scan_batch(
+            scan_list,
+            semantic_labels=labels,
+            robot_base_pos=[0.0, 0.0, 0.0],
+            reachability_radius=0.95
+        )
+        assert res_scan is not None and res_scan.initial_scan_ready, f"Expected initial_scan_ready=True, got {res_scan}"
         print("✓ Step 2: Initial 360° Scan (Single Batch) processed and acknowledged by server.")
 
         # 3. Test Real-Time Multi-Camera Streaming
@@ -61,7 +69,9 @@ def run_test():
                 'rgb': (np.random.rand(128, 128, 3) * 255).astype(np.uint8),
                 'depth': np.ones((128, 128), dtype=np.float32) * 0.75,
                 'extrinsics': np.eye(4, dtype=np.float32),
-                'intrinsics': np.eye(3, dtype=np.float32)
+                'intrinsics': intr,
+                'near_clipping': 0.01,
+                'far_clipping': 3.5
             }
         }
         client.start_streaming()
