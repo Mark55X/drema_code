@@ -129,6 +129,7 @@ class CoppeliaSimulationClient:
 
         # Setup 4 cameras at distinct vertical and radial offsets (identical to prepare_data_for_drema)
         cams = []
+        cams_mask = []
         resolutions = [128, 128]
         p_offsets = [
             [0.0, 0.0, 0.0],
@@ -145,13 +146,24 @@ class CoppeliaSimulationClient:
                 view_angle=40.0,
                 render_mode=RenderMode.OPENGL3
             )
+            c_mask = VisionSensor.create(
+                resolution=resolutions,
+                explicit_handling=True,
+                near_clipping_plane=0.01,
+                far_clipping_plane=4.5,
+                view_angle=40.0,
+                render_mode=RenderMode.OPENGL_COLOR_CODED
+            )
             p = list(base_pose)
             p[0] += p_offsets[idx][0]
             p[1] += p_offsets[idx][1]
             p[2] += p_offsets[idx][2]
             c.set_pose(p)
+            c_mask.set_pose(p)
             c.set_parent(placeholder)
+            c_mask.set_parent(placeholder)
             cams.append(c)
+            cams_mask.append(c_mask)
 
         rotate_angle = (2.0 * np.pi) / float(num_steps)
         all_scan_cameras = []
@@ -160,9 +172,10 @@ class CoppeliaSimulationClient:
             for step_idx in range(num_steps):
                 base_dummy.rotate([0, 0, rotate_angle])
 
-                for c_idx, c in enumerate(cams):
+                for c_idx, (c, c_mask) in enumerate(zip(cams, cams_mask)):
                     # In CoppeliaSim, explicit_handling requires handle_explicit() before capture
                     c.handle_explicitly()
+                    c_mask.handle_explicitly()
                     rgb_float = c.capture_rgb()
                     rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
                     depth_m = c.capture_depth(in_meters=True).astype(np.float32)
@@ -171,8 +184,13 @@ class CoppeliaSimulationClient:
                     near_clip = float(c.get_near_clipping_plane()) if hasattr(c, 'get_near_clipping_plane') else 0.01
                     far_clip = float(c.get_far_clipping_plane()) if hasattr(c, 'get_far_clipping_plane') else 3.5
 
+                    # Extract exact integer handle per pixel from color-coded mask
+                    m_rgb = c_mask.capture_rgb()
+                    m_255 = (np.clip(m_rgb, 0.0, 1.0) * 255.0).astype(int)
+                    mask_int32 = (m_255[:, :, 0] + m_255[:, :, 1] * 256 + m_255[:, :, 2] * 256 * 256).astype(np.int32)
+
                     cam_name = f'orbit_{step_idx}_{c_idx}'
-                    all_scan_cameras.append((cam_name, rgb_uint8, depth_m, ext, intrinsic, near_clip, far_clip))
+                    all_scan_cameras.append((cam_name, rgb_uint8, depth_m, ext, intrinsic, near_clip, far_clip, mask_int32))
 
                 if (step_idx + 1) % 10 == 0:
                     print(f"[CoppeliaClient Scan] Captured {(step_idx + 1) * 4}/{num_steps * 4} views...")
@@ -194,20 +212,23 @@ class CoppeliaSimulationClient:
 
             print(f"[CoppeliaClient Scan] Extracted {len(semantic_labels)} semantic labels from CoppeliaSim scene.")
 
-            # Retrieve robot base position
+            # Retrieve real robot base position and initial joint positions
             robot_base_pos = [0.0, 0.0, 0.0]
+            robot_joint_positions = []
             if hasattr(self, 'task') and hasattr(self.task, '_robot'):
                 try:
                     robot_base_pos = list(self.task._robot.arm.get_position())
+                    robot_joint_positions = list(self.task._robot.arm.get_joint_positions())
                 except Exception:
                     pass
 
-            # Send ALL views in ONE single batch message with robot reachability
+            # Send ALL views in ONE single batch message with robot reachability and real initial joints
             res = self.client.push_initial_scan_batch(
                 all_scan_cameras,
                 semantic_labels=semantic_labels,
                 robot_base_pos=robot_base_pos,
-                reachability_radius=self.reachability_radius
+                reachability_radius=self.reachability_radius,
+                joint_positions=robot_joint_positions
             )
 
             if res and res.initial_scan_ready:
@@ -226,6 +247,11 @@ class CoppeliaSimulationClient:
             for c in cams:
                 try:
                     c.remove()
+                except Exception:
+                    pass
+            for c_mask in cams_mask:
+                try:
+                    c_mask.remove()
                 except Exception:
                     pass
             try:
@@ -280,6 +306,11 @@ class CoppeliaSimulationClient:
             'wrist': scene._cam_wrist,
             'overhead': scene._cam_overhead
         }
+        self.mask_cameras = {
+            'front': getattr(scene, '_cam_front_mask', None),
+            'wrist': getattr(scene, '_cam_wrist_mask', None),
+            'overhead': getattr(scene, '_cam_overhead_mask', None)
+        }
 
     def _cli_listener(self):
         """CLI thread listening for interactive commands."""
@@ -320,7 +351,7 @@ class CoppeliaSimulationClient:
                 break
 
     def capture_camera_data(self):
-        """Extracts RGB, Depth, Extrinsics, and Intrinsics from all vision sensors."""
+        """Extracts RGB, Depth, Extrinsics, Intrinsics, and Masks from all vision sensors."""
         cam_dict = {}
         for name, cam in self.cameras.items():
             # RGB: uint8 [0, 255]
@@ -339,13 +370,25 @@ class CoppeliaSimulationClient:
             near_clip = float(cam.get_near_clipping_plane()) if hasattr(cam, 'get_near_clipping_plane') else 0.01
             far_clip = float(cam.get_far_clipping_plane()) if hasattr(cam, 'get_far_clipping_plane') else 3.5
 
+            mask_cam = self.mask_cameras.get(name)
+            mask_int32 = None
+            if mask_cam is not None:
+                try:
+                    mask_cam.handle_explicitly()
+                    m_rgb = mask_cam.capture_rgb()
+                    m_255 = (np.clip(m_rgb, 0.0, 1.0) * 255.0).astype(int)
+                    mask_int32 = (m_255[:, :, 0] + m_255[:, :, 1] * 256 + m_255[:, :, 2] * 256 * 256).astype(np.int32)
+                except Exception:
+                    mask_int32 = None
+
             cam_dict[name] = {
                 'rgb': rgb_uint8,
                 'depth': depth_m,
                 'extrinsics': ext,
                 'intrinsics': intrinsic,
                 'near_clipping': near_clip,
-                'far_clipping': far_clip
+                'far_clipping': far_clip,
+                'mask': mask_int32
             }
         return cam_dict
 
@@ -401,6 +444,7 @@ class CoppeliaSimulationClient:
 
                 # 1. Perception Step (f_cam ≈ 10 Hz): capture and push frames to gRPC queue if connected
                 robot_base_pos = list(arm.get_position()) if hasattr(arm, 'get_position') else [0.0, 0.0, 0.0]
+                q = list(arm.get_joint_positions()) if hasattr(arm, 'get_joint_positions') else []
                 is_cam_step = (self.step_counter % self.cam_decimation == 0)
                 if is_cam_step and self.server_connected:
                     cam_data = self.capture_camera_data()
@@ -410,11 +454,13 @@ class CoppeliaSimulationClient:
                         camera_dict=cam_data,
                         blocking=blocking_send,
                         robot_base_pos=robot_base_pos,
-                        reachability_radius=self.reachability_radius
+                        reachability_radius=self.reachability_radius,
+                        joint_positions=q
                     )
 
                 # 2. Read Robot State & Scene Target (if defined in task)
-                q = arm.get_joint_positions()
+                if not q and hasattr(arm, 'get_joint_positions'):
+                    q = arm.get_joint_positions()
                 dq = arm.get_joint_velocities()
                 ee_pose = arm.get_tip().get_pose().tolist()
                 gripper_open = float(gripper.get_open_amount()[0])

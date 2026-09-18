@@ -3,7 +3,7 @@
 import grpc
 import warnings
 
-from . import drema_comm_pb2 as drema__comm__pb2
+from drema.communication.proto import drema_comm_pb2 as drema_dot_communication_dot_proto_dot_drema__comm__pb2
 
 GRPC_GENERATED_VERSION = '1.70.0'
 GRPC_VERSION = grpc.__version__
@@ -18,7 +18,7 @@ except ImportError:
 if _version_not_supported:
     raise RuntimeError(
         f'The grpc package installed is at version {GRPC_VERSION},'
-        + f' but the generated code in drema_comm_pb2_grpc.py depends on'
+        + f' but the generated code in drema/communication/proto/drema_comm_pb2_grpc.py depends on'
         + f' grpcio>={GRPC_GENERATED_VERSION}.'
         + f' Please upgrade your grpc module to grpcio>={GRPC_GENERATED_VERSION}'
         + f' or downgrade your generated code using grpcio-tools<={GRPC_VERSION}.'
@@ -37,28 +37,28 @@ class DremaInferenceServiceStub(object):
         """
         self.StreamFrames = channel.stream_unary(
                 '/drema.DremaInferenceService/StreamFrames',
-                request_serializer=drema__comm__pb2.FrameObservation.SerializeToString,
-                response_deserializer=drema__comm__pb2.StreamStatus.FromString,
+                request_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.SerializeToString,
+                response_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.FromString,
                 _registered_method=True)
         self.SendFrame = channel.unary_unary(
                 '/drema.DremaInferenceService/SendFrame',
-                request_serializer=drema__comm__pb2.FrameObservation.SerializeToString,
-                response_deserializer=drema__comm__pb2.StreamStatus.FromString,
+                request_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.SerializeToString,
+                response_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.FromString,
                 _registered_method=True)
         self.RequestAction = channel.unary_unary(
                 '/drema.DremaInferenceService/RequestAction',
-                request_serializer=drema__comm__pb2.RobotState.SerializeToString,
-                response_deserializer=drema__comm__pb2.ControlAction.FromString,
+                request_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.RobotState.SerializeToString,
+                response_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ControlAction.FromString,
                 _registered_method=True)
         self.ResetEpisode = channel.unary_unary(
                 '/drema.DremaInferenceService/ResetEpisode',
-                request_serializer=drema__comm__pb2.ResetRequest.SerializeToString,
-                response_deserializer=drema__comm__pb2.ResetResponse.FromString,
+                request_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetRequest.SerializeToString,
+                response_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetResponse.FromString,
                 _registered_method=True)
         self.Ping = channel.unary_unary(
                 '/drema.DremaInferenceService/Ping',
-                request_serializer=drema__comm__pb2.PingRequest.SerializeToString,
-                response_deserializer=drema__comm__pb2.PingResponse.FromString,
+                request_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingRequest.SerializeToString,
+                response_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingResponse.FromString,
                 _registered_method=True)
 
 
@@ -106,28 +106,28 @@ def add_DremaInferenceServiceServicer_to_server(servicer, server):
     rpc_method_handlers = {
             'StreamFrames': grpc.stream_unary_rpc_method_handler(
                     servicer.StreamFrames,
-                    request_deserializer=drema__comm__pb2.FrameObservation.FromString,
-                    response_serializer=drema__comm__pb2.StreamStatus.SerializeToString,
+                    request_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.FromString,
+                    response_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.SerializeToString,
             ),
             'SendFrame': grpc.unary_unary_rpc_method_handler(
                     servicer.SendFrame,
-                    request_deserializer=drema__comm__pb2.FrameObservation.FromString,
-                    response_serializer=drema__comm__pb2.StreamStatus.SerializeToString,
+                    request_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.FromString,
+                    response_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.SerializeToString,
             ),
             'RequestAction': grpc.unary_unary_rpc_method_handler(
                     servicer.RequestAction,
-                    request_deserializer=drema__comm__pb2.RobotState.FromString,
-                    response_serializer=drema__comm__pb2.ControlAction.SerializeToString,
+                    request_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.RobotState.FromString,
+                    response_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ControlAction.SerializeToString,
             ),
             'ResetEpisode': grpc.unary_unary_rpc_method_handler(
                     servicer.ResetEpisode,
-                    request_deserializer=drema__comm__pb2.ResetRequest.FromString,
-                    response_serializer=drema__comm__pb2.ResetResponse.SerializeToString,
+                    request_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetRequest.FromString,
+                    response_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetResponse.SerializeToString,
             ),
             'Ping': grpc.unary_unary_rpc_method_handler(
                     servicer.Ping,
-                    request_deserializer=drema__comm__pb2.PingRequest.FromString,
-                    response_serializer=drema__comm__pb2.PingResponse.SerializeToString,
+                    request_deserializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingRequest.FromString,
+                    response_serializer=drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingResponse.SerializeToString,
             ),
     }
     generic_handler = grpc.method_handlers_generic_handler(
@@ -156,8 +156,8 @@ class DremaInferenceService(object):
             request_iterator,
             target,
             '/drema.DremaInferenceService/StreamFrames',
-            drema__comm__pb2.FrameObservation.SerializeToString,
-            drema__comm__pb2.StreamStatus.FromString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.SerializeToString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -183,8 +183,8 @@ class DremaInferenceService(object):
             request,
             target,
             '/drema.DremaInferenceService/SendFrame',
-            drema__comm__pb2.FrameObservation.SerializeToString,
-            drema__comm__pb2.StreamStatus.FromString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.FrameObservation.SerializeToString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.StreamStatus.FromString,
             options,
             channel_credentials,
             insecure,
@@ -210,8 +210,8 @@ class DremaInferenceService(object):
             request,
             target,
             '/drema.DremaInferenceService/RequestAction',
-            drema__comm__pb2.RobotState.SerializeToString,
-            drema__comm__pb2.ControlAction.FromString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.RobotState.SerializeToString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.ControlAction.FromString,
             options,
             channel_credentials,
             insecure,
@@ -237,8 +237,8 @@ class DremaInferenceService(object):
             request,
             target,
             '/drema.DremaInferenceService/ResetEpisode',
-            drema__comm__pb2.ResetRequest.SerializeToString,
-            drema__comm__pb2.ResetResponse.FromString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetRequest.SerializeToString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.ResetResponse.FromString,
             options,
             channel_credentials,
             insecure,
@@ -264,8 +264,8 @@ class DremaInferenceService(object):
             request,
             target,
             '/drema.DremaInferenceService/Ping',
-            drema__comm__pb2.PingRequest.SerializeToString,
-            drema__comm__pb2.PingResponse.FromString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingRequest.SerializeToString,
+            drema_dot_communication_dot_proto_dot_drema__comm__pb2.PingResponse.FromString,
             options,
             channel_credentials,
             insecure,

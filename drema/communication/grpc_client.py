@@ -27,16 +27,18 @@ def pack_camera_frame(
     extrinsics: np.ndarray,
     intrinsics: np.ndarray,
     near_clipping: float = 0.0,
-    far_clipping: float = 0.0
+    far_clipping: float = 0.0,
+    mask: Optional[np.ndarray] = None
 ) -> drema_comm_pb2.CameraFrame:
     """
-    Serializes camera RGB, Depth, Extrinsics, and Intrinsics into a Protobuf CameraFrame.
+    Serializes camera RGB, Depth, Extrinsics, Intrinsics, and optional Mask into a Protobuf CameraFrame.
     rgb: uint8 array (H, W, 3)
     depth: float32 array (H, W) in meters
     extrinsics: 4x4 matrix (cam to world)
     intrinsics: 3x3 matrix
     near_clipping: sensor near clipping limit (meters)
     far_clipping: sensor far clipping limit (meters)
+    mask: optional int32 array (H, W) of semantic shape handles
     """
     h, w = rgb.shape[:2]
     c = rgb.shape[2] if len(rgb.shape) > 2 else 1
@@ -44,6 +46,7 @@ def pack_camera_frame(
     # Ensure contiguous memory buffers for fast serialization
     rgb_bytes = rgb.astype(np.uint8).tobytes()
     depth_bytes = depth.astype(np.float32).tobytes()
+    mask_bytes = mask.astype(np.int32).tobytes() if mask is not None else b""
 
     ext_flat = extrinsics.flatten().tolist()
     int_flat = intrinsics.flatten().tolist()
@@ -58,14 +61,15 @@ def pack_camera_frame(
         extrinsics=ext_flat,
         intrinsics=int_flat,
         near_clipping=float(near_clipping),
-        far_clipping=float(far_clipping)
+        far_clipping=float(far_clipping),
+        mask_data=mask_bytes
     )
 
 
-def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float]:
+def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, Optional[np.ndarray]]:
     """
-    Deserializes a Protobuf CameraFrame into numpy arrays and clipping planes.
-    Returns: (name, rgb (H,W,3 uint8), depth (H,W float32), extrinsics (4,4), intrinsics (3,3), near_clipping, far_clipping)
+    Deserializes a Protobuf CameraFrame into numpy arrays, clipping planes, and optional segmentation mask.
+    Returns: (name, rgb (H,W,3 uint8), depth (H,W float32), extrinsics (4,4), intrinsics (3,3), near_clipping, far_clipping, mask (H,W int32 or None))
     """
     h, w, c = frame.height, frame.width, frame.channels
     rgb = np.frombuffer(frame.rgb_data, dtype=np.uint8).reshape((h, w, c))
@@ -74,7 +78,10 @@ def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndar
     intrinsics = np.array(frame.intrinsics, dtype=np.float32).reshape((3, 3))
     near_clip = float(frame.near_clipping) if frame.near_clipping > 0 else 0.01
     far_clip = float(frame.far_clipping) if frame.far_clipping > 0 else 3.5
-    return frame.name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip
+    mask = None
+    if len(frame.mask_data) > 0:
+        mask = np.frombuffer(frame.mask_data, dtype=np.int32).reshape((h, w))
+    return frame.name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip, mask
 
 
 class DremaGrpcClient:
@@ -154,7 +161,8 @@ class DremaGrpcClient:
         is_scan_finished: bool = False,
         semantic_labels: Optional[Dict[str, int]] = None,
         robot_base_pos: Optional[List[float]] = None,
-        reachability_radius: float = 0.95
+        reachability_radius: float = 0.95,
+        joint_positions: Optional[List[float]] = None
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes a multi-camera observation into the streaming queue.
@@ -168,7 +176,8 @@ class DremaGrpcClient:
                 extrinsics=data['extrinsics'],
                 intrinsics=data['intrinsics'],
                 near_clipping=data.get('near_clipping', 0.0),
-                far_clipping=data.get('far_clipping', 0.0)
+                far_clipping=data.get('far_clipping', 0.0),
+                mask=data.get('mask', None)
             )
             frames.append(f)
 
@@ -180,7 +189,8 @@ class DremaGrpcClient:
             is_scan_finished=is_scan_finished,
             semantic_labels=semantic_labels or {},
             robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
-            reachability_radius=float(reachability_radius)
+            reachability_radius=float(reachability_radius),
+            joint_positions=joint_positions or []
         )
 
         if blocking:
@@ -209,17 +219,19 @@ class DremaGrpcClient:
         cameras_list: List[Any],
         semantic_labels: Optional[Dict[str, int]] = None,
         robot_base_pos: Optional[List[float]] = None,
-        reachability_radius: float = 0.95
+        reachability_radius: float = 0.95,
+        joint_positions: Optional[List[float]] = None
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes the entire 360° orbital scan (all ~200 views) in a single batch to DREMA suite.
-        Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip])
+        Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip, mask])
         """
         frames = []
         for item in cameras_list:
             name, rgb, depth, extrinsics, intrinsics = item[0], item[1], item[2], item[3], item[4]
             near_clip = item[5] if len(item) > 5 else 0.0
             far_clip = item[6] if len(item) > 6 else 0.0
+            mask = item[7] if len(item) > 7 else None
             f = pack_camera_frame(
                 name=name,
                 rgb=rgb,
@@ -227,7 +239,8 @@ class DremaGrpcClient:
                 extrinsics=extrinsics,
                 intrinsics=intrinsics,
                 near_clipping=near_clip,
-                far_clipping=far_clip
+                far_clipping=far_clip,
+                mask=mask
             )
             frames.append(f)
 
@@ -239,7 +252,8 @@ class DremaGrpcClient:
             is_scan_finished=True,
             semantic_labels=semantic_labels or {},
             robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
-            reachability_radius=float(reachability_radius)
+            reachability_radius=float(reachability_radius),
+            joint_positions=joint_positions or []
         )
 
         try:

@@ -14,14 +14,8 @@ import sys
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union
 
-try:
-    import pybullet as p
-    import pybullet_data
-    HAS_PYBULLET = True
-except ImportError:
-    p = None
-    pybullet_data = None
-    HAS_PYBULLET = False
+import pybullet as p
+import pybullet_data
 
 
 class PyBulletDigitalTwin:
@@ -46,9 +40,6 @@ class PyBulletDigitalTwin:
         # Dynamic registry of objects spawned by perception (obj_id -> object metadata)
         self.tracked_objects: Dict[int, Dict] = {}
 
-        if not HAS_PYBULLET:
-            print("[DigitalTwin Warning] PyBullet is not installed. Running in dummy mode.")
-            return
 
         # Connect to PyBullet
         if self.visualize:
@@ -70,20 +61,95 @@ class PyBulletDigitalTwin:
         # 1. Base Workcell Environment: Ground Plane (Table is spawned dynamically from t=0 scanning)
         p.loadURDF("plane.urdf")
 
-        # 2. Known Baseline Model: Franka Panda Arm URDF
+        # 2. Cache Robot URDF path (Franka Panda is loaded dynamically upon first communication!)
         if robot_urdf_path is None:
-            base_dir = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-            robot_urdf_path = os.path.join(base_dir, "assets/franka_panda/panda.urdf")
+            robot_urdf_path = "franka_panda/panda.urdf"
+        self.robot_urdf_path = robot_urdf_path
+        self.robot_id = -1
 
-        if os.path.exists(robot_urdf_path):
-            self.robot_id = p.loadURDF(robot_urdf_path, [0.0, 0.0, 0.0], [0, 0, 0, 1], useFixedBase=True)
-            print(f"✓ Digital Twin: Loaded Franka Panda robot URDF (ID: {self.robot_id})")
+    def load_robot(
+        self,
+        base_position: Tuple[float, float, float],
+        base_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1),
+        joint_positions: Optional[List[float]] = None
+    ) -> int:
+        """
+        Dynamically loads or updates Franka Panda robot in PyBullet at the given world position.
+        """
+        if self.client_id < 0:
+            return -1
+
+        if self.robot_id >= 0:
+            try:
+                p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
+                if joint_positions is not None:
+                    self.sync_robot_state(joint_positions)
+                return self.robot_id
+            except Exception as e:
+                print(f"[DigitalTwin Warning] Failed to update robot pose: {e}")
+
+        # Load URDF at the exact base position received dynamically
+        try:
+            self.robot_id = p.loadURDF(self.robot_urdf_path, list(base_position), list(base_orientation), useFixedBase=True)
+            print(f"✓ Digital Twin: Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
+        except Exception as e:
+            print(f"[DigitalTwin Warning] Failed to load Franka Panda URDF: {e}")
+            return -1
+
+        if joint_positions is not None:
+            self.sync_robot_state(joint_positions)
+
+        return self.robot_id
+
+    def set_robot_base_pose(
+        self,
+        base_position: Tuple[float, float, float],
+        base_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1)
+    ):
+        """Updates or dynamically loads the robot base position and orientation in PyBullet."""
+        if self.robot_id < 0:
+            self.load_robot(base_position, base_orientation)
         else:
             try:
-                self.robot_id = p.loadURDF("franka_panda/panda.urdf", [0.0, 0.0, 0.0], [0, 0, 0, 1], useFixedBase=True)
-                print(f"✓ Digital Twin: Loaded fallback PyBullet panda.urdf (ID: {self.robot_id})")
+                p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
             except Exception as e:
-                print(f"[DigitalTwin Warning] Failed to load Franka Panda URDF: {e}")
+                print(f"[DigitalTwin Warning] Failed to reset robot base pose: {e}")
+
+    def get_robot_link_positions(self) -> List[Tuple[float, float, float]]:
+        """Returns the 3D world positions of all Franka robot links in PyBullet."""
+        if self.client_id < 0 or self.robot_id < 0:
+            return []
+        try:
+            positions = [p.getBasePositionAndOrientation(self.robot_id)[0]]
+            num_joints = p.getNumJoints(self.robot_id)
+            for i in range(num_joints):
+                state = p.getLinkState(self.robot_id, i)
+                positions.append(state[0])
+            return positions
+        except Exception:
+            return []
+
+    def get_dense_robot_skeleton_points(self, num_samples_per_link: int = 4) -> List[Tuple[float, float, float]]:
+        """
+        Returns dense 3D points sampled along Franka robot link segments for robust pointcloud/depth masking.
+        """
+        if self.client_id < 0 or self.robot_id < 0:
+            return []
+        try:
+            link_pos = self.get_robot_link_positions()
+            if len(link_pos) <= 1:
+                return link_pos
+            dense_points = [link_pos[0]]
+            for i in range(len(link_pos) - 1):
+                p1 = np.array(link_pos[i], dtype=np.float32)
+                p2 = np.array(link_pos[i + 1], dtype=np.float32)
+                alphas = np.linspace(0.0, 1.0, num_samples_per_link + 2)[1:]
+                for a in alphas:
+                    pt = (1.0 - a) * p1 + a * p2
+                    dense_points.append(tuple(pt.tolist()))
+            return dense_points
+        except Exception:
+            return self.get_robot_link_positions()
 
     def spawn_scanned_table(
         self,
@@ -95,7 +161,7 @@ class PyBulletDigitalTwin:
         Dynamically spawns the tabletop workspace surface from real 3D scanning data at t=0.
         Does NOT rely on hardcoded table geometry!
         """
-        if not HAS_PYBULLET or self.client_id < 0:
+        if self.client_id < 0:
             return -1
 
         # Remove existing table if re-scanning upon episode reset
@@ -147,6 +213,58 @@ class PyBulletDigitalTwin:
         print(f"✓ Digital Twin: Spawned scanned table structure with bounds X[{cx-hx:.2f}, {cx+hx:.2f}], Y[{cy-hy:.2f}, {cy+hy:.2f}], Z=[0.0, {self.table_z:.3f}]m (ID: {self.table_id})")
         return self.table_id
 
+    def draw_voxel_grid_bbox(
+        self,
+        origin: Tuple[float, float, float],
+        dim: Tuple[int, int, int],
+        voxel_size: float,
+        color: Tuple[float, float, float] = (0.0, 0.9, 0.25),
+        line_width: float = 2.0
+    ):
+        """
+        Draws the 12 wireframe edges and center coordinate cross of the TSDF Voxel Grid in PyBullet GUI.
+        """
+        if self.client_id < 0:
+            return
+
+        x0, y0, z0 = origin
+        x1 = x0 + dim[0] * voxel_size
+        y1 = y0 + dim[1] * voxel_size
+        z1 = z0 + dim[2] * voxel_size
+
+        edges = [
+            # Bottom 4 edges
+            ([x0, y0, z0], [x1, y0, z0]), ([x1, y0, z0], [x1, y1, z0]),
+            ([x1, y1, z0], [x0, y1, z0]), ([x0, y1, z0], [x0, y0, z0]),
+            # Top 4 edges
+            ([x0, y0, z1], [x1, y0, z1]), ([x1, y0, z1], [x1, y1, z1]),
+            ([x1, y1, z1], [x0, y1, z1]), ([x0, y1, z1], [x0, y0, z1]),
+            # 4 Vertical edges
+            ([x0, y0, z0], [x0, y0, z1]), ([x1, y0, z0], [x1, y0, z1]),
+            ([x1, y1, z0], [x1, y1, z1]), ([x0, y1, z0], [x0, y1, z1]),
+        ]
+        for p0, p1 in edges:
+            p.addUserDebugLine(p0, p1, lineColorRGB=list(color), lineWidth=line_width)
+
+        # Center marker coordinate cross
+        cx = (x0 + x1) / 2.0
+        cy = (y0 + y1) / 2.0
+        cz = (z0 + z1) / 2.0
+        d = 0.06
+        p.addUserDebugLine([cx - d, cy, cz], [cx + d, cy, cz], lineColorRGB=[1, 0, 0], lineWidth=4)
+        p.addUserDebugLine([cx, cy - d, cz], [cx, cy + d, cz], lineColorRGB=[0, 1, 0], lineWidth=4)
+        p.addUserDebugLine([cx, cy, cz - d], [cx, cy, cz + d], lineColorRGB=[0, 0, 1], lineWidth=4)
+
+        # 3D Text Label in PyBullet Scene
+        p.addUserDebugText(
+            f"Voxel Grid: {dim[0]}x{dim[1]}x{dim[2]} ({voxel_size*100:.1f}cm)\nCenter: [{cx:.2f}, {cy:.2f}, {cz:.2f}]",
+            [cx - 0.15, cy, z1 + 0.03],
+            textColorRGB=[0.0, 1.0, 0.4],
+            textSize=1.1,
+            lifeTime=0
+        )
+        print(f"✓ Digital Twin: Voxel Grid wireframe bbox rendered in PyBullet (Center: [{cx:.3f}, {cy:.3f}, {cz:.3f}])")
+
     # -------------------------------------------------------------------------
     # Generic Dynamic Object Spawning (Called by VG-Mapping pipeline)
     # -------------------------------------------------------------------------
@@ -164,7 +282,7 @@ class PyBulletDigitalTwin:
         Dynamically inserts an object into the Digital Twin from a 3D surface mesh
         extracted by VG-Mapping at t=0.
         """
-        if not HAS_PYBULLET or self.client_id < 0:
+        if self.client_id < 0:
             return -1
 
         # If object was already spawned, remove old body first
@@ -210,7 +328,7 @@ class PyBulletDigitalTwin:
         """
         Dynamically inserts a bounding primitive object into the Digital Twin.
         """
-        if not HAS_PYBULLET or self.client_id < 0:
+        if self.client_id < 0:
             return -1
 
         if obj_id in self.tracked_objects:
@@ -240,7 +358,7 @@ class PyBulletDigitalTwin:
 
     def remove_object(self, obj_id: int):
         """Removes an object from PyBullet."""
-        if not HAS_PYBULLET or self.client_id < 0:
+        if self.client_id < 0:
             return
         if obj_id in self.tracked_objects:
             body_id = self.tracked_objects[obj_id]['body_id']
@@ -262,12 +380,16 @@ class PyBulletDigitalTwin:
 
     def sync_robot_state(self, joint_positions: List[float]):
         """Synchronizes robot joint angles in the Digital Twin from CoppeliaSim."""
-        if not HAS_PYBULLET or self.robot_id < 0:
+        if self.robot_id < 0:
             return
 
-        num_movable = min(len(joint_positions), p.getNumJoints(self.robot_id))
-        for j_idx in range(num_movable):
-            p.resetJointState(self.robot_id, j_idx, joint_positions[j_idx])
+        num_joints = p.getNumJoints(self.robot_id)
+        arm_j = 0
+        for i in range(num_joints):
+            info = p.getJointInfo(self.robot_id, i)
+            if info[2] != p.JOINT_FIXED and arm_j < len(joint_positions):
+                p.resetJointState(self.robot_id, i, joint_positions[arm_j])
+                arm_j += 1
 
     def sync_object_pose(
         self,
@@ -278,7 +400,7 @@ class PyBulletDigitalTwin:
         """
         Synchronizes the 3D position and orientation of an object tracked by RecurGS SE(3).
         """
-        if not HAS_PYBULLET or obj_id not in self.tracked_objects:
+        if obj_id not in self.tracked_objects:
             return
 
         body_id = self.tracked_objects[obj_id]['body_id']
@@ -294,7 +416,7 @@ class PyBulletDigitalTwin:
         ANY currently tracked dynamic obstacle in the scene.
         Used by the MPC controller for proactive collision avoidance.
         """
-        if not HAS_PYBULLET or self.robot_id < 0 or len(self.tracked_objects) == 0:
+        if self.robot_id < 0 or len(self.tracked_objects) == 0:
             return float('inf')
 
         min_distance = float('inf')
@@ -319,13 +441,13 @@ class PyBulletDigitalTwin:
         return float(min_distance)
 
     def step(self):
-        if HAS_PYBULLET and self.client_id >= 0:
+        if self.client_id >= 0:
             p.stepSimulation()
 
     def reset(self):
         """Resets the Digital Twin for a new episode."""
         self.clear_dynamic_objects()
-        if HAS_PYBULLET and self.client_id >= 0 and self.table_id >= 0:
+        if self.client_id >= 0 and self.table_id >= 0:
             try:
                 p.removeBody(self.table_id)
             except Exception:
@@ -333,6 +455,6 @@ class PyBulletDigitalTwin:
             self.table_id = -1
 
     def close(self):
-        if HAS_PYBULLET and self.client_id >= 0:
+        if self.client_id >= 0:
             p.disconnect(self.client_id)
             self.client_id = -1

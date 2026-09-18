@@ -18,8 +18,9 @@ import threading
 from typing import Optional, Dict, Any, List, Tuple
 import numpy as np
 import torch
-from scipy.spatial import ConvexHull, cKDTree
-from scipy.sparse import csgraph
+import mcubes
+import trimesh
+import viser
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")))
@@ -38,6 +39,16 @@ except Exception as e:
     print("DREMA requires VG-Mapping & RecurGS for real-time 3D reconstruction and tracking.")
     print("=" * 75 + "\n")
     sys.exit(1)
+
+
+# Semantic Label Keyword Constants
+ROBOT_KEYWORD_LABELS = (
+    "panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"
+)
+BACKGROUND_KEYWORD_LABELS = (
+    "workspace", "table", "floor", "wall", "ceiling", "pillar",
+    "sensor", "success", "camera", "head", "waypoint", "detector"
+)
 
 
 def pointcloud_from_depth_and_camera_params(depth: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
@@ -65,6 +76,62 @@ def pointcloud_from_depth_and_camera_params(depth: np.ndarray, extrinsics: np.nd
     return np.reshape(transformed_coords_vector, (h, w, 3))
 
 
+def extract_obstacle_mesh_from_tsdf(
+    tsdf_map,
+    z_min_cutoff: float,
+    z_max_cutoff: Optional[float] = None,
+    x_bounds: Optional[Tuple[float, float]] = None,
+    y_bounds: Optional[Tuple[float, float]] = None,
+    level: float = 0.0
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extracts solid surface mesh above tabletop cutoff (z_min_cutoff) and within table bounds using Marching Cubes,
+    isolating tabletop obstacles from the tabletop support plane without arbitrary robot distance thresholds.
+    """
+    F_np = tsdf_map.F.cpu().numpy().copy()
+    W_np = tsdf_map.W.cpu().numpy().copy()
+
+    # Mask unobserved voxels as free space
+    F_np[W_np <= 0.5] = 1.0
+
+    # Mask out everything below table cutoff to isolate tabletop support plane
+    nx, ny, nz = F_np.shape
+    origin_np = tsdf_map.origin.cpu().numpy()
+    voxel_size = tsdf_map.voxel_size
+    origin_z = float(origin_np[2])
+
+    k_min = int(np.ceil((z_min_cutoff - origin_z) / voxel_size))
+    k_min = max(0, min(nz, k_min))
+    if k_min > 0:
+        F_np[:, :, :k_min] = 1.0
+
+    if z_max_cutoff is not None:
+        k_max = int(np.floor((z_max_cutoff - origin_z) / voxel_size))
+        k_max = max(0, min(nz, k_max))
+        if k_max < nz:
+            F_np[:, :, k_max:] = 1.0
+
+    # Mask out regions outside tabletop horizontal bounds
+    if x_bounds is not None or y_bounds is not None:
+        xs = origin_np[0] + (np.arange(nx) + 0.5) * voxel_size
+        ys = origin_np[1] + (np.arange(ny) + 0.5) * voxel_size
+        xm, ym = np.meshgrid(xs, ys, indexing='ij')
+
+        mask_free = np.zeros((nx, ny), dtype=bool)
+        if x_bounds is not None:
+            mask_free |= (xm < x_bounds[0]) | (xm > x_bounds[1])
+        if y_bounds is not None:
+            mask_free |= (ym < y_bounds[0]) | (ym > y_bounds[1])
+
+        F_np[mask_free, :] = 1.0
+
+    if F_np.min() <= level and F_np.max() >= level:
+        vertices, triangles = mcubes.marching_cubes(F_np, level)
+        vertices = origin_np + (vertices + 0.5) * voxel_size
+        return vertices, triangles
+    return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
+
+
 class DremaDynamicSuite:
     """
     Coordinator managing the 3 submodules and gRPC communication.
@@ -74,6 +141,8 @@ class DremaDynamicSuite:
         self,
         port: int = 50051,
         visualize_pybullet: bool = False,
+        visualize_viser: bool = True,
+        viser_port: int = 8080,
         table_z_prior: float = 0.75,
         reachability_radius: float = 0.95,
         voxel_size: float = 0.01,
@@ -84,15 +153,30 @@ class DremaDynamicSuite:
         self.table_z_prior = table_z_prior
         self.reachability_radius = reachability_radius
         self.voxel_size = voxel_size
+        self.visualize_viser = visualize_viser
+        self.viser_port = viser_port
+        self.viser_server = None
+        self.viser_handles: Dict[str, Any] = {}
 
         # Robot base & dynamic active workspace (updated via initial scan & gRPC)
         self.robot_base_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+        self.robot_joint_positions: List[float] = []
         self.active_workspace_bounds: Optional[Dict[str, float]] = None
+        self.workspace_bounds_t: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
 
         print(f"==================================================")
         print(f"   DREMA Dynamic Inference Suite Starting...     ")
         print(f"   Device: {self.device} | Port: {self.port}       ")
         print(f"==================================================")
+
+        # 0. Initialize Real-Time Viser 3D Web Visualizer if enabled
+        if self.visualize_viser:
+            try:
+                self.viser_server = viser.ViserServer(host="0.0.0.0", port=self.viser_port)
+                print(f"✓ [Viser 3D] Real-time Web Visualizer active at http://localhost:{self.viser_port}")
+            except Exception as e:
+                print(f"[Viser Notice] Could not start Viser on port {self.viser_port}: {e}")
+                self.viser_server = None
 
         # 1. Initialize Submodule 2: PyBullet Digital Twin (Ground plane + Robot URDF)
         self.digital_twin = PyBulletDigitalTwin(
@@ -134,9 +218,21 @@ class DremaDynamicSuite:
         # Initial 360-degree scan state & dynamic objects
         self.initial_scan_ready = False
         self.accumulated_scan_points = []
+        self.accumulated_scan_frames = []
+        self.semantic_labels = {}
+        self.robot_ids = set()
+        self.target_object_ids = set()
         self.tracked_objects = {}
         self.output_mesh_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/scanned_meshes")
         os.makedirs(self.output_mesh_dir, exist_ok=True)
+
+        self.scene_gaussians = {
+            'xyz': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'rgb': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+        }
 
         # Telemetry
         self.total_frames_processed = 0
@@ -149,6 +245,162 @@ class DremaDynamicSuite:
             on_action_callback=self.on_request_action,
             on_reset_callback=self.on_reset_episode
         )
+
+    def _apply_semantic_robot_mask(
+        self,
+        depth_t: torch.Tensor,
+        mask_np: Optional[np.ndarray]
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Applies per-pixel CoppeliaSim entity handle segmentation mask to filter robot arm links from TSDF and 3DGS.
+        Returns:
+            depth_masked: Depth tensor with robot pixels set to 0.0 (ignored by TSDF integration).
+            mask_t: Integer tensor containing CoppeliaSim handle IDs per pixel (for VDC 3DGS filtering).
+        """
+        if mask_np is None:
+            return depth_t, None
+        mask_t = torch.from_numpy(mask_np).to(self.device)
+        depth_masked = depth_t.clone()
+        if len(self.robot_ids) > 0:
+            r_ids = torch.tensor(list(self.robot_ids), device=self.device, dtype=mask_t.dtype)
+            is_robot = torch.isin(mask_t, r_ids)
+            depth_masked[0, is_robot] = 0.0
+        return depth_masked, mask_t
+
+    def _add_viser_obstacle_mesh(self, obj_name: str, idx: int, comp):
+        """Adds an extracted Marching Cubes obstacle surface mesh to the Viser 3D scene."""
+        if self.viser_server is not None and comp is not None:
+            try:
+                self.viser_handles[f"mesh_{idx}"] = self.viser_server.scene.add_mesh_trimesh(
+                    name=f"/marching_cubes/{obj_name}_{idx}",
+                    mesh=comp
+                )
+            except Exception:
+                pass
+
+    def _init_viser_voxel_grid(
+        self,
+        grid_origin: Tuple[float, float, float],
+        grid_dim: Tuple[int, int, int]
+    ):
+        """Initializes Voxel Grid wireframe, footprint grid, coordinate frame, and GUI toggles in Viser."""
+        if self.viser_server is None:
+            return
+
+        gx, gy, gz = grid_origin
+        nx_v, ny_v, nz_v = grid_dim
+        s_v = self.voxel_size
+        ext_x, ext_y, ext_z = nx_v * s_v, ny_v * s_v, nz_v * s_v
+        cx = gx + ext_x / 2.0
+        cy = gy + ext_y / 2.0
+        cz = gz + ext_z / 2.0
+
+        # 1. Emerald green wireframe bounding box
+        self.viser_handles['vg_bbox'] = self.viser_server.scene.add_box(
+            name="/voxel_grid/bbox",
+            color=(0, 245, 100),
+            dimensions=(ext_x, ext_y, ext_z),
+            position=(cx, cy, cz),
+            wireframe=True
+        )
+        # 2. Tabletop footprint grid aligned with bottom of voxel grid
+        try:
+            self.viser_handles['vg_base'] = self.viser_server.scene.add_grid(
+                name="/voxel_grid/base_grid",
+                width=ext_x,
+                height=ext_y,
+                plane="xy",
+                position=(cx, cy, gz),
+                cell_size=max(s_v * 5, 0.05),
+                cell_color=(0, 180, 80),
+                section_size=max(s_v * 10, 0.10),
+                section_color=(0, 255, 128)
+            )
+        except Exception:
+            pass
+
+        # 3. 3D Coordinate frame at geometric center
+        self.viser_handles['vg_center'] = self.viser_server.scene.add_frame(
+            name="/voxel_grid/center",
+            position=(cx, cy, cz),
+            axes_length=0.15,
+            axes_radius=0.004
+        )
+        # 4. Floating 3D label positioned right above the voxel grid
+        try:
+            self.viser_handles['vg_label'] = self.viser_server.scene.add_label(
+                name="/voxel_grid/label",
+                text=f"TSDF Voxel Grid: {nx_v}x{ny_v}x{nz_v} ({s_v*100:.1f}cm)\nCenter: [{cx:.2f}, {cy:.2f}, {cz:.2f}]m",
+                position=(cx, cy, gz + ext_z + 0.04)
+            )
+        except Exception:
+            pass
+
+        # 5. Sidebar Markdown info panel
+        self.viser_server.gui.add_markdown(
+            f"### VG-Mapping Voxel Grid\n"
+            f"- **Origin**: `[{gx:.3f}, {gy:.3f}, {gz:.3f}]` m\n"
+            f"- **Dimensions**: `{nx_v} x {ny_v} x {nz_v}` voxels\n"
+            f"- **Physical Size**: `{ext_x:.2f}m x {ext_y:.2f}m x {ext_z:.2f}m`\n"
+            f"- **Resolution**: `{s_v * 100:.1f}` cm\n"
+            f"- **Center**: `[{cx:.3f}, {cy:.3f}, {cz:.3f}]` m\n"
+        )
+
+        # 6. Interactive Visibility Checkboxes
+        cb_bbox = self.viser_server.gui.add_checkbox("Show Voxel Grid BBox & Center", initial_value=True)
+        @cb_bbox.on_update
+        def _(_):
+            is_vis = cb_bbox.value
+            for k in ['vg_bbox', 'vg_base', 'vg_center', 'vg_label']:
+                if k in self.viser_handles and self.viser_handles[k] is not None:
+                    self.viser_handles[k].visible = is_vis
+
+        cb_gaussians = self.viser_server.gui.add_checkbox("Show 3D Gaussians", initial_value=True)
+        @cb_gaussians.on_update
+        def _(_):
+            if 'gaussians' in self.viser_handles and self.viser_handles['gaussians'] is not None:
+                self.viser_handles['gaussians'].visible = cb_gaussians.value
+
+        cb_voxels = self.viser_server.gui.add_checkbox("Show TSDF Surface Voxels", initial_value=True)
+        @cb_voxels.on_update
+        def _(_):
+            if 'surface_voxels' in self.viser_handles and self.viser_handles['surface_voxels'] is not None:
+                self.viser_handles['surface_voxels'].visible = cb_voxels.value
+
+        cb_meshes = self.viser_server.gui.add_checkbox("Show Obstacle Meshes", initial_value=True)
+        @cb_meshes.on_update
+        def _(_):
+            for k, handle in self.viser_handles.items():
+                if k.startswith("mesh_") and handle is not None:
+                    handle.visible = cb_meshes.value
+
+    def _update_viser_surface_voxels(self):
+        """Extracts and displays discrete TSDF surface voxels in Viser 3D Web Visualizer."""
+        if self.viser_server is None:
+            return
+        try:
+            with torch.no_grad():
+                surf_mask = (self.vg_pipeline.tsdf_map.W > 0.5) & (self.vg_pipeline.tsdf_map.F.abs() < 0.12)
+                if surf_mask.any():
+                    surf_pts = self.vg_pipeline.tsdf_map.voxel_centers[surf_mask].detach().cpu().numpy()
+                    surf_colors = np.zeros_like(surf_pts)
+                    surf_colors[:, 0] = 0.05
+                    surf_colors[:, 1] = 0.85
+                    surf_colors[:, 2] = 0.95
+                    if len(surf_pts) > 40000:
+                        sub_idx = np.random.choice(len(surf_pts), 40000, replace=False)
+                        surf_pts = surf_pts[sub_idx]
+                        surf_colors = surf_colors[sub_idx]
+                    self.viser_handles['surface_voxels'] = self.viser_server.scene.add_point_cloud(
+                        name="/voxel_grid/surface_voxels",
+                        points=surf_pts,
+                        colors=surf_colors,
+                        point_size=self.voxel_size * 0.7,
+                        point_shape="square"
+                    )
+                    print(f"✓ [Viser 3D] Visualizing {len(surf_pts)} TSDF surface voxels at /voxel_grid/surface_voxels")
+        except Exception as e:
+            print(f"[Viser Notice] Could not add TSDF surface voxels: {e}")
 
     def _process_initial_scene_scan(self, semantic_labels: Optional[Dict[str, int]] = None) -> bool:
         """
@@ -289,84 +541,260 @@ class DremaDynamicSuite:
             device=self.device
         )
 
-        # 6. Discover Tabletop Obstacles (Strictly within Active Workspace, no arbitrary height ceiling)
-        dist_to_robot = np.sqrt((all_pts[:, 0] - rb_x)**2 + (all_pts[:, 1] - rb_y)**2)
-        obj_mask = (all_pts[:, 2] > (z_table + OBSTACLE_MIN_CLEARANCE_Z)) & (all_pts[:, 2] <= act_z_max) & \
-                   (all_pts[:, 0] >= act_x_min) & (all_pts[:, 0] <= act_x_max) & \
-                   (all_pts[:, 1] >= act_y_min) & (all_pts[:, 1] <= act_y_max) & \
-                   (dist_to_robot <= r_reach) & (dist_to_robot >= ROBOT_BASE_RADIUS)
-        obj_pts = all_pts[obj_mask]
-        print(f"[DREMA Discovery] Tabletop obstacle points detected in active workspace: {len(obj_pts)}")
+        # Render Voxel Grid Wireframe Bounding Box in PyBullet GUI
+        self.digital_twin.draw_voxel_grid_bbox(
+            origin=grid_origin,
+            dim=grid_dim,
+            voxel_size=self.voxel_size
+        )
 
-        if len(obj_pts) >= 30:
-            voxel_idx = np.floor(obj_pts / self.voxel_size).astype(int)
-            _, unique_idx = np.unique(voxel_idx, axis=0, return_index=True)
-            ds_pts = obj_pts[unique_idx]
+        # Update Viser Real-Time Web Visualizer with Voxel Grid
+        self._init_viser_voxel_grid(grid_origin=grid_origin, grid_dim=grid_dim)
 
-            tree = cKDTree(ds_pts)
-            adj = tree.sparse_distance_matrix(tree, max_distance=0.04)
-            n_comp, labels = csgraph.connected_components(adj)
+        # 6. Parse Semantic Labels using Keyword Constants
+        self.semantic_labels = semantic_labels or {}
+        id_to_name = {}
+        self.robot_ids = set()
+        self.target_object_ids = set()
 
-            cluster_list = []
-            for lbl in range(n_comp):
-                c_pts = ds_pts[labels == lbl]
-                if len(c_pts) >= 15:
-                    cluster_list.append(c_pts)
+        for name, num in self.semantic_labels.items():
+            num = int(num)
+            id_to_name[num] = name
+            name_lower = name.lower()
+            if any(kw in name_lower for kw in ROBOT_KEYWORD_LABELS):
+                self.robot_ids.add(num)
 
-            cluster_list.sort(key=lambda c: len(c), reverse=True)
-            print(f"[DREMA Discovery] Found {len(cluster_list)} distinct object cluster(s) in active workspace.")
+            is_robot_or_bg = any(kw in name_lower for kw in (ROBOT_KEYWORD_LABELS + BACKGROUND_KEYWORD_LABELS))
+            if not is_robot_or_bg:
+                self.target_object_ids.add(num)
 
-            spawned_obstacles = 0
-            for c_idx, c_pts in enumerate(cluster_list):
-                center = np.mean(c_pts, axis=0)
-                extents = np.max(c_pts, axis=0) - np.min(c_pts, axis=0)
-                max_dim = float(np.max(extents))
+        if len(self.semantic_labels) > 0:
+            print(f"✓ [DREMA Scan] Parsed {len(self.semantic_labels)} semantic labels from CoppeliaSim:")
+            print(f"   Robot IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
+            print(f"   Target Object IDs ({len(self.target_object_ids)}): {sorted(list(self.target_object_ids))}")
 
-                is_tunnel_obstacle = (max_dim > 0.10)
-                obj_name = "tunnel_obstacle" if is_tunnel_obstacle else f"object_{c_idx}"
+        # 7. Ingest All 360° Scan Frames into VG-Mapping (TSDF Voxel Grid & 3D Gaussian Splats)
+        print(f"\n[VG-Mapping] Ingesting {len(self.accumulated_scan_frames)} scan views into TSDF Voxel Grid & 3DGS...")
 
-                print(f"  Cluster #{c_idx} ({obj_name}): {len(c_pts)} points, center=[{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}], size=[{extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f}]")
+        workspace_bounds_t = (
+            torch.tensor([act_x_min, act_y_min, act_z_min], dtype=torch.float32, device=self.device),
+            torch.tensor([act_x_max, act_y_max, act_z_max], dtype=torch.float32, device=self.device)
+        )
+        self.workspace_bounds_t = workspace_bounds_t
 
-                pts_centered = c_pts - center
-                obs_mesh_file = os.path.join(self.output_mesh_dir, f"scanned_obstacle_{spawned_obstacles}.obj")
+        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
+        num_views = len(self.accumulated_scan_frames)
 
-                try:
-                    hull_o = ConvexHull(pts_centered)
-                    with open(obs_mesh_file, "w") as f:
-                        for v in pts_centered:
-                            f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-                        for s in hull_o.simplices:
-                            f.write(f"f {s[0]+1} {s[1]+1} {s[2]+1}\n")
-                except Exception:
-                    hx, hy, hz = [max(0.02, float(d) / 2.0) for d in extents]
-                    verts = [[-hx,-hy,-hz],[hx,-hy,-hz],[hx,hy,-hz],[-hx,hy,-hz],
-                             [-hx,-hy,hz],[hx,-hy,hz],[hx,hy,hz],[-hx,hy,hz]]
-                    faces = [(1,2,3),(1,3,4),(5,7,6),(5,8,7),(1,6,2),(1,5,6),
-                             (2,7,3),(2,6,7),(3,8,4),(3,7,8),(4,5,1),(4,8,5)]
-                    with open(obs_mesh_file, "w") as f:
-                        for v in verts: f.write(f"v {v[0]:.6f} {v[1]:.6f} {v[2]:.6f}\n")
-                        for s in faces: f.write(f"f {s[0]} {s[1]} {s[2]}\n")
+        for f_idx, frame_data in enumerate(self.accumulated_scan_frames):
+            rgb_t = torch.from_numpy(frame_data['rgb']).permute(2, 0, 1).float().to(self.device) / 255.0
+            depth_t = torch.from_numpy(frame_data['depth']).unsqueeze(0).to(self.device)
+            k_t = torch.from_numpy(frame_data['intrinsics']).to(self.device)
+            pose_t = torch.from_numpy(frame_data['extrinsics']).to(self.device)
+            mask_np = frame_data.get('mask')
+
+            # Filter out robot arm links & base footprint via per-pixel CoppeliaSim semantic handle mask
+            depth_tsdf, mask_t = self._apply_semantic_robot_mask(
+                depth_t=depth_t,
+                mask_np=mask_np
+            )
+
+            # Step 1: TSDF integration (robot depth masked to 0 so robot is never carved into TSDF)
+            self.vg_pipeline.step_1_ingest_frame(
+                rgb=rgb_t,
+                depth=depth_tsdf,
+                intrinsic=k_t,
+                camera_pose=pose_t
+            )
+
+            # Step 2: VDC Gaussian mapping (mask_t provided so is_robot is True on robot pixels)
+            rendered_rgb = rgb_t.clone()
+            rendered_depth = depth_t.clone()
+
+            new_g, prune_mask = self.vg_pipeline.step_2_online_mapping(
+                rgb=rgb_t,
+                depth=depth_t,
+                rendered_rgb=rendered_rgb,
+                rendered_depth=rendered_depth,
+                intrinsic=k_t,
+                camera_pose=pose_t,
+                current_morton_codes=self.scene_gaussians['morton'],
+                mask=mask_t,
+                workspace_bounds=workspace_bounds_t,
+                is_initial_timestep=True,
+                num_views=num_views,
+                robot_ids=self.robot_ids,
+                target_object_ids=self.target_object_ids
+            )
+
+            if len(new_g['xyz']) > 0:
+                new_xyz_acc.append(new_g['xyz'])
+                new_rgb_acc.append(new_g['rgb'])
+                new_scale_acc.append(new_g['scale'])
+                new_morton_acc.append(new_g['morton'])
+                new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)))
+
+        # Deduplication by Morton codes (1 Gaussian per 1cm voxel surface)
+        if len(new_xyz_acc) > 0:
+            added_xyz = torch.cat(new_xyz_acc, dim=0)
+            added_rgb = torch.cat(new_rgb_acc, dim=0)
+            added_scale = torch.cat(new_scale_acc, dim=0)
+            added_morton = torch.cat(new_morton_acc, dim=0)
+            added_obj_id = torch.cat(new_obj_id_acc, dim=0)
+
+            if len(added_morton) > 0:
+                perm = torch.argsort(added_morton)
+                sorted_morton = added_morton[perm]
+                uniq_mask = torch.ones_like(sorted_morton, dtype=torch.bool)
+                uniq_mask[1:] = (sorted_morton[1:] != sorted_morton[:-1])
+                keep_idx = perm[uniq_mask]
+
+                self.scene_gaussians['xyz'] = added_xyz[keep_idx]
+                self.scene_gaussians['rgb'] = added_rgb[keep_idx]
+                self.scene_gaussians['scale'] = added_scale[keep_idx]
+                self.scene_gaussians['morton'] = added_morton[keep_idx]
+                self.scene_gaussians['obj_id'] = added_obj_id[keep_idx]
+
+        print(f"✓ [VG-Mapping] TSDF volumetric integration complete ({num_views} views).")
+        print(f"✓ [VG-Mapping] Surface 3DGS populated with {len(self.scene_gaussians['xyz'])} Gaussian primitives.")
+
+        # Update Viser with initial Gaussian Splatting scene
+        self._update_viser_gaussians()
+
+        # Update Viser with TSDF Surface Voxels
+        self._update_viser_surface_voxels()
+
+        # 8. Extract Tabletop Obstacle Meshes via TSDF Marching Cubes
+        z_cutoff = z_table + OBSTACLE_MIN_CLEARANCE_Z
+        verts, faces = extract_obstacle_mesh_from_tsdf(
+            self.vg_pipeline.tsdf_map,
+            z_min_cutoff=z_cutoff,
+            z_max_cutoff=act_z_max,
+            x_bounds=(tab_x_min + 0.02, tab_x_max - 0.02),
+            y_bounds=(tab_y_min + 0.02, tab_y_max - 0.02),
+            level=0.0
+        )
+        print(f"✓ [VG-Mapping Marching Cubes] Extracted raw obstacle surface mesh: {len(verts)} vertices, {len(faces)} faces.")
+
+        spawned_obstacles = 0
+        if len(verts) > 0 and len(faces) > 0:
+            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+            components = mesh.split(only_watertight=False)
+
+            # If trimesh split yielded components, process each valid component
+            valid_components = []
+            for comp in components:
+                ext = comp.bounds[1] - comp.bounds[0]
+                center_c = (comp.bounds[0] + comp.bounds[1]) / 2.0
+                # Must reside strictly within tabletop bounds and workspace ceiling
+                in_table = (
+                    (center_c[0] >= tab_x_min + 0.02) and (center_c[0] <= tab_x_max - 0.02) and
+                    (center_c[1] >= tab_y_min + 0.02) and (center_c[1] <= tab_y_max - 0.02) and
+                    (center_c[2] >= z_table + 0.01) and (center_c[2] <= act_z_max)
+                )
+                if in_table and np.max(ext) >= 0.02 and len(comp.vertices) >= 20:
+                    valid_components.append(comp)
+
+            # Fallback if no split components passed filter but raw mesh is valid
+            if len(valid_components) == 0 and len(verts) >= 20:
+                valid_components = [mesh]
+
+            valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
+            print(f"✓ [VG-Mapping Marching Cubes] Discovered {len(valid_components)} distinct tabletop obstacle mesh(es).")
+
+            # Collect target object candidate names from semantic labels
+            target_names = [id_to_name[t] for t in self.target_object_ids if t in id_to_name]
+            goal_names = [n for n in target_names if any(k in n.lower() for k in ["target", "goal", "cube", "sphere", "block"])]
+            obs_names = [n for n in target_names if any(k in n.lower() for k in ["obstacle", "wall", "distractor", "barrier"])]
+            other_names = [n for n in target_names if n not in goal_names and n not in obs_names]
+
+            for c_idx, comp in enumerate(valid_components):
+                comp_verts = comp.vertices
+                comp_faces = comp.faces
+                min_b, max_b = comp.bounds[0], comp.bounds[1]
+                center = (min_b + max_b) / 2.0
+                extents = max_b - min_b
+                is_small = float(np.max(extents)) < 0.10
+
+                # Match semantic name and target classification
+                obj_name = None
+                is_target = False
+                if is_small and len(goal_names) > 0:
+                    obj_name = goal_names.pop(0)
+                    is_target = True
+                elif (not is_small) and len(obs_names) > 0:
+                    obj_name = obs_names.pop(0)
+                    is_target = False
+                elif len(goal_names) > 0:
+                    obj_name = goal_names.pop(0)
+                    is_target = True
+                elif len(obs_names) > 0:
+                    obj_name = obs_names.pop(0)
+                    is_target = False
+                elif len(other_names) > 0:
+                    obj_name = other_names.pop(0)
+                    is_target = is_small
+                else:
+                    obj_name = f"scanned_obstacle_{spawned_obstacles}"
+                    is_target = False
+
+                # Center mesh vertices around center of bounding box
+                verts_centered = comp_verts - center
+                comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=comp_faces)
+
+                obs_mesh_file = os.path.join(self.output_mesh_dir, f"{obj_name}_{spawned_obstacles}.obj")
+                comp_centered.export(obs_mesh_file)
+
+                # Associate canonical Gaussian points from scene_gaussians
+                xyz_g = self.scene_gaussians['xyz']
+                rgb_g = self.scene_gaussians['rgb']
+                in_box = (xyz_g[:, 0] >= min_b[0] - 0.02) & (xyz_g[:, 0] <= max_b[0] + 0.02) & \
+                         (xyz_g[:, 1] >= min_b[1] - 0.02) & (xyz_g[:, 1] <= max_b[1] + 0.02) & \
+                         (xyz_g[:, 2] >= min_b[2] - 0.01) & (xyz_g[:, 2] <= max_b[2] + 0.02)
+
+                clean_xyz = xyz_g[in_box]
+                clean_rgb = rgb_g[in_box]
+                if len(clean_xyz) == 0:
+                    clean_xyz = torch.from_numpy(comp_verts).float().to(self.device)
+                    clean_rgb = torch.full((len(clean_xyz), 3), 0.5, dtype=torch.float32, device=self.device)
+
+                obj_color = (0.88, 0.22, 0.22, 1.0) if is_target else (0.20, 0.45, 0.85, 1.0)
 
                 body_id = self.digital_twin.spawn_mesh_object(
                     obj_id=spawned_obstacles,
                     mesh_file_path=obs_mesh_file,
                     initial_position=tuple(center.tolist()),
                     initial_orientation=(0, 0, 0, 1),
-                    color=(0.2, 0.45, 0.85, 1.0) if is_tunnel_obstacle else (0.85, 0.2, 0.2, 1.0),
-                    is_target=not is_tunnel_obstacle
+                    color=obj_color,
+                    is_target=is_target
                 )
 
                 self.tracked_objects[spawned_obstacles] = {
                     'body_id': body_id,
                     'name': obj_name,
                     'initial_pos': tuple(center.tolist()),
-                    'canonical_pts': pts_centered,
+                    'dims': extents.tolist(),
+                    'canonical_points': {
+                        'xyz': clean_xyz.clone(),
+                        'rgb': clean_rgb.clone()
+                    },
                     'last_pos': tuple(center.tolist()),
                     'last_quat': (0, 0, 0, 1),
-                    'dims': extents.tolist()
+                    'last_T': torch.eye(4, device=self.device)
                 }
-                print(f"✓ Spawned '{obj_name}' in PyBullet Digital Twin (Body ID: {body_id}) from 3D scan mesh")
+                # Add Marching Cubes mesh to Viser 3D Web Visualizer
+                self._add_viser_obstacle_mesh(obj_name, spawned_obstacles, comp)
+
+                print(f"✓ Spawned '{obj_name}' in PyBullet Digital Twin (Body ID: {body_id}) from Marching Cubes surface mesh")
                 spawned_obstacles += 1
+        else:
+            print("[DREMA Discovery] Marching Cubes yielded 0 tabletop obstacle vertices above table.")
+
+        # 10. Load Franka Panda in PyBullet Digital Twin using REAL initial joint angles from CoppeliaSim
+        if len(self.robot_joint_positions) > 0 and len(self.robot_base_pos) >= 3:
+            self.digital_twin.load_robot(
+                base_position=tuple(self.robot_base_pos.tolist()),
+                joint_positions=list(self.robot_joint_positions)
+            )
 
         self.initial_scan_ready = True
         print(f"\n✓ [DREMA Suite] Initial Scene Setup Complete! Active Workspace Ready.")
@@ -375,15 +803,19 @@ class DremaDynamicSuite:
 
     def on_frame_received(self, obs: drema_comm_pb2.FrameObservation) -> Optional[drema_comm_pb2.StreamStatus]:
         """gRPC callback triggered when a camera frame arrives from CoppeliaSim."""
-        # Update robot base and reachability radius if transmitted by client
+        # Update robot base, reachability radius, and joints if transmitted by client
         if len(obs.robot_base_pos) >= 3:
             self.robot_base_pos = np.array(obs.robot_base_pos[:3], dtype=np.float32)
         if obs.reachability_radius > 0:
             self.reachability_radius = float(obs.reachability_radius)
+        if len(obs.joint_positions) > 0:
+            self.robot_joint_positions = list(obs.joint_positions)
+            if self.digital_twin.robot_id >= 0:
+                self.digital_twin.sync_robot_state(self.robot_joint_positions)
 
         if obs.is_initial_scan:
             for f in obs.cameras:
-                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip = unpack_camera_frame(f)
+                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip, mask = unpack_camera_frame(f)
 
                 # Back-project depth points using camera projection
                 pcd = pointcloud_from_depth_and_camera_params(depth, extrinsics, intrinsics)
@@ -391,9 +823,21 @@ class DremaDynamicSuite:
                 valid = (depth > near_clip) & (depth < far_clip)
                 pts = pcd[valid]
 
-                # Accumulate all valid points across all scanning views (no premature arbitrary box cropping)
+                # Accumulate all valid points across all scanning views (for table plane discovery)
                 if len(pts) > 0:
                     self.accumulated_scan_points.append(pts)
+
+                # Save the full observation frame for VG-Mapping TSDF & 3DGS ingestion
+                self.accumulated_scan_frames.append({
+                    'name': name,
+                    'rgb': rgb,
+                    'depth': depth,
+                    'extrinsics': extrinsics,
+                    'intrinsics': intrinsics,
+                    'near_clip': near_clip,
+                    'far_clip': far_clip,
+                    'mask': mask
+                })
 
             if obs.is_scan_finished:
                 semantic_labels = dict(obs.semantic_labels) if obs.semantic_labels else None
@@ -429,6 +873,94 @@ class DremaDynamicSuite:
             initial_scan_ready=self.initial_scan_ready
         )
 
+    def _track_and_sync_objects(self):
+        """Performs batched RecurGS SE(3) optimization and PyBullet physics synchronization."""
+        if not (self.initial_scan_ready and len(self.tracked_objects) > 0 and len(self.scene_gaussians['xyz']) > 0 and self.active_workspace_bounds is not None):
+            return
+
+        try:
+            objects_source = {}
+            objects_target = {}
+            initial_T_coarse_dict = {}
+
+            xyz_curr = self.scene_gaussians['xyz']
+            rgb_curr = self.scene_gaussians['rgb']
+            ws = self.active_workspace_bounds
+            z_tab = ws['z_table']
+
+            # Foreground workspace candidate points above table surface
+            table_clean_mask = (xyz_curr[:, 2] > (z_tab + 0.008)) & (xyz_curr[:, 2] <= ws['z_max']) & \
+                               (xyz_curr[:, 0] >= ws['x_min']) & (xyz_curr[:, 0] <= ws['x_max']) & \
+                               (xyz_curr[:, 1] >= ws['y_min']) & (xyz_curr[:, 1] <= ws['y_max'])
+            cand_xyz = xyz_curr[table_clean_mask]
+            cand_rgb = rgb_curr[table_clean_mask]
+
+            for oid, obj_info in self.tracked_objects.items():
+                src_xyz = obj_info['canonical_points']['xyz']
+                src_rgb = obj_info['canonical_points']['rgb']
+                if len(src_xyz) == 0 or len(cand_xyz) < 4:
+                    continue
+
+                # Subsample canonical points if large (up to 256 points)
+                N_src = len(src_xyz)
+                if N_src > 256:
+                    sub_s = torch.randperm(N_src, device=self.device)[:256]
+                    objects_source[oid] = {'xyz': src_xyz[sub_s], 'rgb': src_rgb[sub_s]}
+                else:
+                    objects_source[oid] = {'xyz': src_xyz, 'rgb': src_rgb}
+
+                # Target points in proximity to last known position
+                last_p = np.array(obj_info['last_pos'])
+                dist_p = torch.norm(cand_xyz - torch.tensor(last_p, device=self.device, dtype=torch.float32), dim=1)
+                near_mask = dist_p < 0.25
+                if torch.any(near_mask) and near_mask.sum() >= 4:
+                    tgt_xyz = cand_xyz[near_mask]
+                    tgt_rgb = cand_rgb[near_mask]
+                else:
+                    tgt_xyz = cand_xyz
+                    tgt_rgb = cand_rgb
+
+                N_tgt = len(tgt_xyz)
+                if N_tgt > 256:
+                    sub_t = torch.randperm(N_tgt, device=self.device)[:256]
+                    objects_target[oid] = {'xyz': tgt_xyz[sub_t], 'rgb': tgt_rgb[sub_t]}
+                else:
+                    objects_target[oid] = {'xyz': tgt_xyz, 'rgb': tgt_rgb}
+
+                initial_T_coarse_dict[oid] = obj_info.get('last_T', torch.eye(4, device=self.device))
+
+            # Batched RecurGS Lie algebra optimization
+            if len(objects_source) > 0 and len(objects_target) > 0:
+                T_fine_dict = self.vg_pipeline.step_3_estimate_multi_se3_motion(
+                    objects_source=objects_source,
+                    objects_target=objects_target,
+                    initial_T_coarse_dict=initial_T_coarse_dict,
+                    z_table=z_tab,
+                    num_iterations=15,
+                    icp_max_iters=12,
+                    lr=3e-3,
+                    tol=1e-4
+                )
+
+                for oid, T_fine in T_fine_dict.items():
+                    self.tracked_objects[oid]['last_T'] = T_fine.detach()
+                    c0 = self.tracked_objects[oid]['initial_pos']
+                    half_h = self.tracked_objects[oid]['dims'][2] / 2.0
+
+                    R_fine = T_fine[:3, :3]
+                    t_fine = T_fine[:3, 3]
+                    c0_t = torch.tensor(c0, dtype=torch.float32, device=self.device)
+                    pos_w = R_fine @ c0_t + t_fine
+                    pos_z = max(float(pos_w[2].item()), float(z_tab) + float(half_h))
+                    new_pos = (float(pos_w[0].item()), float(pos_w[1].item()), pos_z)
+                    quat = rotation_matrix_to_quaternion(R_fine)
+
+                    self.digital_twin.sync_object_pose(oid, new_pos, quat)
+                    self.tracked_objects[oid]['last_pos'] = new_pos
+                    self.tracked_objects[oid]['last_quat'] = quat
+        except Exception:
+            pass
+
     def _vg_mapping_worker(self):
         """Background thread executing 3D reconstruction and SE(3) tracking."""
         while not self.stop_event.is_set():
@@ -443,82 +975,124 @@ class DremaDynamicSuite:
             # Unpack all camera views
             camera_views = {}
             for f in obs.cameras:
-                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip = unpack_camera_frame(f)
+                name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip, mask = unpack_camera_frame(f)
                 camera_views[name] = {
                     'rgb': rgb,
                     'depth': depth,
                     'extrinsics': extrinsics,
                     'intrinsics': intrinsics,
                     'near_clipping': near_clip,
-                    'far_clipping': far_clip
+                    'far_clipping': far_clip,
+                    'mask': mask
                 }
 
-            # If VG-Mapping pipeline is available, integrate depth frames
+            # 1. Ingest streaming multi-camera frames into TSDF and VDC
             if self.vg_pipeline is not None and len(camera_views) > 0:
-                try:
-                    first_cam = list(camera_views.values())[0]
-                    d_tensor = torch.from_numpy(first_cam['depth'].copy()).to(self.device)
-                    k_tensor = torch.from_numpy(first_cam['intrinsics'].copy()).to(self.device)
-                    t_tensor = torch.from_numpy(first_cam['extrinsics'].copy()).to(self.device)
-                    rgb_tensor = torch.from_numpy(first_cam['rgb'].copy()).float().to(self.device) / 255.0
+                workspace_bounds_t = self.workspace_bounds_t
 
-                    self.vg_pipeline.step_1_ingest_frame(
-                        rgb=rgb_tensor,
-                        depth=d_tensor,
-                        intrinsic=k_tensor,
-                        camera_pose=t_tensor
-                    )
-                except Exception as e:
-                    print(f"[VG-Mapping Worker] Exception during frame {timestep} integration: {e}")
+                for cam_name, cam_data in camera_views.items():
+                    try:
+                        d_tensor = torch.from_numpy(cam_data['depth'].copy()).unsqueeze(0).to(self.device)
+                        k_tensor = torch.from_numpy(cam_data['intrinsics'].copy()).to(self.device)
+                        t_tensor = torch.from_numpy(cam_data['extrinsics'].copy()).to(self.device)
+                        rgb_tensor = torch.from_numpy(cam_data['rgb'].copy()).permute(2, 0, 1).float().to(self.device) / 255.0
+                        mask_np = cam_data.get('mask')
 
-            # If obstacle 0 is tracked, update its position via real-time centroid tracking in Active Workspace
-            if self.initial_scan_ready and 0 in self.tracked_objects and len(camera_views) > 0 and self.active_workspace_bounds is not None:
-                try:
-                    first_cam = list(camera_views.values())[0]
-                    depth_rt = first_cam['depth']
-                    ext_rt = first_cam['extrinsics']
-                    int_rt = first_cam['intrinsics']
-                    near_c = first_cam['near_clipping']
-                    far_c = first_cam['far_clipping']
+                        d_masked, mask_t = self._apply_semantic_robot_mask(
+                            depth_t=d_tensor,
+                            mask_np=mask_np
+                        )
 
-                    H, W = depth_rt.shape
-                    u_g, v_g = np.meshgrid(np.arange(0, W, 4), np.arange(0, H, 4))
-                    d_vals = depth_rt[v_g, u_g]
-                    valid = (d_vals > near_c) & (d_vals < far_c)
+                        # Step 1: TSDF integration (robot depth masked to 0)
+                        self.vg_pipeline.step_1_ingest_frame(
+                            rgb=rgb_tensor,
+                            depth=d_masked,
+                            intrinsic=k_tensor,
+                            camera_pose=t_tensor
+                        )
 
-                    u_v, v_v, d_v = u_g[valid], v_g[valid], d_vals[valid]
-                    fx, fy = int_rt[0, 0], int_rt[1, 1]
-                    cx, cy = int_rt[0, 2], int_rt[1, 2]
-                    x_c = (u_v - cx) * d_v / fx
-                    y_c = (v_v - cy) * d_v / fy
-                    p_c = np.stack([x_c, y_c, d_v, np.ones_like(d_v)], axis=-1)
-                    p_w = (ext_rt @ p_c.T).T[:, :3]
+                        # Step 2: VDC variation detection & raycast pruning
+                        rendered_rgb = rgb_tensor.clone()
+                        rendered_depth = d_tensor.clone()
 
-                    ws = self.active_workspace_bounds
-                    z_tab = ws['z_table']
-                    rb_x, rb_y = float(self.robot_base_pos[0]), float(self.robot_base_pos[1])
-                    dist_rt = np.sqrt((p_w[:, 0] - rb_x)**2 + (p_w[:, 1] - rb_y)**2)
+                        new_g, prune_mask = self.vg_pipeline.step_2_online_mapping(
+                            rgb=rgb_tensor,
+                            depth=d_tensor,
+                            rendered_rgb=rendered_rgb,
+                            rendered_depth=rendered_depth,
+                            intrinsic=k_tensor,
+                            camera_pose=t_tensor,
+                            current_morton_codes=self.scene_gaussians['morton'],
+                            mask=mask_t,
+                            workspace_bounds=workspace_bounds_t,
+                            is_initial_timestep=False,
+                            num_views=len(camera_views),
+                            robot_ids=self.robot_ids,
+                            target_object_ids=self.target_object_ids
+                        )
 
-                    obs_m = (p_w[:, 2] > (z_tab + 0.015)) & (p_w[:, 2] <= ws['z_max']) & \
-                            (p_w[:, 0] >= ws['x_min']) & (p_w[:, 0] <= ws['x_max']) & \
-                            (p_w[:, 1] >= ws['y_min']) & (p_w[:, 1] <= ws['y_max']) & \
-                            (dist_rt <= self.reachability_radius) & (dist_rt >= 0.12)
-                    pts_obs_curr = p_w[obs_m]
+                        # Apply pruning
+                        if len(prune_mask) > 0 and torch.any(prune_mask):
+                            keep_mask = ~prune_mask
+                            for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
+                                self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
 
-                    if len(pts_obs_curr) >= 20:
-                        curr_center = np.mean(pts_obs_curr, axis=0)
-                        self.digital_twin.sync_object_pose(0, tuple(curr_center.tolist()), (0, 0, 0, 1))
-                        self.tracked_objects[0]['last_pos'] = tuple(curr_center.tolist())
-                except Exception:
-                    pass
+                        # Add new Gaussians with Morton deduplication
+                        if len(new_g['xyz']) > 0:
+                            added_morton = new_g['morton']
+                            if len(self.scene_gaussians['morton']) > 0:
+                                occupied = torch.isin(added_morton, self.scene_gaussians['morton'])
+                                non_dup = ~occupied
+                            else:
+                                non_dup = torch.ones_like(added_morton, dtype=torch.bool)
+
+                            for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
+                                val = new_g[k] if k in new_g else torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
+                                self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val[non_dup]], dim=0)
+
+                    except Exception as e:
+                        pass
+
+            # 2. RecurGS SE(3) Tracking & PyBullet Physics Synchronization
+            self._track_and_sync_objects()
 
             self.total_frames_processed += 1
             elapsed = (time.time() - t0) * 1000.0
+
+            # Periodically refresh Viser 3D web point cloud
+            if self.total_frames_processed % 3 == 0:
+                self._update_viser_gaussians()
 
             if self.total_frames_processed % 20 == 0:
                 print(f"[VG-Mapping] Ingested Frame #{timestep} ({len(camera_views)} views) in {elapsed:.1f}ms")
 
             self.frame_queue.task_done()
+
+    def _update_viser_gaussians(self):
+        """Updates the live 3D Gaussian point cloud in Viser Web Visualizer."""
+        if self.viser_server is None or len(self.scene_gaussians['xyz']) == 0:
+            return
+        try:
+            pts_np = self.scene_gaussians['xyz'].detach().cpu().numpy()
+            rgb_np = self.scene_gaussians['rgb'].detach().cpu().numpy()
+            rgb_np = np.clip(rgb_np, 0.0, 1.0)
+
+            # Subsample if large for responsive 60fps web streaming
+            if len(pts_np) > 50000:
+                sub = np.random.choice(len(pts_np), 50000, replace=False)
+                pts_np = pts_np[sub]
+                rgb_np = rgb_np[sub]
+
+            h = self.viser_server.scene.add_point_cloud(
+                name="/scene/gaussians",
+                points=pts_np,
+                colors=rgb_np,
+                point_size=0.005,
+                point_shape="circle"
+            )
+            self.viser_handles['gaussians'] = h
+        except Exception:
+            pass
 
     def on_request_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
         """gRPC callback triggered when CoppeliaSim requests joint velocity command."""
@@ -530,8 +1104,13 @@ class DremaDynamicSuite:
         if robot_state.reachability_radius > 0:
             self.reachability_radius = float(robot_state.reachability_radius)
 
-        # 1. Update PyBullet Digital Twin robot joint configuration
-        if len(robot_state.joint_positions) > 0:
+        # 1. Update PyBullet Digital Twin robot configuration (load dynamically if not loaded yet)
+        if self.digital_twin.robot_id < 0 and len(self.robot_base_pos) >= 3:
+            self.digital_twin.load_robot(
+                base_position=tuple(self.robot_base_pos.tolist()),
+                joint_positions=list(robot_state.joint_positions) if len(robot_state.joint_positions) > 0 else None
+            )
+        elif len(robot_state.joint_positions) > 0:
             self.digital_twin.sync_robot_state(robot_state.joint_positions)
 
         # 2. Step PyBullet physics forward
@@ -560,8 +1139,21 @@ class DremaDynamicSuite:
         print(f"[DREMA Suite] Resetting episode {reset_req.episode_index} for task {reset_req.task_name}...")
         self.initial_scan_ready = False
         self.accumulated_scan_points = []
+        self.accumulated_scan_frames = []
+        self.semantic_labels = {}
+        self.robot_ids = set()
+        self.target_object_ids = set()
         self.tracked_objects = {}
         self.active_workspace_bounds = None
+        self.workspace_bounds_t = None
+        self.robot_joint_positions = []
+        self.scene_gaussians = {
+            'xyz': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'rgb': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
+            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+        }
         self.digital_twin.reset()
         self.mpc_controller.reset()
         return True
@@ -586,6 +1178,11 @@ class DremaDynamicSuite:
             self.worker_thread.join(timeout=1.0)
         self.server.stop(grace=0.5)
         self.digital_twin.close()
+        if self.viser_server is not None:
+            try:
+                self.viser_server.stop()
+            except Exception:
+                pass
         print("✓ DREMA Suite cleanly stopped.")
 
 
@@ -593,6 +1190,9 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Run DREMA Dynamic Inference Suite")
     parser.add_argument("--port", type=int, default=50051, help="gRPC Server port (default: 50051)")
     parser.add_argument("--visualize_pybullet", action="store_true", help="Open PyBullet GUI window for real-time visualization")
+    parser.add_argument("--visualize_viser", action="store_true", default=True, help="Launch real-time 3D Viser Web Visualizer (default: True)")
+    parser.add_argument("--no_viser", dest="visualize_viser", action="store_false", help="Disable Viser Web Visualizer")
+    parser.add_argument("--viser_port", type=int, default=8080, help="Viser Web Visualizer port (default: 8080)")
     parser.add_argument("--table_z_prior", type=float, default=0.75, help="Preliminary prior for table Z search in meters (default: 0.75)")
     parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--voxel_size", type=float, default=0.01, help="TSDF voxel grid resolution (default: 0.01m)")
@@ -605,6 +1205,8 @@ if __name__ == "__main__":
     suite = DremaDynamicSuite(
         port=args.port,
         visualize_pybullet=args.visualize_pybullet,
+        visualize_viser=args.visualize_viser,
+        viser_port=args.viser_port,
         table_z_prior=args.table_z_prior,
         reachability_radius=args.reachability_radius,
         voxel_size=args.voxel_size,

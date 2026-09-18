@@ -22,12 +22,8 @@ from typing import Dict, List, Optional, Tuple
 
 import torch
 
-try:
-    import viser
-    import viser.transforms as tf
-    HAS_VISER = True
-except ImportError:
-    HAS_VISER = False
+import viser
+import viser.transforms as tf
 
 
 def generate_object_palette(max_id: int = 32) -> Dict[int, np.ndarray]:
@@ -191,9 +187,6 @@ def launch_viser_server(
     """
     Launches an interactive 3D Viser Web Visualizer for a sequence of 3D Gaussian scenes.
     """
-    if not HAS_VISER:
-        print("❌ Error: 'viser' is not installed! Run: pip install viser")
-        return
 
     timesteps = discover_sequence_timesteps(data_dir)
     if len(timesteps) == 0:
