@@ -4,11 +4,6 @@ Motion Primitive Library for Franka Panda Manipulator (MP-PMPPI).
 
 Synthesizes concepts from:
 - Mathisen et al. (MP-MPPI, 2026), Section 2.3: Ingestion of structured Motion Primitives into MPPI.
-- Marco Stefani (2026), Section 3:
-    3.1 Geometric Bottlenecks & Narrow Passages: Vertical linear insertion/retract.
-    3.2 High-Dimensional Joint Coordination: Cartesian primitives mapped via Jacobian.
-    3.3 Myopic Obstacle Avoidance vs. Broad Maneuvers: Broad parabolic and lateral bypass arcs.
-- Equations (13)-(14): Hybrid sampling matrix U_t and selective primitive filtering.
 """
 
 import numpy as np
@@ -28,7 +23,7 @@ class MotionPrimitiveLibrary:
         kinematics: FrankaKinematics,
         horizon: int = 20,
         dt: float = 0.05,
-        max_joint_acc: float = 0.5  # rad/s^2 (matching Zhou et al. Table I / Isaac Gym)
+        max_joint_acc: float = 0.5
     ):
         """
         :param kinematics: FrankaKinematics instance for Jacobian and FK computations.
@@ -97,8 +92,6 @@ class MotionPrimitiveLibrary:
 
         # ---------------------------------------------------------------------
         # 3. Lateral, Upward & Reactive Obstacle Evasion Primitives (Bypass Obstacles)
-        # Marco Stefani Section 3.3 & 6.2: "Broad pre-calculated motion primitives
-        # allow evaluating macro-maneuvers that bypass obstacles entirely."
         # ---------------------------------------------------------------------
         # Sidestep Left (+Y world)
         v_left = np.array([0.0, 0.12, 0.0], dtype=np.float32)
@@ -111,7 +104,7 @@ class MotionPrimitiveLibrary:
         # Parabolic Upward Sweep (Arc: +Z upward while advancing forward)
         primitives.append(self._create_parabolic_arc(q_current, qd_current, forward_speed=0.08, arc_height=0.12))
 
-        # Reactive Obstacle Evasion Primitive (Marco Stefani Section 6.2):
+        # Reactive Obstacle Evasion Primitive:
         # Generates a repulsive velocity vector directed away from closest dynamic obstacle
         if obstacles:
             for obs in obstacles:

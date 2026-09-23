@@ -52,7 +52,7 @@ class FrankaKinematics:
         """
         :param base_position: 3D coordinates [x, y, z] of the robot base in world frame.
         """
-        self.base_position = np.array(base_position, dtype=np.float32) if base_position is not None else np.zeros(3, dtype=np.float32)
+        self.base_position = np.array(base_position, dtype=np.float32) if base_position is not None else None
 
     def _dh_transform(self, a: float, alpha: float, d: float, theta: float) -> np.ndarray:
         """Computes standard Modified DH 4x4 homogeneous transformation matrix."""
@@ -104,7 +104,8 @@ class FrankaKinematics:
         all_T = self.forward_kinematics_all(q)
         T_ee = all_T[-1]
         pos_base = T_ee[:3, 3]
-        pos_world = pos_base + self.base_position
+        base_offset = self.base_position if self.base_position is not None else np.zeros(3, dtype=np.float32)
+        pos_world = pos_base + base_offset
         rot_matrix = T_ee[:3, :3]
         return pos_world, rot_matrix
 
@@ -174,7 +175,8 @@ class FrankaKinematics:
         :return: (q_sol, success_flag)
         """
         q = np.array(q_init, dtype=np.float32).copy()
-        target_p_rel = target_pos - self.base_position
+        base_offset = self.base_position if self.base_position is not None else np.zeros(3, dtype=np.float32)
+        target_p_rel = target_pos - base_offset
 
         for _ in range(max_iters):
             all_T = self.forward_kinematics_all(q)
