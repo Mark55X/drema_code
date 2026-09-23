@@ -23,29 +23,57 @@ class FrankaKinematics:
     Kinematics model and Jacobian calculator for 7-DOF Franka Emika Panda.
     """
 
-    # Franka Panda joint position limits [rad]
+    # -------------------------------------------------------------------------
+    # Franka Panda Joint Position Limits [rad] (Q_MIN, Q_MAX)
+    # Source (Official Franka Control Interface / franka_ros joint_limits.yaml):
+    # https://github.com/frankaemika/franka_ros/blob/develop/franka_description/robots/panda/joint_limits.yaml
+    # Official FCI Manual: https://frankaemika.github.io/docs/
+    # -------------------------------------------------------------------------
     Q_MIN = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973], dtype=np.float32)
     Q_MAX = np.array([ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973], dtype=np.float32)
 
-    # Franka Panda joint velocity limits [rad/s]
+    # -------------------------------------------------------------------------
+    # Franka Panda Joint Velocity Limits [rad/s] (QD_MAX)
+    # Source (Official franka_ros joint_limits.yaml & panda.urdf):
+    # https://github.com/frankaemika/franka_ros/blob/develop/franka_description/robots/panda/joint_limits.yaml
+    # Joint 1-4: 2.1750 rad/s (125 deg/s) | Joint 5-7: 2.6100 rad/s (150 deg/s)
+    # -------------------------------------------------------------------------
     QD_MAX = np.array([2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100], dtype=np.float32)
 
-    # Maximum joint acceleration limits [rad/s^2] (conservatively configured for smooth MPC sampling)
+    # -------------------------------------------------------------------------
+    # Maximum Joint Acceleration Limits [rad/s^2] (QDD_MAX)
+    # Source (Official Franka Control Interface / FCI Specifications):
+    # https://frankaemika.github.io/docs/control_parameters.html
+    # Note: In Zhou et al. (IEEE T-RO 2025, Table I) sampling is performed in
+    # acceleration space with bounds [-0.5, 0.5] rad/s^2 for smooth MPC sampling.
+    # -------------------------------------------------------------------------
     QDD_MAX = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0], dtype=np.float32)
 
-    # Modified Denavit-Hartenberg (MDH) parameters for Franka Panda:
+    # -------------------------------------------------------------------------
+    # Modified Denavit-Hartenberg (MDH) Parameters for Franka Panda:
     # [a_{i-1}, alpha_{i-1}, d_i, theta_offset]
     # Frames: 0 to 7 + flange + EE
+    # Source: Claudio Gaz et al., "Dynamic Identification of the Franka Emika
+    # Panda Robot with Retrieval of Feasible Parameters Using Penalty-Based
+    # Optimization", IEEE Robotics and Automation Letters (RA-L), 2019.
+    # DOI: https://doi.org/10.1109/LRA.2019.2931248
+    # GitHub Repository: https://github.com/marcocognetti/FrankaEmikaPandaDynModel
+    # -------------------------------------------------------------------------
     MDH_PARAMS = [
-        (0.0,      0.0,         0.333, 0.0),        # Joint 1
+        (0.0,      0.0,         0.333, 0.0),        # Joint 1 (d1 = 0.333m)
         (0.0,     -np.pi / 2.0, 0.0,   0.0),        # Joint 2
-        (0.0,      np.pi / 2.0, 0.316, 0.0),        # Joint 3
-        (0.0825,   np.pi / 2.0, 0.0,   0.0),        # Joint 4
-        (-0.0825, -np.pi / 2.0, 0.384, 0.0),        # Joint 5
+        (0.0,      np.pi / 2.0, 0.316, 0.0),        # Joint 3 (d3 = 0.316m)
+        (0.0825,   np.pi / 2.0, 0.0,   0.0),        # Joint 4 (a4 = 0.0825m)
+        (-0.0825, -np.pi / 2.0, 0.384, 0.0),        # Joint 5 (a5 = -0.0825m, d5 = 0.384m)
         (0.0,      np.pi / 2.0, 0.0,   0.0),        # Joint 6
-        (0.088,    np.pi / 2.0, 0.107, 0.0),        # Joint 7
+        (0.088,    np.pi / 2.0, 0.107, 0.0),        # Joint 7 (a7 = 0.088m, d7 = 0.107m)
     ]
-    # End-Effector / Gripper Flange offset from Joint 7
+
+    # -------------------------------------------------------------------------
+    # End-Effector / Gripper TCP Offset from Joint 7 Flange [m]
+    # Source (Official franka_hand.xacro, tcp_xyz='0 0 0.1034'):
+    # https://github.com/frankaemika/franka_ros/blob/develop/franka_description/robots/common/franka_hand.xacro
+    # -------------------------------------------------------------------------
     EE_OFFSET = np.array([0.0, 0.0, 0.1034], dtype=np.float32)
 
     def __init__(self, base_position: Optional[np.ndarray] = None):
@@ -163,7 +191,15 @@ class FrankaKinematics:
     ) -> Tuple[np.ndarray, bool]:
         """
         Solves Inverse Kinematics using Damped Least-Squares (DLS):
-        dq = J^T * (J * J^T + lambda^2 * I)^(-1) * error
+        dq = J^T * (J * J^T + lambda^2 * I)^(-1) * error (Nakamura & Hanafusa / Levenberg-Marquardt).
+
+        Note on MPPI IK Guidance:
+        This DLS solver acts as a lightweight, deterministic fallback when PyBullet's
+        native C++ IK is unavailable or encounters singularities. In MPPI, IK does not
+        need to be micro-accurate: it merely provides a joint-space guidance center
+        q_{des,t} (Zhou et al. Eq. 26) to attract the stochastic sample cloud.
+        Millimetric target convergence is guaranteed by the Cartesian Sparse Reward
+        attraction bubble R_s (Eq. 12 / 28).
 
         :param q_init: Initial joint configuration (shape: [7]).
         :param target_pos: Target 3D position [x, y, z] in world frame.
