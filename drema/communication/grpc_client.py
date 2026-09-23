@@ -220,49 +220,65 @@ class DremaGrpcClient:
         semantic_labels: Optional[Dict[str, int]] = None,
         robot_base_pos: Optional[List[float]] = None,
         reachability_radius: float = 0.95,
-        joint_positions: Optional[List[float]] = None
+        joint_positions: Optional[List[float]] = None,
+        chunk_size: int = 4
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
-        Pushes the entire 360° orbital scan (all ~200 views) in a single batch to DREMA suite.
+        Pushes the 360° orbital scan frames to DREMA suite in chunks to avoid gRPC payload overflow.
         Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip, mask])
         """
-        frames = []
-        for item in cameras_list:
-            name, rgb, depth, extrinsics, intrinsics = item[0], item[1], item[2], item[3], item[4]
-            near_clip = item[5] if len(item) > 5 else 0.0
-            far_clip = item[6] if len(item) > 6 else 0.0
-            mask = item[7] if len(item) > 7 else None
-            f = pack_camera_frame(
-                name=name,
-                rgb=rgb,
-                depth=depth,
-                extrinsics=extrinsics,
-                intrinsics=intrinsics,
-                near_clipping=near_clip,
-                far_clipping=far_clip,
-                mask=mask
-            )
-            frames.append(f)
-
-        obs = drema_comm_pb2.FrameObservation(
-            timestep=0,
-            timestamp=time.time(),
-            cameras=frames,
-            is_initial_scan=True,
-            is_scan_finished=True,
-            semantic_labels=semantic_labels or {},
-            robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
-            reachability_radius=float(reachability_radius),
-            joint_positions=joint_positions or []
-        )
-
-        try:
-            print(f"[GrpcClient] Sending single-batch initial scan ({len(frames)} views, {len(semantic_labels or {})} labels) to DREMA...")
-            res = self.stub.SendFrame(obs, timeout=60.0)
-            return res
-        except Exception as e:
-            print(f"[GrpcClient Error] push_initial_scan_batch failed: {e}")
+        total_views = len(cameras_list)
+        if total_views == 0:
             return None
+
+        print(f"[GrpcClient] Transmitting {total_views} initial scan views to DREMA in chunks of {chunk_size}...")
+        
+        last_res = None
+        for start_idx in range(0, total_views, chunk_size):
+            chunk = cameras_list[start_idx:start_idx + chunk_size]
+            is_last = (start_idx + chunk_size >= total_views)
+
+            frames = []
+            for item in chunk:
+                name, rgb, depth, extrinsics, intrinsics = item[0], item[1], item[2], item[3], item[4]
+                near_clip = item[5] if len(item) > 5 else 0.0
+                far_clip = item[6] if len(item) > 6 else 0.0
+                mask = item[7] if len(item) > 7 else None
+                f = pack_camera_frame(
+                    name=name,
+                    rgb=rgb,
+                    depth=depth,
+                    extrinsics=extrinsics,
+                    intrinsics=intrinsics,
+                    near_clipping=near_clip,
+                    far_clipping=far_clip,
+                    mask=mask
+                )
+                frames.append(f)
+
+            obs = drema_comm_pb2.FrameObservation(
+                timestep=0,
+                timestamp=time.time(),
+                cameras=frames,
+                is_initial_scan=True,
+                is_scan_finished=is_last,
+                semantic_labels=semantic_labels if is_last else {},
+                robot_base_pos=(robot_base_pos or [0.0, 0.0, 0.0]) if is_last else [],
+                reachability_radius=float(reachability_radius),
+                joint_positions=(joint_positions or []) if is_last else []
+            )
+
+            try:
+                # Generous timeout on final chunk to allow TSDF volumetric integration and Marching Cubes
+                timeout = 600.0 if is_last else 30.0
+                last_res = self.stub.SendFrame(obs, timeout=timeout)
+                if not is_last and (start_idx + len(chunk)) % 20 == 0:
+                    print(f"   [GrpcClient] Transmitted {start_idx + len(chunk)}/{total_views} views to DREMA...")
+            except Exception as e:
+                print(f"[GrpcClient Error] push_initial_scan_batch failed at chunk [{start_idx}:{start_idx+len(chunk)}]: {e}")
+                return None
+
+        return last_res
 
     def request_action(
         self,

@@ -16,6 +16,7 @@ import time
 import argparse
 import threading
 import numpy as np
+from typing import Tuple, List, Optional, Dict, Any
 
 # Ensure paths are set (do not shadow installed PyRep with source tree)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -49,7 +50,8 @@ class CoppeliaSimulationClient:
         headless: bool = False,
         cam_fps: float = 10.0,
         ctrl_fps: float = 50.0,
-        reachability_radius: float = 0.95
+        reachability_radius: float = 0.95,
+        scan_resolution: Tuple[int, int] = (1280, 720)
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -58,6 +60,7 @@ class CoppeliaSimulationClient:
         self.cam_fps = cam_fps
         self.ctrl_fps = ctrl_fps
         self.reachability_radius = reachability_radius
+        self.scan_resolution = tuple(scan_resolution)
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -130,7 +133,7 @@ class CoppeliaSimulationClient:
         # Setup 4 cameras at distinct vertical and radial offsets (identical to prepare_data_for_drema)
         cams = []
         cams_mask = []
-        resolutions = [128, 128]
+        resolutions = list(self.scan_resolution)
         p_offsets = [
             [0.0, 0.0, 0.0],
             [0.0, 0.0, 0.30],
@@ -354,6 +357,12 @@ class CoppeliaSimulationClient:
         """Extracts RGB, Depth, Extrinsics, Intrinsics, and Masks from all vision sensors."""
         cam_dict = {}
         for name, cam in self.cameras.items():
+            if cam is not None:
+                try:
+                    cam.handle_explicitly()
+                except Exception:
+                    pass
+
             # RGB: uint8 [0, 255]
             rgb_float = cam.capture_rgb()
             rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
@@ -540,6 +549,8 @@ def parse_args():
     parser.add_argument("--cam_fps", type=float, default=10.0, help="Camera sensor capture and streaming frequency in Hz (default: 10)")
     parser.add_argument("--ctrl_fps", type=float, default=50.0, help="Robot joint velocity control frequency in Hz (default: 50)")
     parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
+    parser.add_argument("--scan_resolution", type=int, nargs=2, default=[1280, 720], metavar=("WIDTH", "HEIGHT"),
+                        help="Orbital scan camera resolution [width, height] (default: 1280 720)")
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
     return parser.parse_args()
 
@@ -553,6 +564,7 @@ if __name__ == "__main__":
         headless=args.headless,
         cam_fps=args.cam_fps,
         ctrl_fps=args.ctrl_fps,
-        reachability_radius=args.reachability_radius
+        reachability_radius=args.reachability_radius,
+        scan_resolution=args.scan_resolution
     )
     client.run()

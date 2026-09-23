@@ -235,6 +235,7 @@ class DremaDynamicSuite:
             'xyz': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'rgb': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'normal': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
             'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
         }
@@ -265,13 +266,16 @@ class DremaDynamicSuite:
         """
         if mask_np is None:
             return depth_t, None
-        mask_t = torch.from_numpy(mask_np).to(self.device)
+        mask_t = torch.from_numpy(mask_np.copy()).to(self.device)
         depth_masked = depth_t.clone()
         filter_ids = self.robot_ids | self.virtual_ids
         if len(filter_ids) > 0:
             f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_t.dtype)
             is_filtered = torch.isin(mask_t, f_ids)
-            depth_masked[0, is_filtered] = 0.0
+            # 1-pixel morphological dilation to prevent boundary bleeding along link silhouettes
+            filt_float = is_filtered.float().unsqueeze(0).unsqueeze(0)
+            dilated = (torch.nn.functional.max_pool2d(filt_float, kernel_size=3, stride=1, padding=1).squeeze() > 0.5)
+            depth_masked[0, dilated] = 0.0
         return depth_masked, mask_t
 
     def _add_viser_obstacle_mesh(self, obj_name: str, idx: int, comp):
@@ -601,7 +605,7 @@ class DremaDynamicSuite:
         )
         self.workspace_bounds_t = workspace_bounds_t
 
-        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
+        new_xyz_acc, new_rgb_acc, new_scale_acc, new_normal_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], [], []
         raw_gaussians_count = 0
 
         for f_idx, frame_data in enumerate(self.accumulated_scan_frames):
@@ -628,11 +632,11 @@ class DremaDynamicSuite:
 
             # Step 2: VDC Gaussian mapping (is_robot=True for both robot links and virtual targets)
             rendered_rgb = rgb_t.clone()
-            rendered_depth = depth_t.clone()
+            rendered_depth = depth_tsdf.clone()
 
             new_g, prune_mask = self.vg_pipeline.step_2_online_mapping(
                 rgb=rgb_t,
-                depth=depth_t,
+                depth=depth_tsdf,
                 rendered_rgb=rendered_rgb,
                 rendered_depth=rendered_depth,
                 intrinsic=k_t,
@@ -647,6 +651,18 @@ class DremaDynamicSuite:
             )
 
             n_new_g = len(new_g['xyz'])
+            if n_new_g > 0 and len(self.robot_base_pos) >= 3:
+                # Geometric exclusion of robot base mounting column (radius 0.13m, z >= table_z)
+                rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
+                p_xy = new_g['xyz'][:, :2]
+                dist_base = torch.sqrt((p_xy[:, 0] - rx) ** 2 + (p_xy[:, 1] - ry) ** 2)
+                keep_geom = (dist_base > 0.13) | (new_g['xyz'][:, 2] < (rz - 0.05))
+                if not torch.all(keep_geom):
+                    for k in list(new_g.keys()):
+                        if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == n_new_g:
+                            new_g[k] = new_g[k][keep_geom]
+                    n_new_g = len(new_g['xyz'])
+
             raw_gaussians_count += n_new_g
             t_view_ms = (time.time() - t_start_view) * 1000.0
             cam_name = frame_data.get('name', f'view_{f_idx}')
@@ -656,6 +672,10 @@ class DremaDynamicSuite:
                 new_xyz_acc.append(new_g['xyz'])
                 new_rgb_acc.append(new_g['rgb'])
                 new_scale_acc.append(new_g['scale'])
+                if 'normal' in new_g and len(new_g['normal']) == n_new_g:
+                    new_normal_acc.append(new_g['normal'])
+                else:
+                    new_normal_acc.append(torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(n_new_g, 1))
                 new_morton_acc.append(new_g['morton'])
                 new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)))
 
@@ -664,6 +684,7 @@ class DremaDynamicSuite:
             added_xyz = torch.cat(new_xyz_acc, dim=0)
             added_rgb = torch.cat(new_rgb_acc, dim=0)
             added_scale = torch.cat(new_scale_acc, dim=0)
+            added_normal = torch.cat(new_normal_acc, dim=0)
             added_morton = torch.cat(new_morton_acc, dim=0)
             added_obj_id = torch.cat(new_obj_id_acc, dim=0)
 
@@ -677,6 +698,7 @@ class DremaDynamicSuite:
                 self.scene_gaussians['xyz'] = added_xyz[keep_idx]
                 self.scene_gaussians['rgb'] = added_rgb[keep_idx]
                 self.scene_gaussians['scale'] = added_scale[keep_idx]
+                self.scene_gaussians['normal'] = added_normal[keep_idx]
                 self.scene_gaussians['morton'] = added_morton[keep_idx]
                 self.scene_gaussians['obj_id'] = added_obj_id[keep_idx]
 
@@ -984,6 +1006,11 @@ class DremaDynamicSuite:
                     if mesh_handle is not None:
                         mesh_handle.position = new_pos
                         mesh_handle.wxyz = (quat[3], quat[0], quat[1], quat[2])
+
+                    # Rotate obstacle surface normals with estimated SE(3) rotation
+                    obj_mask = (self.scene_gaussians['obj_id'] == oid)
+                    if torch.any(obj_mask) and 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(obj_mask):
+                        self.scene_gaussians['normal'][obj_mask] = self.scene_gaussians['normal'][obj_mask] @ R_fine.T
         except Exception:
             pass
 
@@ -1039,11 +1066,11 @@ class DremaDynamicSuite:
 
                         # Step 2: VDC variation detection & raycast pruning
                         rendered_rgb = rgb_tensor.clone()
-                        rendered_depth = d_tensor.clone()
+                        rendered_depth = d_masked.clone()
 
                         new_g, prune_mask = self.vg_pipeline.step_2_online_mapping(
                             rgb=rgb_tensor,
-                            depth=d_tensor,
+                            depth=d_masked,
                             rendered_rgb=rendered_rgb,
                             rendered_depth=rendered_depth,
                             intrinsic=k_tensor,
@@ -1060,10 +1087,21 @@ class DremaDynamicSuite:
                         # Apply pruning
                         if len(prune_mask) > 0 and torch.any(prune_mask):
                             keep_mask = ~prune_mask
-                            for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
-                                self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+                            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                                if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
+                                    self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
 
-                        # Add new Gaussians with Morton deduplication
+                        # Add new Gaussians with Morton deduplication & robot cylinder exclusion
+                        if len(new_g['xyz']) > 0 and len(self.robot_base_pos) >= 3:
+                            rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
+                            p_xy = new_g['xyz'][:, :2]
+                            dist_base = torch.sqrt((p_xy[:, 0] - rx) ** 2 + (p_xy[:, 1] - ry) ** 2)
+                            keep_geom = (dist_base > 0.13) | (new_g['xyz'][:, 2] < (rz - 0.05))
+                            if not torch.all(keep_geom):
+                                for k in list(new_g.keys()):
+                                    if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(new_g['xyz']):
+                                        new_g[k] = new_g[k][keep_geom]
+
                         if len(new_g['xyz']) > 0:
                             added_morton = new_g['morton']
                             if len(self.scene_gaussians['morton']) > 0:
@@ -1072,8 +1110,13 @@ class DremaDynamicSuite:
                             else:
                                 non_dup = torch.ones_like(added_morton, dtype=torch.bool)
 
-                            for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
-                                val = new_g[k] if k in new_g else torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
+                            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                                if k in new_g:
+                                    val = new_g[k]
+                                elif k == 'normal':
+                                    val = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(new_g['xyz']), 1)
+                                else:
+                                    val = torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
                                 self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val[non_dup]], dim=0)
 
                     except Exception as e:
@@ -1104,18 +1147,37 @@ class DremaDynamicSuite:
             scale_np = self.scene_gaussians['scale'].detach().cpu().numpy()
             rgb_np = np.clip(rgb_np, 0.0, 1.0)
 
+            # Extract surface normals dynamically from scene_gaussians
+            normals_np = self.scene_gaussians.get('normal', torch.empty(0)).detach().cpu().numpy() if 'normal' in self.scene_gaussians else None
+
             # Subsample if extremely large for responsive 60fps web streaming
             if len(pts_np) > 50000:
                 sub = np.random.choice(len(pts_np), 50000, replace=False)
                 pts_np = pts_np[sub]
                 rgb_np = rgb_np[sub]
                 scale_np = scale_np[sub]
+                if normals_np is not None and len(normals_np) == len(self.scene_gaussians['xyz']):
+                    normals_np = normals_np[sub]
 
-            # Construct anisotropic covariance matrix for true 3D Gaussian Splats
-            covariances = np.zeros((len(pts_np), 3, 3), dtype=np.float32)
-            covariances[:, 0, 0] = np.square(np.maximum(scale_np[:, 0], 1e-4))
-            covariances[:, 1, 1] = np.square(np.maximum(scale_np[:, 1], 1e-4))
-            covariances[:, 2, 2] = np.square(np.maximum(scale_np[:, 2], 1e-4))
+            # Dynamically normalize surface normal vectors
+            if normals_np is not None and len(normals_np) == len(pts_np):
+                n_norms = np.linalg.norm(normals_np, axis=-1, keepdims=True)
+                valid_n = (n_norms > 1e-4).squeeze(-1)
+                normals_clean = np.zeros_like(normals_np)
+                normals_clean[valid_n] = normals_np[valid_n] / n_norms[valid_n]
+                normals_clean[~valid_n] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+            else:
+                normals_clean = np.tile(np.array([0.0, 0.0, 1.0], dtype=np.float32), (len(pts_np), 1))
+
+            # Dynamic scale: s_tan across local surface tangent plane, s_norm through surface thickness
+            s_tan = np.maximum(scale_np[:, 0:1], 0.012)
+            s_norm = np.maximum(scale_np[:, 1:2], 0.003)
+
+            # Dynamic Anisotropic Covariance: Sigma = s_tan^2 * I + (s_norm^2 - s_tan^2) * (n n^T)
+            # Aligns each disc-like 3D Gaussian flatly against the physical surface tangent plane (Eq. 16 VG-Mapping)
+            nnT = normals_clean[:, :, None] @ normals_clean[:, None, :]
+            eye3 = np.eye(3, dtype=np.float32)[None, :, :]
+            covariances = (s_tan[:, :, None] ** 2) * eye3 + (s_norm[:, :, None] ** 2 - s_tan[:, :, None] ** 2) * nnT
             opacities = np.full((len(pts_np), 1), 0.95, dtype=np.float32)
 
             h = self.viser_server.scene.add_gaussian_splats(
@@ -1199,6 +1261,7 @@ class DremaDynamicSuite:
             'xyz': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'rgb': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
+            'normal': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
             'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
         }
