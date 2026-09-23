@@ -47,7 +47,11 @@ ROBOT_KEYWORD_LABELS = (
 )
 BACKGROUND_KEYWORD_LABELS = (
     "workspace", "table", "floor", "wall", "ceiling", "pillar",
-    "sensor", "success", "camera", "head", "waypoint", "detector"
+    "sensor", "success", "camera", "head", "waypoint", "detector",
+    "target", "goal", "marker", "dummy"
+)
+VIRTUAL_KEYWORD_LABELS = (
+    "target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"
 )
 
 
@@ -221,7 +225,8 @@ class DremaDynamicSuite:
         self.accumulated_scan_frames = []
         self.semantic_labels = {}
         self.robot_ids = set()
-        self.target_object_ids = set()
+        self.virtual_ids = set()
+        self.dynamic_object_ids = set()
         self.tracked_objects = {}
         self.output_mesh_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets/scanned_meshes")
         os.makedirs(self.output_mesh_dir, exist_ok=True)
@@ -252,19 +257,21 @@ class DremaDynamicSuite:
         mask_np: Optional[np.ndarray]
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
-        Applies per-pixel CoppeliaSim entity handle segmentation mask to filter robot arm links from TSDF and 3DGS.
+        Applies per-pixel CoppeliaSim entity handle segmentation mask to filter robot arm links
+        and virtual simulation markers (target, goal, waypoint, marker) from TSDF and 3DGS.
         Returns:
-            depth_masked: Depth tensor with robot pixels set to 0.0 (ignored by TSDF integration).
+            depth_masked: Depth tensor with robot and virtual marker pixels set to 0.0 (ignored by TSDF integration).
             mask_t: Integer tensor containing CoppeliaSim handle IDs per pixel (for VDC 3DGS filtering).
         """
         if mask_np is None:
             return depth_t, None
         mask_t = torch.from_numpy(mask_np).to(self.device)
         depth_masked = depth_t.clone()
-        if len(self.robot_ids) > 0:
-            r_ids = torch.tensor(list(self.robot_ids), device=self.device, dtype=mask_t.dtype)
-            is_robot = torch.isin(mask_t, r_ids)
-            depth_masked[0, is_robot] = 0.0
+        filter_ids = self.robot_ids | self.virtual_ids
+        if len(filter_ids) > 0:
+            f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_t.dtype)
+            is_filtered = torch.isin(mask_t, f_ids)
+            depth_masked[0, is_filtered] = 0.0
         return depth_masked, mask_t
 
     def _add_viser_obstacle_mesh(self, obj_name: str, idx: int, comp):
@@ -510,10 +517,11 @@ class DremaDynamicSuite:
         print(f"✓ [DREMA Reachability] Robot Base: [{rb_x:.2f}, {rb_y:.2f}, {rb_z:.2f}], Reach Radius: {r_reach:.2f}m")
         print(f"✓ [DREMA Active Workspace] X[{act_x_min:.3f}, {act_x_max:.3f}], Y[{act_y_min:.3f}, {act_y_max:.3f}], Z[{act_z_min:.3f}, {act_z_max:.3f}]")
 
-        # 4. Spawn Solid Table in PyBullet Digital Twin (Full geometry)
+        # 4. Spawn Solid Table in PyBullet Digital Twin (Strictly active reachable workspace)
+        active_table_bounds = (act_x_min, act_x_max, act_y_min, act_y_max)
         self.digital_twin.spawn_scanned_table(
             table_z=z_table,
-            bounds=table_bounds
+            bounds=active_table_bounds
         )
 
         # 5. Dynamically Initialize TSDF Grid for Active Workspace in Submodule 1
@@ -555,7 +563,8 @@ class DremaDynamicSuite:
         self.semantic_labels = semantic_labels or {}
         id_to_name = {}
         self.robot_ids = set()
-        self.target_object_ids = set()
+        self.virtual_ids = set()
+        self.dynamic_object_ids = set()
 
         for name, num in self.semantic_labels.items():
             num = int(num)
@@ -563,18 +572,28 @@ class DremaDynamicSuite:
             name_lower = name.lower()
             if any(kw in name_lower for kw in ROBOT_KEYWORD_LABELS):
                 self.robot_ids.add(num)
+            elif any(kw in name_lower for kw in VIRTUAL_KEYWORD_LABELS):
+                self.virtual_ids.add(num)
 
             is_robot_or_bg = any(kw in name_lower for kw in (ROBOT_KEYWORD_LABELS + BACKGROUND_KEYWORD_LABELS))
             if not is_robot_or_bg:
-                self.target_object_ids.add(num)
+                self.dynamic_object_ids.add(num)
 
         if len(self.semantic_labels) > 0:
             print(f"✓ [DREMA Scan] Parsed {len(self.semantic_labels)} semantic labels from CoppeliaSim:")
-            print(f"   Robot IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
-            print(f"   Target Object IDs ({len(self.target_object_ids)}): {sorted(list(self.target_object_ids))}")
+            print(f"   Robot Arm Link IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
+            if len(self.virtual_ids) > 0:
+                v_names = [f"'{id_to_name[v]}' (ID:{v})" for v in sorted(list(self.virtual_ids))]
+                print(f"   Virtual/Target IDs to filter ({len(self.virtual_ids)}): {', '.join(v_names)}")
+            if len(self.dynamic_object_ids) > 0:
+                d_names = [f"'{id_to_name[d]}' (ID:{d})" for d in sorted(list(self.dynamic_object_ids))]
+                print(f"   Scene Physical Object IDs ({len(self.dynamic_object_ids)}): {', '.join(d_names)}")
+            else:
+                print(f"   Scene Physical Object IDs: None detected from initial labels.")
 
         # 7. Ingest All 360° Scan Frames into VG-Mapping (TSDF Voxel Grid & 3D Gaussian Splats)
-        print(f"\n[VG-Mapping] Ingesting {len(self.accumulated_scan_frames)} scan views into TSDF Voxel Grid & 3DGS...")
+        num_views = len(self.accumulated_scan_frames)
+        print(f"\n[VG-Mapping] Starting ingestion of {num_views} scan views into TSDF Voxel Grid & 3DGS...")
 
         workspace_bounds_t = (
             torch.tensor([act_x_min, act_y_min, act_z_min], dtype=torch.float32, device=self.device),
@@ -583,22 +602,23 @@ class DremaDynamicSuite:
         self.workspace_bounds_t = workspace_bounds_t
 
         new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
-        num_views = len(self.accumulated_scan_frames)
+        raw_gaussians_count = 0
 
         for f_idx, frame_data in enumerate(self.accumulated_scan_frames):
-            rgb_t = torch.from_numpy(frame_data['rgb']).permute(2, 0, 1).float().to(self.device) / 255.0
-            depth_t = torch.from_numpy(frame_data['depth']).unsqueeze(0).to(self.device)
+            t_start_view = time.time()
+            rgb_t = torch.from_numpy(frame_data['rgb'].copy()).permute(2, 0, 1).float().to(self.device) / 255.0
+            depth_t = torch.from_numpy(frame_data['depth'].copy()).unsqueeze(0).to(self.device)
             k_t = torch.from_numpy(frame_data['intrinsics']).to(self.device)
             pose_t = torch.from_numpy(frame_data['extrinsics']).to(self.device)
             mask_np = frame_data.get('mask')
 
-            # Filter out robot arm links & base footprint via per-pixel CoppeliaSim semantic handle mask
+            # Filter out robot arm links & virtual targets via per-pixel semantic mask
             depth_tsdf, mask_t = self._apply_semantic_robot_mask(
                 depth_t=depth_t,
                 mask_np=mask_np
             )
 
-            # Step 1: TSDF integration (robot depth masked to 0 so robot is never carved into TSDF)
+            # Step 1: TSDF integration (robot & virtual targets masked to 0 so never carved into TSDF)
             self.vg_pipeline.step_1_ingest_frame(
                 rgb=rgb_t,
                 depth=depth_tsdf,
@@ -606,7 +626,7 @@ class DremaDynamicSuite:
                 camera_pose=pose_t
             )
 
-            # Step 2: VDC Gaussian mapping (mask_t provided so is_robot is True on robot pixels)
+            # Step 2: VDC Gaussian mapping (is_robot=True for both robot links and virtual targets)
             rendered_rgb = rgb_t.clone()
             rendered_depth = depth_t.clone()
 
@@ -622,11 +642,17 @@ class DremaDynamicSuite:
                 workspace_bounds=workspace_bounds_t,
                 is_initial_timestep=True,
                 num_views=num_views,
-                robot_ids=self.robot_ids,
-                target_object_ids=self.target_object_ids
+                robot_ids=(self.robot_ids | self.virtual_ids),
+                target_object_ids=self.dynamic_object_ids
             )
 
-            if len(new_g['xyz']) > 0:
+            n_new_g = len(new_g['xyz'])
+            raw_gaussians_count += n_new_g
+            t_view_ms = (time.time() - t_start_view) * 1000.0
+            cam_name = frame_data.get('name', f'view_{f_idx}')
+            print(f"   [Scan Ingest {f_idx+1:02d}/{num_views:02d}] View '{cam_name}': +{n_new_g:,} new Gaussians | Total Raw: {raw_gaussians_count:,} | {t_view_ms:.1f}ms")
+
+            if n_new_g > 0:
                 new_xyz_acc.append(new_g['xyz'])
                 new_rgb_acc.append(new_g['rgb'])
                 new_scale_acc.append(new_g['scale'])
@@ -654,14 +680,16 @@ class DremaDynamicSuite:
                 self.scene_gaussians['morton'] = added_morton[keep_idx]
                 self.scene_gaussians['obj_id'] = added_obj_id[keep_idx]
 
-        print(f"✓ [VG-Mapping] TSDF volumetric integration complete ({num_views} views).")
-        print(f"✓ [VG-Mapping] Surface 3DGS populated with {len(self.scene_gaussians['xyz'])} Gaussian primitives.")
+        retained_count = len(self.scene_gaussians['xyz'])
+        reduction_pct = ((raw_gaussians_count - retained_count) / max(1, raw_gaussians_count)) * 100.0
+        print(f"\n✓ [VG-Mapping] TSDF volumetric integration complete ({num_views} views).")
+        print(f"✓ [VG-Mapping Deduplication] Morton surface pruning:")
+        print(f"   Raw Gaussians accumulated: {raw_gaussians_count:,}")
+        print(f"   Unique 1cm voxel surface Gaussians retained: {retained_count:,}")
+        print(f"   Pruned redundant primitives: {raw_gaussians_count - retained_count:,} ({reduction_pct:.1f}% reduction).")
 
         # Update Viser with initial Gaussian Splatting scene
         self._update_viser_gaussians()
-
-        # Update Viser with TSDF Surface Voxels
-        self._update_viser_surface_voxels()
 
         # 8. Extract Tabletop Obstacle Meshes via TSDF Marching Cubes
         z_cutoff = z_table + OBSTACLE_MIN_CLEARANCE_Z
@@ -701,11 +729,8 @@ class DremaDynamicSuite:
             valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
             print(f"✓ [VG-Mapping Marching Cubes] Discovered {len(valid_components)} distinct tabletop obstacle mesh(es).")
 
-            # Collect target object candidate names from semantic labels
-            target_names = [id_to_name[t] for t in self.target_object_ids if t in id_to_name]
-            goal_names = [n for n in target_names if any(k in n.lower() for k in ["target", "goal", "cube", "sphere", "block"])]
-            obs_names = [n for n in target_names if any(k in n.lower() for k in ["obstacle", "wall", "distractor", "barrier"])]
-            other_names = [n for n in target_names if n not in goal_names and n not in obs_names]
+            # Semantic names for physical scene objects if available
+            available_obj_names = [id_to_name[t] for t in self.dynamic_object_ids if t in id_to_name]
 
             for c_idx, comp in enumerate(valid_components):
                 comp_verts = comp.vertices
@@ -713,29 +738,11 @@ class DremaDynamicSuite:
                 min_b, max_b = comp.bounds[0], comp.bounds[1]
                 center = (min_b + max_b) / 2.0
                 extents = max_b - min_b
-                is_small = float(np.max(extents)) < 0.10
 
-                # Match semantic name and target classification
-                obj_name = None
-                is_target = False
-                if is_small and len(goal_names) > 0:
-                    obj_name = goal_names.pop(0)
-                    is_target = True
-                elif (not is_small) and len(obs_names) > 0:
-                    obj_name = obs_names.pop(0)
-                    is_target = False
-                elif len(goal_names) > 0:
-                    obj_name = goal_names.pop(0)
-                    is_target = True
-                elif len(obs_names) > 0:
-                    obj_name = obs_names.pop(0)
-                    is_target = False
-                elif len(other_names) > 0:
-                    obj_name = other_names.pop(0)
-                    is_target = is_small
+                if len(available_obj_names) > 0:
+                    obj_name = available_obj_names.pop(0)
                 else:
-                    obj_name = f"scanned_obstacle_{spawned_obstacles}"
-                    is_target = False
+                    obj_name = f"obstacle_{spawned_obstacles}"
 
                 # Center mesh vertices around center of bounding box
                 verts_centered = comp_verts - center
@@ -757,7 +764,17 @@ class DremaDynamicSuite:
                     clean_xyz = torch.from_numpy(comp_verts).float().to(self.device)
                     clean_rgb = torch.full((len(clean_xyz), 3), 0.5, dtype=torch.float32, device=self.device)
 
-                obj_color = (0.88, 0.22, 0.22, 1.0) if is_target else (0.20, 0.45, 0.85, 1.0)
+                # Real object color computed as mean RGB of its Gaussians
+                if len(clean_rgb) > 0:
+                    mean_rgb = clean_rgb.mean(dim=0).cpu().numpy()
+                    obj_color = (
+                        float(np.clip(mean_rgb[0], 0.0, 1.0)),
+                        float(np.clip(mean_rgb[1], 0.0, 1.0)),
+                        float(np.clip(mean_rgb[2], 0.0, 1.0)),
+                        1.0
+                    )
+                else:
+                    obj_color = (0.5, 0.5, 0.5, 1.0)
 
                 body_id = self.digital_twin.spawn_mesh_object(
                     obj_id=spawned_obstacles,
@@ -765,7 +782,7 @@ class DremaDynamicSuite:
                     initial_position=tuple(center.tolist()),
                     initial_orientation=(0, 0, 0, 1),
                     color=obj_color,
-                    is_target=is_target
+                    is_target=False
                 )
 
                 self.tracked_objects[spawned_obstacles] = {
@@ -784,7 +801,10 @@ class DremaDynamicSuite:
                 # Add Marching Cubes mesh to Viser 3D Web Visualizer
                 self._add_viser_obstacle_mesh(obj_name, spawned_obstacles, comp)
 
-                print(f"✓ Spawned '{obj_name}' in PyBullet Digital Twin (Body ID: {body_id}) from Marching Cubes surface mesh")
+                print(f"   -> Object #{spawned_obstacles} ('{obj_name}'):")
+                print(f"      Center: [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}] m | Extents: [{extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f}] m")
+                print(f"      Associated Gaussians: {len(clean_xyz):,} | Real RGB Color: [{obj_color[0]:.2f}, {obj_color[1]:.2f}, {obj_color[2]:.2f}]")
+                print(f"      Spawned in PyBullet Digital Twin (Body ID: {body_id})")
                 spawned_obstacles += 1
         else:
             print("[DREMA Discovery] Marching Cubes yielded 0 tabletop obstacle vertices above table.")
@@ -958,6 +978,12 @@ class DremaDynamicSuite:
                     self.digital_twin.sync_object_pose(oid, new_pos, quat)
                     self.tracked_objects[oid]['last_pos'] = new_pos
                     self.tracked_objects[oid]['last_quat'] = quat
+
+                    # Synchronize Marching Cubes obstacle mesh in Viser Web Visualizer in real-time
+                    mesh_handle = self.viser_handles.get(f"mesh_{oid}")
+                    if mesh_handle is not None:
+                        mesh_handle.position = new_pos
+                        mesh_handle.wxyz = (quat[3], quat[0], quat[1], quat[2])
         except Exception:
             pass
 
@@ -1027,8 +1053,8 @@ class DremaDynamicSuite:
                             workspace_bounds=workspace_bounds_t,
                             is_initial_timestep=False,
                             num_views=len(camera_views),
-                            robot_ids=self.robot_ids,
-                            target_object_ids=self.target_object_ids
+                            robot_ids=(self.robot_ids | self.virtual_ids),
+                            target_object_ids=self.dynamic_object_ids
                         )
 
                         # Apply pruning
@@ -1063,36 +1089,57 @@ class DremaDynamicSuite:
             if self.total_frames_processed % 3 == 0:
                 self._update_viser_gaussians()
 
-            if self.total_frames_processed % 20 == 0:
-                print(f"[VG-Mapping] Ingested Frame #{timestep} ({len(camera_views)} views) in {elapsed:.1f}ms")
+            if self.total_frames_processed % 10 == 0:
+                print(f"[Dynamic Inference #{timestep:04d}] Active Gaussians: {len(self.scene_gaussians['xyz']):,} | Loop Latency: {elapsed:.1f}ms | Tracked Objects: {len(self.tracked_objects)}")
 
             self.frame_queue.task_done()
 
     def _update_viser_gaussians(self):
-        """Updates the live 3D Gaussian point cloud in Viser Web Visualizer."""
+        """Updates the live 3D Gaussian Splats in Viser Web Visualizer."""
         if self.viser_server is None or len(self.scene_gaussians['xyz']) == 0:
             return
         try:
             pts_np = self.scene_gaussians['xyz'].detach().cpu().numpy()
             rgb_np = self.scene_gaussians['rgb'].detach().cpu().numpy()
+            scale_np = self.scene_gaussians['scale'].detach().cpu().numpy()
             rgb_np = np.clip(rgb_np, 0.0, 1.0)
 
-            # Subsample if large for responsive 60fps web streaming
+            # Subsample if extremely large for responsive 60fps web streaming
             if len(pts_np) > 50000:
                 sub = np.random.choice(len(pts_np), 50000, replace=False)
                 pts_np = pts_np[sub]
                 rgb_np = rgb_np[sub]
+                scale_np = scale_np[sub]
 
-            h = self.viser_server.scene.add_point_cloud(
+            # Construct anisotropic covariance matrix for true 3D Gaussian Splats
+            covariances = np.zeros((len(pts_np), 3, 3), dtype=np.float32)
+            covariances[:, 0, 0] = np.square(np.maximum(scale_np[:, 0], 1e-4))
+            covariances[:, 1, 1] = np.square(np.maximum(scale_np[:, 1], 1e-4))
+            covariances[:, 2, 2] = np.square(np.maximum(scale_np[:, 2], 1e-4))
+            opacities = np.full((len(pts_np), 1), 0.95, dtype=np.float32)
+
+            h = self.viser_server.scene.add_gaussian_splats(
                 name="/scene/gaussians",
-                points=pts_np,
-                colors=rgb_np,
-                point_size=0.005,
-                point_shape="circle"
+                centers=pts_np,
+                covariances=covariances,
+                rgbs=rgb_np,
+                opacities=opacities,
+                scale=1.0
             )
             self.viser_handles['gaussians'] = h
         except Exception:
-            pass
+            # Fallback to point cloud if add_gaussian_splats encounters an issue
+            try:
+                h = self.viser_server.scene.add_point_cloud(
+                    name="/scene/gaussians",
+                    points=pts_np,
+                    colors=rgb_np,
+                    point_size=0.008,
+                    point_shape="circle"
+                )
+                self.viser_handles['gaussians'] = h
+            except Exception:
+                pass
 
     def on_request_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
         """gRPC callback triggered when CoppeliaSim requests joint velocity command."""
@@ -1142,7 +1189,8 @@ class DremaDynamicSuite:
         self.accumulated_scan_frames = []
         self.semantic_labels = {}
         self.robot_ids = set()
-        self.target_object_ids = set()
+        self.virtual_ids = set()
+        self.dynamic_object_ids = set()
         self.tracked_objects = {}
         self.active_workspace_bounds = None
         self.workspace_bounds_t = None
