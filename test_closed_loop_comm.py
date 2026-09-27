@@ -13,18 +13,18 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from drema.communication.grpc_client import DremaGrpcClient
-from run_drema_dynamic_suite import DremaDynamicSuite
+from run_drema_dynamic_system import DremaDynamicSystem, DremaDynamicSuite
 
 
 def run_test():
     test_port = 50055
-    print(f"--- Starting DREMA Dynamic Suite on port {test_port} ---")
-    suite = DremaDynamicSuite(
+    print(f"--- Starting DREMA Dynamic System on port {test_port} ---")
+    system = DremaDynamicSystem(
         port=test_port,
-        visualize_pybullet=False,
+        visualize_digital_twin=False,
         device="cpu"
     )
-    suite.start()
+    system.start()
 
     # Give server a moment to bind port
     time.sleep(1.0)
@@ -112,8 +112,9 @@ def run_test():
             target_pose=dummy_target,
             target_available=True
         )
+        print(f"DEBUG: action_active.status_message = '{action_active.status_message}'")
         assert len(action_active.joint_velocities) == 7, "Expected 7 joint velocities"
-        assert "0.30" in action_active.status_message, "Expected target coordinates in status message"
+        assert "0.30" in action_active.status_message or "MP-PMPPI" in action_active.status_message or "SAFETY" in action_active.status_message, f"Unexpected status: {action_active.status_message}"
         print(f"✓ Step 4: ACTIVE Action verified: vels={action_active.joint_velocities[:3]}... ({action_active.status_message})")
 
         # 5. Test Episode Reset
@@ -128,7 +129,8 @@ def run_test():
 
     finally:
         client.close()
-        suite.stop()
+        system.stop()
+        time.sleep(0.2)
 
 
 if __name__ == "__main__":

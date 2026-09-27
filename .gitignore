@@ -169,3 +169,9 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# DREMA Scanned Meshes, Caches & Scratch artifacts
+assets/scanned_meshes/
+cache/
+scratch/test_cache/
+scratch/*_cache/

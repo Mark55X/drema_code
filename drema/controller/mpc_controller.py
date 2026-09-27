@@ -23,11 +23,12 @@ from .mp_pmppi_engine import MPPMPPIEngine
 class MPCController:
     """
     MP-PMPPI Controller interface for Franka Panda 7-DOF manipulator.
-    Directly interfaces with CoppeliaSim via gRPC and PyBullet Digital Twin.
+    Directly interfaces with environment via gRPC and Digital Twin.
     """
 
     def __init__(
         self,
+        digital_twin: Optional[Any] = None,
         num_joints: int = 7,
         max_joint_velocity: float = 0.50,         # rad/s execution limit
         safety_collision_distance: float = 0.0,   # Physical penetration limit (<= 0 is hard contact)
@@ -37,6 +38,7 @@ class MPCController:
         top_k: int = 12,                          # Candidates evaluated by the Judge
         max_joint_acc: float = 0.50               # Joint acceleration saturation limit (rad/s^2)
     ):
+        self.digital_twin = digital_twin
         self.num_joints = num_joints
         self.max_joint_velocity = max_joint_velocity
         self.safety_collision_distance = safety_collision_distance
@@ -57,21 +59,27 @@ class MPCController:
             alpha_sigma=0.2
         )
 
+    def set_digital_twin(self, digital_twin: Any) -> None:
+        """Sets or updates the Digital Twin reference."""
+        self.digital_twin = digital_twin
+
     def compute_action(
         self,
         robot_state: drema_comm_pb2.RobotState,
-        digital_twin=None,
+        digital_twin: Optional[Any] = None,
         target_goal: Optional[np.ndarray] = None
     ) -> drema_comm_pb2.ControlAction:
         """
         Calculates optimal joint velocity action using MP-PMPPI given current state
-        and PyBullet digital twin environment.
+        and Digital Twin environment.
 
-        :param robot_state: Current state from CoppeliaSim (joint angles, velocities, ee_pose).
-        :param digital_twin: PyBulletDigitalTwin instance for collision evaluation.
+        :param robot_state: Current state from environment (joint angles, velocities, ee_pose).
+        :param digital_twin: Optional Digital Twin instance override (defaults to self.digital_twin).
         :param target_goal: Optional 3D position [x, y, z] of target.
         :return: ControlAction message with 7 joint velocities.
         """
+        if digital_twin is None:
+            digital_twin = self.digital_twin
         # 1. Early input validation: ensure strict 7-joint Franka Panda compatibility
         if len(robot_state.joint_positions) != self.num_joints:
             return drema_comm_pb2.ControlAction(

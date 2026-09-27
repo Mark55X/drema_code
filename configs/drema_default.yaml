@@ -1,0 +1,74 @@
+# ==============================================================================
+# DREMA Dynamic System Configuration
+# ==============================================================================
+
+# ------------------------------------------------------------------------------
+# 1. System, Networking & Web Visualization
+# ------------------------------------------------------------------------------
+system:
+  device: "auto"                    # Computation device ("auto", "cuda", or "cpu")
+  grpc_port: 50051                  # gRPC server port for simulation environment / real robot
+  viser:
+    enabled: true                   # Launch real-time 3D Viser Web Visualizer
+    port: 8080                      # Web visualizer port (http://localhost:8080)
+    update_decimation: 3            # Push to Viser every N perception steps
+    max_splats: 50000               # Max Gaussians displayed in web browser for responsive 60fps
+
+# ------------------------------------------------------------------------------
+# 2. Perception & 3D Dynamic Reconstruction Pipeline
+# ------------------------------------------------------------------------------
+perception:
+  module: "vg_mapping_recurgs"       # Perception backend identifier ("vg_mapping_recurgs")
+  frequency_hz: 10.0                 # Target perception / dynamic tracking loop rate (Hz)
+  queue_max_size: 5                  # Max camera observation queue size (prevents frame latency lag)
+  voxel_size: 0.01                   # TSDF volumetric grid resolution in meters (0.01 = 1cm)
+
+  # Workspace & Table Segmentation Priors
+  workspace:
+    table_z_prior: 0.75              # Prior guess for tabletop elevation in meters
+    reachability_radius: 0.95        # Franka Panda reachability radius in meters
+    robot_base_radius: 0.13          # Exclusion cylinder radius around robot base in meters
+    obstacle_min_clearance_z: 0.015  # Minimum clearance above table to isolate objects from surface noise
+
+  # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
+  gaussians:
+    scale_tangent_min: 0.012         # Min radius across surface tangent plane (meters) to seal voxel gaps
+    scale_normal_min: 0.003          # Min thickness through surface normal (meters)
+    opacity_init: 0.95               # Initial opacity for reconstructed surface primitives
+
+  # RecurGS SE(3) Rigid Object Tracking
+  tracking:
+    se3_iterations: 15               # Lie algebra gradient optimization iterations per frame
+    se3_icp_iterations: 12           # Coarse ICP alignment iterations
+    subsample: 256                   # Subsampled points per object for real-time tracking
+    learning_rate: 0.003             # Step size in se(3) tangent space
+    tolerance: 0.0001                # Convergence criterion
+    proximity_search_radius: 0.25    # Bounding sphere search radius around last known position in meters
+
+  # Initial Scan (t=0) Caching
+  cache:
+    enabled: false                   # When True, attempts instant restore of t=0 scan from disk
+    save_on_scan: false              # When True, saves t=0 scan tensors and meshes to disk
+    cache_dir: "cache/scene_init"    # Directory where scene_gaussians.pt, tsdf.pt, meshes are stored
+
+# ------------------------------------------------------------------------------
+# 3. Digital Twin Engine
+# ------------------------------------------------------------------------------
+digital_twin:
+  engine: "pybullet"                 # Physics engine backend ("pybullet" or "isaac")
+  gui: true                          # Show native physics visualizer window
+  time_step: 0.002                   # Physics simulation time step in seconds
+  urdf_path: "assets/franka_panda/panda.urdf"
+
+# ------------------------------------------------------------------------------
+# 4. Controller (MP-PMPPI)
+# ------------------------------------------------------------------------------
+controller:
+  engine: "mp_pmppi"                 # Controller architecture
+  frequency_hz: 20.0                 # Control execution and planning frequency (Hz)
+  dt: 0.05                           # MPPI prediction time step dt (seconds)
+  horizon: 15                        # MPPI prediction horizon H (15 * 0.05s = 0.75s)
+  max_joint_velocity: 0.50           # Maximum joint velocity execution limit (rad/s)
+  max_joint_acc: 0.50                # Joint acceleration saturation limit (rad/s^2)
+  num_samples_per_planner: 24        # Stochastic samples per MPPI strategy
+  top_k: 12                          # Top candidates evaluated by the Judge

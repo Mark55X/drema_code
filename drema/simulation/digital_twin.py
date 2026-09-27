@@ -16,9 +16,10 @@ from typing import Optional, Tuple, List, Dict, Union
 
 import pybullet as p
 import pybullet_data
+from .base_twin import BaseDigitalTwin
 
 
-class PyBulletDigitalTwin:
+class PyBulletDigitalTwin(BaseDigitalTwin):
     """
     Physical Digital Twin of the manipulation scene running in PyBullet.
     """
@@ -316,6 +317,29 @@ class PyBulletDigitalTwin:
             print(f"[DigitalTwin Error] Failed to spawn mesh object {obj_id}: {e}")
             return -1
 
+    def spawn_scanned_mesh_obstacle(
+        self,
+        mesh_path: str,
+        initial_pos: Tuple[float, float, float],
+        initial_quat: Tuple[float, float, float, float] = (0, 0, 0, 1),
+        name: str = "obstacle",
+        is_target: bool = False,
+        mass: float = 0.0,
+        color: Optional[List[float]] = None,
+        obj_id: Optional[int] = None
+    ) -> int:
+        """Alias matching BaseDigitalTwin contract."""
+        target_obj_id = obj_id if obj_id is not None else len(self.tracked_objects)
+        col = tuple(color) if color is not None else (0.2, 0.45, 0.85, 1.0)
+        return self.spawn_mesh_object(
+            obj_id=target_obj_id,
+            mesh_file_path=mesh_path,
+            initial_position=initial_pos,
+            initial_orientation=initial_quat,
+            color=col,
+            is_target=is_target
+        )
+
     def spawn_box_object(
         self,
         obj_id: int,
@@ -410,6 +434,17 @@ class PyBulletDigitalTwin:
         pos = (float(position[0]), float(position[1]), float(pos_z))
         p.resetBasePositionAndOrientation(body_id, pos, orientation)
 
+    def get_object_pose(
+        self,
+        obj_id: int
+    ) -> Optional[Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]]:
+        """Retrieves rigid body position and orientation for the given object ID."""
+        if obj_id in self.tracked_objects and self.client_id >= 0:
+            body_id = self.tracked_objects[obj_id]['body_id']
+            pos, orn = p.getBasePositionAndOrientation(body_id)
+            return tuple(pos), tuple(orn)
+        return None
+
     def get_min_obstacle_distance(self) -> float:
         """
         Calculates the minimum clearance distance between the Franka Panda arm and
@@ -444,6 +479,9 @@ class PyBulletDigitalTwin:
         if self.client_id >= 0:
             p.stepSimulation()
 
+    def step_simulation(self):
+        self.step()
+
     def reset(self):
         """Resets the Digital Twin for a new episode."""
         self.clear_dynamic_objects()
@@ -458,3 +496,6 @@ class PyBulletDigitalTwin:
         if self.client_id >= 0:
             p.disconnect(self.client_id)
             self.client_id = -1
+
+    def shutdown(self):
+        self.close()
