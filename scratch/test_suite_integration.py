@@ -20,7 +20,8 @@ for p in [drema_root, thesis_root]:
         sys.path.insert(0, p)
 
 from drema.config import load_config
-from drema.simulation.digital_twin import PyBulletDigitalTwin
+from drema.simulation.pybullet_digital_twin import PyBulletDigitalTwin
+from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.perception.base_perception import InitialScanResult, StreamingUpdateResult
 from run_drema_dynamic_system import DremaDynamicSystem
@@ -76,6 +77,51 @@ def test_digital_twin():
     twin.reset()
     twin.shutdown()
     print("  ✓ Digital Twin reset and shutdown cleanly")
+
+
+def test_mujoco_digital_twin():
+    print("\n--- [TEST 1b] Digital Twin (MuJoCo) Contract & Execution ---")
+    twin = MuJoCoDigitalTwin(visualize=False, table_z=0.75, tracking_mode="constraint")
+
+    # 1. Load robot
+    success = twin.load_robot(base_position=(0.0, 0.0, 0.75), joint_positions=[0.0]*7)
+    assert success is True and twin.robot_id >= 0, "MuJoCo Robot failed to load"
+    print("  ✓ MuJoCo Robot loaded with ID:", twin.robot_id)
+
+    # 2. Table
+    table_id = twin.spawn_scanned_table(table_z=0.75, bounds=(-0.5, 0.8, -0.4, 0.4))
+    assert table_id >= 0, "MuJoCo Table failed to spawn"
+    print("  ✓ MuJoCo Table spawned with ID:", table_id)
+
+    # 3. Obstacle
+    mesh_path = create_synthetic_cube_mesh("assets/scanned_meshes/test_cube_mj.obj")
+    obs_body_id = twin.spawn_scanned_mesh_obstacle(
+        mesh_path=mesh_path,
+        initial_pos=(0.4, 0.0, 0.80),
+        obj_id=0,
+        name="test_cube_mj"
+    )
+    assert obs_body_id >= 0, "MuJoCo Obstacle failed to spawn"
+    print("  ✓ MuJoCo Obstacle spawned with ID:", obs_body_id)
+
+    # 4. Sync pose
+    twin.sync_object_pose(obj_id=0, position=(0.45, 0.05, 0.80), orientation=(0, 0, 0, 1))
+    for _ in range(25):
+        twin.step()
+    pos, quat = twin.get_object_pose(obj_id=0)
+    assert abs(pos[0] - 0.45) < 1e-2 and abs(pos[1] - 0.05) < 1e-2, f"Unexpected pos: {pos}"
+    print("  ✓ MuJoCo Object pose synchronized to:", pos)
+
+    # 5. Step & distance
+    twin.step()
+    min_d = twin.get_min_obstacle_distance()
+    assert min_d > 0, "Expected positive distance to obstacle"
+    print(f"  ✓ MuJoCo Min distance calculated: {min_d:.3f}m")
+
+    # 6. Reset & shutdown
+    twin.reset()
+    twin.shutdown()
+    print("  ✓ MuJoCo Digital Twin reset and shutdown cleanly")
 
 
 def test_perception_and_caching():
@@ -232,6 +278,7 @@ def test_grpc_suite_lifecycle():
 
 if __name__ == "__main__":
     test_digital_twin()
+    test_mujoco_digital_twin()
     test_perception_and_caching()
     test_grpc_suite_lifecycle()
     print("\n=======================================================")
