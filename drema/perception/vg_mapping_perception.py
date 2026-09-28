@@ -143,6 +143,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.raycast_steps = map_cfg.get("raycast_steps", None)
         self.tau_p = float(map_cfg.get("tau_p", 0.2))
         self.max_weight = float(map_cfg.get("max_weight", 15.0))
+        self.safety_margin_factor = float(map_cfg.get("safety_margin_factor", 1.0))
 
         # Diagnostics & Timing Breakdown
         diag_cfg = config.get_nested("perception.diagnostics", {})
@@ -339,6 +340,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             origin=self.grid_origin,
             max_weight=self.max_weight,
             tau_p=self.tau_p,
+            safety_margin_factor=self.safety_margin_factor,
             device=self.device
         )
 
@@ -1013,6 +1015,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 origin=self.grid_origin,
                 max_weight=self.max_weight,
                 tau_p=self.tau_p,
+                safety_margin_factor=self.safety_margin_factor,
                 device=self.device
             )
             tsdf_loaded = torch.load(tsdf_path, map_location=self.device, weights_only=False)

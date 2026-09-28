@@ -786,6 +786,7 @@ def parse_args():
     parser.add_argument("--raycast_stride", type=int, default=None, help="Pixel stride for raycast pruning (1 = full dense, 2 = 2x subsampled)")
     parser.add_argument("--tau_p", type=float, default=None, help="TSDF surface pruning threshold (e.g. 0.35)")
     parser.add_argument("--max_weight", type=float, default=None, help="TSDF maximum integration weight clamp (e.g. 10.0)")
+    parser.add_argument("--safety_margin_factor", type=float, default=None, help="Stopping distance factor for raycast pruning (paper: 1.0)")
     parser.add_argument("--se3_iterations", type=int, default=None, help="Lie algebra SE(3) optimization iterations (overrides config)")
     parser.add_argument("--se3_icp_iterations", type=int, default=None, help="Coarse ICP iterations (overrides config)")
     parser.add_argument("--se3_subsample", type=int, default=None, help="Max subsampled points per object (overrides config)")
@@ -826,6 +827,8 @@ if __name__ == "__main__":
         cfg.set_nested("perception.mapping.tau_p", args.tau_p)
     if args.max_weight is not None:
         cfg.set_nested("perception.mapping.max_weight", args.max_weight)
+    if args.safety_margin_factor is not None:
+        cfg.set_nested("perception.mapping.safety_margin_factor", args.safety_margin_factor)
     if args.se3_iterations is not None:
         cfg.set_nested("perception.tracking.se3_iterations", args.se3_iterations)
     if args.se3_icp_iterations is not None:

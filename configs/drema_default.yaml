@@ -23,6 +23,7 @@ communication:
     ping_max_retries: 3             # Consecutive failed pings before declaring server disconnected
     scan_chunk_size: 2              # Number of views per chunk transmission (halves message size for SSH stability)
     scan_chunk_timeout_s: 180.0     # Generous timeout per chunk over SSH jump proxy
+    cam_resolution: [256, 256]      # Online dynamic streaming camera resolution [width, height]
 
 # ------------------------------------------------------------------------------
 # 3. Perception & 3D Dynamic Reconstruction Pipeline
@@ -53,6 +54,7 @@ perception:
     tau_p: 0.35                      # Pruning TSDF surface threshold (paper: 0.2, widened to 0.35 for robust hull capture)
     tau_w: null                      # Geometry variation weight threshold (null = view count based)
     max_weight: 3.0                  # Max TSDF weight clamp to enable rapid dynamic clearing in 2-3 frames
+    safety_margin_factor: 1.0        # Stopping distance factor for raycast pruning (paper Eq. 17: 1.0 * voxel_size = 1cm)
 
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:

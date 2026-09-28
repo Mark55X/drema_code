@@ -57,7 +57,8 @@ class CoppeliaSimulationClient:
         scan_chunk_timeout: float = 180.0,
         ping_timeout: float = 1.5,
         ping_max_retries: int = 3,
-        force_scan: bool = False
+        force_scan: bool = False,
+        cam_resolution: Tuple[int, int] = (256, 256)
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -73,6 +74,7 @@ class CoppeliaSimulationClient:
         self.ping_timeout = float(ping_timeout)
         self.ping_max_retries = int(ping_max_retries)
         self.force_scan = bool(force_scan)
+        self.cam_resolution = tuple(cam_resolution)
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -291,15 +293,15 @@ class CoppeliaSimulationClient:
         obs_config = ObservationConfig()
         obs_config.front_camera.rgb = True
         obs_config.front_camera.depth = True
-        obs_config.front_camera.image_size = (128, 128)
+        obs_config.front_camera.image_size = self.cam_resolution
 
         obs_config.wrist_camera.rgb = True
         obs_config.wrist_camera.depth = True
-        obs_config.wrist_camera.image_size = (128, 128)
+        obs_config.wrist_camera.image_size = self.cam_resolution
 
         obs_config.overhead_camera.rgb = True
         obs_config.overhead_camera.depth = True
-        obs_config.overhead_camera.image_size = (128, 128)
+        obs_config.overhead_camera.image_size = self.cam_resolution
 
         action_mode = ActionMode(arm_action_mode=JointVelocity(), gripper_action_mode=Discrete())
         self.env = Environment(
@@ -597,6 +599,8 @@ def parse_args():
     parser.add_argument("--ping_timeout", type=float, default=1.5, help="gRPC ping timeout in seconds (default: 1.5)")
     parser.add_argument("--ping_retries", type=int, default=3, help="Consecutive failed pings before holding (default: 3)")
     parser.add_argument("--force_scan", action="store_true", default=False, help="Force orbital scan even if DREMA server has cached scene ready")
+    parser.add_argument("--cam_resolution", type=int, nargs=2, default=[256, 256], metavar=("WIDTH", "HEIGHT"),
+                        help="Streaming camera resolution [width, height] (default: 256 256)")
     return parser.parse_args()
 
 
@@ -616,6 +620,7 @@ if __name__ == "__main__":
         scan_chunk_timeout=args.scan_chunk_timeout,
         ping_timeout=args.ping_timeout,
         ping_max_retries=args.ping_retries,
-        force_scan=args.force_scan
+        force_scan=args.force_scan,
+        cam_resolution=args.cam_resolution
     )
     client.run()
