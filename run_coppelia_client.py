@@ -56,7 +56,8 @@ class CoppeliaSimulationClient:
         scan_chunk_size: int = 2,
         scan_chunk_timeout: float = 180.0,
         ping_timeout: float = 1.5,
-        ping_max_retries: int = 3
+        ping_max_retries: int = 3,
+        force_scan: bool = False
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -71,6 +72,7 @@ class CoppeliaSimulationClient:
         self.scan_chunk_timeout = float(scan_chunk_timeout)
         self.ping_timeout = float(ping_timeout)
         self.ping_max_retries = int(ping_max_retries)
+        self.force_scan = bool(force_scan)
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -105,7 +107,8 @@ class CoppeliaSimulationClient:
         # Initialize RLBench Environment
         self._init_rlbench()
 
-        self.initial_scan_done = False
+        if self.force_scan:
+            self.initial_scan_done = False
 
         # Start interactive CLI listener thread
         self.cli_thread = threading.Thread(target=self._cli_listener, daemon=True)
@@ -353,7 +356,7 @@ class CoppeliaSimulationClient:
                     break
                 cmd = cmd.strip().lower()
 
-                if cmd in ['start', 'run', '']:
+                if cmd in ['start', 'run']:
                     self.task_active = True
                     print(f"\n[CLI] >>> TASK STARTED! Robot closed-loop control engaged (f_ctrl={self.ctrl_fps}Hz).\n")
                 elif cmd in ['scan', 's']:
@@ -544,11 +547,12 @@ class CoppeliaSimulationClient:
                 self.task._task.step()  # Moves oscillating tunnel obstacle
                 self.env._pyrep.step()
 
-                # 6. Check Task Success Condition
-                success, terminate = self.task._task.success()
-                if success:
-                    print(f"\n★ TASK SUCCESS ACHIEVED at step {self.step_counter}! Target touched cleanly.\n")
-                    self.task_active = False
+                # 6. Check Task Success Condition (only when robot is actively executing task)
+                if self.task_active:
+                    success, terminate = self.task._task.success()
+                    if success:
+                        print(f"\n★ TASK SUCCESS ACHIEVED at step {self.step_counter}! Target touched cleanly.\n")
+                        self.task_active = False
 
                 # 7. Synchronization timing
                 elapsed = time.time() - loop_start
@@ -558,15 +562,21 @@ class CoppeliaSimulationClient:
                         time.sleep(sleep_time)
 
         except KeyboardInterrupt:
-            print("\n[CoppeliaClient] Interrupted by user.")
+            print("\n[CoppeliaClient] Interrupted by user (Ctrl+C). Stopping simulation...")
         finally:
             self.shutdown()
 
     def shutdown(self):
         self.running = False
-        self.client.close()
+        try:
+            self.client.close()
+        except Exception:
+            pass
         if hasattr(self, 'env'):
-            self.env.shutdown()
+            try:
+                self.env.shutdown()
+            except Exception:
+                pass
         print("✓ CoppeliaSim Client cleanly stopped.")
 
 
@@ -586,6 +596,7 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
     parser.add_argument("--ping_timeout", type=float, default=1.5, help="gRPC ping timeout in seconds (default: 1.5)")
     parser.add_argument("--ping_retries", type=int, default=3, help="Consecutive failed pings before holding (default: 3)")
+    parser.add_argument("--force_scan", action="store_true", default=False, help="Force orbital scan even if DREMA server has cached scene ready")
     return parser.parse_args()
 
 
@@ -604,6 +615,7 @@ if __name__ == "__main__":
         scan_chunk_size=args.scan_chunk_size,
         scan_chunk_timeout=args.scan_chunk_timeout,
         ping_timeout=args.ping_timeout,
-        ping_max_retries=args.ping_retries
+        ping_max_retries=args.ping_retries,
+        force_scan=args.force_scan
     )
     client.run()

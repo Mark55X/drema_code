@@ -47,12 +47,12 @@ perception:
 
   # Online Raycast Pruning & VDC Mapping
   mapping:
-    raycast_stride: 2                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
+    raycast_stride: 1                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
     raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
     tau_s: 0.15                      # SSIM appearance variation detection threshold
-    tau_p: 0.20                      # Pruning TSDF surface threshold (paper: 0.2)
+    tau_p: 0.35                      # Pruning TSDF surface threshold (paper: 0.2, widened to 0.35 for robust hull capture)
     tau_w: null                      # Geometry variation weight threshold (null = view count based)
-    max_weight: 15.0                 # Max TSDF weight clamp to enable rapid dynamic clearing in 3-4 frames
+    max_weight: 3.0                  # Max TSDF weight clamp to enable rapid dynamic clearing in 2-3 frames
 
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:

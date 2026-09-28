@@ -387,6 +387,8 @@ class DremaDynamicSystem:
         self.perception.reset()
         self.digital_twin.reset()
         self.mpc_controller.reset()
+        if bool(self.config.get_nested("perception.cache.enabled", False)):
+            self._try_startup_cache_restore()
         return True
 
     def _process_initial_scene_scan(self, semantic_labels: Optional[Dict[str, int]] = None) -> bool:
@@ -426,6 +428,23 @@ class DremaDynamicSystem:
                     base_position=tuple(self.robot_base_pos.tolist()),
                     joint_positions=list(self.robot_joint_positions)
                 )
+
+            # Save raw scan frames to disk cache if enabled and frames are present
+            if len(self.accumulated_scan_frames) > 0 and bool(self.config.get_nested("perception.cache.save_on_scan", False)):
+                try:
+                    cache_dir = self.config.get_nested("perception.cache.cache_dir", "cache/scene_init")
+                    os.makedirs(cache_dir, exist_ok=True)
+                    raw_frames_path = os.path.join(cache_dir, "scan_frames.pt")
+                    torch.save({
+                        'scan_frames': self.accumulated_scan_frames,
+                        'semantic_labels': semantic_labels or {},
+                        'robot_base_pos': self.robot_base_pos,
+                        'robot_joint_positions': self.robot_joint_positions,
+                        'reachability_radius': self.reachability_radius
+                    }, raw_frames_path)
+                    print(f"✓ [Perception Cache] Saved {len(self.accumulated_scan_frames)} raw scan frames to '{raw_frames_path}'")
+                except Exception as e:
+                    print(f"[Perception Cache Notice] Failed to save raw scan frames to disk: {e}")
 
             self.initial_scan_ready = True
             print(f"\n✓ [DREMA DYNAMIC SYSTEM] Initial Scene Setup Complete! Active Workspace Ready.")
@@ -644,16 +663,67 @@ class DremaDynamicSystem:
 
         return action
 
+    def _try_startup_cache_restore(self) -> bool:
+        """
+        Attempts to initialize the scene from disk cache.
+        Supports:
+        1. Local GPU reconstruction from saved raw scan frames (scan_frames.pt) in ~5s without network transfer.
+        2. Instant restoration from pre-computed 3D Gaussians (scene_gaussians.pt) in <0.5s.
+        """
+        if not bool(self.config.get_nested("perception.cache.enabled", False)):
+            return False
+
+        cache_dir = self.config.get_nested("perception.cache.cache_dir", "cache/scene_init")
+        g_path = os.path.join(cache_dir, "scene_gaussians.pt")
+        frames_path = os.path.join(cache_dir, "scan_frames.pt")
+        force_recompute = bool(self.config.get_nested("perception.cache.recompute_scan", False))
+
+        # Mode A: Reconstruct locally on GPU from cached raw frames (if explicitly requested or if Gaussians missing)
+        if (force_recompute or not os.path.exists(g_path)) and os.path.exists(frames_path):
+            try:
+                print(f"\n=======================================================")
+                print(f"⚡ [DREMA DYNAMIC SYSTEM] Found cached raw frames in '{frames_path}'!")
+                print(f"   Reconstructing scene locally on {self.device.upper()} (Zero SSH transfer)...")
+                loaded = torch.load(frames_path, map_location="cpu", weights_only=False)
+                if isinstance(loaded, dict) and 'scan_frames' in loaded:
+                    self.accumulated_scan_frames = loaded['scan_frames']
+                    sem_labels = loaded.get('semantic_labels', {})
+                    if 'robot_base_pos' in loaded and len(loaded['robot_base_pos']) >= 3:
+                        self.robot_base_pos = np.array(loaded['robot_base_pos'], dtype=np.float32)
+                    if 'robot_joint_positions' in loaded and len(loaded['robot_joint_positions']) > 0:
+                        self.robot_joint_positions = list(loaded['robot_joint_positions'])
+                    if 'reachability_radius' in loaded:
+                        self.reachability_radius = float(loaded['reachability_radius'])
+                elif isinstance(loaded, list):
+                    self.accumulated_scan_frames = loaded
+                    sem_labels = {}
+                else:
+                    return False
+
+                # Temporarily disable perception cache loading so it re-runs reconstruction algorithm
+                old_cache_enabled = self.perception.cache_enabled
+                self.perception.cache_enabled = False
+                success = self._process_initial_scene_scan(semantic_labels=sem_labels)
+                self.perception.cache_enabled = old_cache_enabled
+                return success
+            except Exception as e:
+                print(f"[DREMA DYNAMIC SYSTEM] [Cache Warning] Failed to reconstruct from raw frames cache: {e}")
+                import traceback
+                traceback.print_exc()
+
+        # Mode B: Instant restoration from pre-computed 3D Gaussians & TSDF map
+        if os.path.exists(g_path):
+            try:
+                print(f"\n[DREMA DYNAMIC SYSTEM] Restoring initial scene from cache '{cache_dir}' at startup...")
+                return self._process_initial_scene_scan()
+            except Exception as e:
+                print(f"[DREMA DYNAMIC SYSTEM] [Cache Note] Startup cache restore skipped: {e}")
+
+        return False
+
     def start(self):
         """Starts the DREMA gRPC Server."""
-        if bool(self.config.get_nested("perception.cache.enabled", False)):
-            cache_dir = self.config.get_nested("perception.cache.cache_dir", "cache/scene_init")
-            if os.path.exists(os.path.join(cache_dir, "scene_gaussians.pt")):
-                try:
-                    print(f"\n[DREMA DYNAMIC SYSTEM] Restoring initial scene from cache '{cache_dir}' at startup...")
-                    self._process_initial_scene_scan()
-                except Exception as e:
-                    print(f"[DREMA DYNAMIC SYSTEM] [Cache Note] Startup cache restore skipped: {e}")
+        self._try_startup_cache_restore()
         self.server.start()
 
     def stop(self):
@@ -709,8 +779,13 @@ def parse_args():
     parser.add_argument("--cache", "--load_cache", dest="load_cache", action="store_true", default=None, help="Restore initial scene scan from disk cache (fast startup)")
     parser.add_argument("--save_cache", dest="save_cache", action="store_true", default=None, help="Save initial scene scan results to disk cache")
     parser.add_argument("--cache_dir", type=str, default=None, help="Directory for scene cache files (default: cache/scene_init)")
+    parser.add_argument("--recompute_scan", "--reconstruct_from_frames", dest="recompute_scan", action="store_true", default=None,
+                        help="Reconstruct initial scene from cached raw frames (scan_frames.pt) instead of loading precomputed Gaussians")
 
     # Perception & Tracking Overrides
+    parser.add_argument("--raycast_stride", type=int, default=None, help="Pixel stride for raycast pruning (1 = full dense, 2 = 2x subsampled)")
+    parser.add_argument("--tau_p", type=float, default=None, help="TSDF surface pruning threshold (e.g. 0.35)")
+    parser.add_argument("--max_weight", type=float, default=None, help="TSDF maximum integration weight clamp (e.g. 10.0)")
     parser.add_argument("--se3_iterations", type=int, default=None, help="Lie algebra SE(3) optimization iterations (overrides config)")
     parser.add_argument("--se3_icp_iterations", type=int, default=None, help="Coarse ICP iterations (overrides config)")
     parser.add_argument("--se3_subsample", type=int, default=None, help="Max subsampled points per object (overrides config)")
@@ -743,6 +818,14 @@ if __name__ == "__main__":
         cfg.set_nested("perception.cache.save_on_scan", args.save_cache)
     if args.cache_dir is not None:
         cfg.set_nested("perception.cache.cache_dir", args.cache_dir)
+    if args.recompute_scan is not None:
+        cfg.set_nested("perception.cache.recompute_scan", args.recompute_scan)
+    if args.raycast_stride is not None:
+        cfg.set_nested("perception.mapping.raycast_stride", args.raycast_stride)
+    if args.tau_p is not None:
+        cfg.set_nested("perception.mapping.tau_p", args.tau_p)
+    if args.max_weight is not None:
+        cfg.set_nested("perception.mapping.max_weight", args.max_weight)
     if args.se3_iterations is not None:
         cfg.set_nested("perception.tracking.se3_iterations", args.se3_iterations)
     if args.se3_icp_iterations is not None:
