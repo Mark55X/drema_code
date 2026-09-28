@@ -50,7 +50,9 @@ perception:
     raycast_stride: 2                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
     raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
     tau_s: 0.15                      # SSIM appearance variation detection threshold
+    tau_p: 0.20                      # Pruning TSDF surface threshold (paper: 0.2)
     tau_w: null                      # Geometry variation weight threshold (null = view count based)
+    max_weight: 15.0                 # Max TSDF weight clamp to enable rapid dynamic clearing in 3-4 frames
 
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:
@@ -77,11 +79,12 @@ perception:
 # 4. Digital Twin Engine
 # ------------------------------------------------------------------------------
 digital_twin:
-  engine: "pybullet"                 # Physics engine backend ("pybullet", "mujoco", or "isaac")
-  gui: true                          # Show native physics visualizer window
+  engine: "pybullet"                 # Physics engine backend: "pybullet" or "mujoco"
+  gui: true                          # Show native physics visualizer window (GLFW for MuJoCo, OpenGL for PyBullet)
   time_step: 0.002                   # Physics simulation time step in seconds
-  urdf_path: "assets/franka_panda/panda.urdf"
-  tracking_mode: "constraint"        # "constraint" (6-DoF constraint), "pd_force" (spring-damper), or "teleport"
+  urdf_path: "assets/franka_panda/panda.urdf"               # URDF for PyBullet backend
+  mujoco_model_path: "assets/franka_panda/panda.xml"        # MJCF XML for MuJoCo backend
+  tracking_mode: "constraint"        # "constraint" (6-DoF constraint / MuJoCo mocap-weld), "pd_force", or "teleport"
   constraint_max_force: 300.0        # Maximum force for 6-DoF constraint (N)
   kp_pos: 250.0                      # Proportional gain for PD position tracking (N/m)
   kd_pos: 30.0                       # Derivative gain for PD velocity damping (N*s/m)

@@ -33,7 +33,8 @@ from drema.communication.grpc_server import DremaGrpcServer
 from drema.communication.grpc_client import unpack_camera_frame
 from drema.communication.proto import drema_comm_pb2
 from drema.simulation.base_twin import BaseDigitalTwin
-from drema.simulation.digital_twin import PyBulletDigitalTwin
+from drema.simulation.pybullet_digital_twin import PyBulletDigitalTwin
+from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
 from drema.perception.base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
@@ -151,15 +152,15 @@ class DremaDynamicSystem:
         table_z = float(config.get_nested("perception.workspace.table_z_prior", 0.75))
         urdf_path = config.get_nested("digital_twin.urdf_path", "assets/franka_panda/panda.urdf")
 
-        if twin_engine == "pybullet":
-            tracking_mode = str(config.get_nested("digital_twin.tracking_mode", "constraint")).lower()
-            constraint_max_force = float(config.get_nested("digital_twin.constraint_max_force", 300.0))
-            kp_pos = float(config.get_nested("digital_twin.kp_pos", 250.0))
-            kd_pos = float(config.get_nested("digital_twin.kd_pos", 30.0))
-            kp_rot = float(config.get_nested("digital_twin.kp_rot", 15.0))
-            kd_rot = float(config.get_nested("digital_twin.kd_rot", 1.5))
-            sim_substeps = int(config.get_nested("digital_twin.sim_substeps", 2))
+        tracking_mode = str(config.get_nested("digital_twin.tracking_mode", "constraint")).lower()
+        constraint_max_force = float(config.get_nested("digital_twin.constraint_max_force", 300.0))
+        kp_pos = float(config.get_nested("digital_twin.kp_pos", 250.0))
+        kd_pos = float(config.get_nested("digital_twin.kd_pos", 30.0))
+        kp_rot = float(config.get_nested("digital_twin.kp_rot", 15.0))
+        kd_rot = float(config.get_nested("digital_twin.kd_rot", 1.5))
+        sim_substeps = int(config.get_nested("digital_twin.sim_substeps", 2))
 
+        if twin_engine == "pybullet":
             self.digital_twin: BaseDigitalTwin = PyBulletDigitalTwin(
                 visualize=twin_gui,
                 table_z=table_z,
@@ -172,7 +173,22 @@ class DremaDynamicSystem:
                 kd_rot=kd_rot,
                 sim_substeps=sim_substeps
             )
-            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: {twin_engine.capitalize()}, Tracking: {tracking_mode}) initialized.")
+            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
+        elif twin_engine == "mujoco":
+            mujoco_model_path = config.get_nested("digital_twin.mujoco_model_path", "assets/franka_panda/panda.xml")
+            self.digital_twin: BaseDigitalTwin = MuJoCoDigitalTwin(
+                visualize=twin_gui,
+                table_z=table_z,
+                robot_model_path=mujoco_model_path,
+                tracking_mode=tracking_mode,
+                constraint_max_force=constraint_max_force,
+                kp_pos=kp_pos,
+                kd_pos=kd_pos,
+                kp_rot=kp_rot,
+                kd_rot=kd_rot,
+                sim_substeps=sim_substeps
+            )
+            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo, Tracking: {tracking_mode}) initialized.")
         else:
             raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported digital twin engine: '{twin_engine}' (expected 'pybullet', 'mujoco')")
 

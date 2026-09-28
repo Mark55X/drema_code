@@ -5,6 +5,8 @@ matplotlib
 object2urdf
 trimesh>=3.21.7,<4.0.0
 pybullet
+mujoco>=3.2.0
+glfw>=2.10.0
 mediapy
 plyfile
 hydra-core>=1.3.2

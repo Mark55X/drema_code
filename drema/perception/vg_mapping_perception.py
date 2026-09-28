@@ -141,6 +141,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         map_cfg = config.get_nested("perception.mapping", {})
         self.raycast_stride = int(map_cfg.get("raycast_stride", 2))
         self.raycast_steps = map_cfg.get("raycast_steps", None)
+        self.tau_p = float(map_cfg.get("tau_p", 0.2))
+        self.max_weight = float(map_cfg.get("max_weight", 15.0))
 
         # Diagnostics & Timing Breakdown
         diag_cfg = config.get_nested("perception.diagnostics", {})
@@ -335,6 +337,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             voxel_size=self.voxel_size,
             grid_dim=self.grid_dim,
             origin=self.grid_origin,
+            max_weight=self.max_weight,
+            tau_p=self.tau_p,
             device=self.device
         )
 
@@ -615,7 +619,28 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                     d_masked, mask_t = self._apply_semantic_robot_mask(depth_t=d_tensor, mask_np=mask_np)
 
-                    # Step 1: TSDF integration (robot masked to 0)
+                    # Step 1: Raycast Pruning of deleted objects and floaters against prior TSDF map (Eq. 17)
+                    t_s2 = time.perf_counter()
+                    prune_mask = self.vg_pipeline.vdc.prune_gaussians_via_morton(
+                        depth_obs=d_masked,
+                        intrinsic=k_tensor,
+                        pose=t_tensor,
+                        tsdf_map=self.vg_pipeline.tsdf_map,
+                        gaussian_morton_codes=self.scene_gaussians['morton'],
+                        stride=self.raycast_stride,
+                        num_steps=self.raycast_steps
+                    )
+
+                    n_pruned = 0
+                    if len(prune_mask) > 0 and torch.any(prune_mask):
+                        n_pruned = int(prune_mask.sum().item())
+                        total_pruned_in_frame += n_pruned
+                        keep_mask = ~prune_mask
+                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                            if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
+                                self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+
+                    # Step 2: TSDF integration of current observation (updates F and W)
                     t_s1 = time.perf_counter()
                     self.vg_pipeline.step_1_ingest_frame(
                         rgb=rgb_tensor,
@@ -625,38 +650,25 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     )
                     t_tsdf_total += (time.perf_counter() - t_s1) * 1000.0
 
-                    # Step 2: VDC variation detection & raycast pruning
-                    t_s2 = time.perf_counter()
+                    # Step 3: VDC variation detection & initialization on newly observed surfaces
                     rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
 
-                    new_g, prune_mask = self.vg_pipeline.step_2_online_mapping(
-                        rgb=rgb_tensor,
-                        depth=d_masked,
+                    new_g = self.vg_pipeline.vdc.detect_and_initialize_gaussians(
+                        rgb_obs=rgb_tensor,
+                        depth_obs=d_masked,
                         rendered_rgb=rendered_rgb,
                         rendered_depth=rendered_depth,
                         intrinsic=k_tensor,
-                        camera_pose=t_tensor,
-                        current_morton_codes=self.scene_gaussians['morton'],
-                        mask=mask_t,
+                        pose=t_tensor,
+                        tsdf_map=self.vg_pipeline.tsdf_map,
+                        mask_obs=mask_t,
                         workspace_bounds=workspace_bounds_t,
                         is_initial_timestep=False,
                         num_views=len(camera_views),
                         robot_ids=(self.robot_ids | self.virtual_ids),
-                        target_object_ids=self.dynamic_object_ids,
-                        raycast_stride=self.raycast_stride,
-                        raycast_steps=self.raycast_steps
+                        target_object_ids=self.dynamic_object_ids
                     )
-
-                    # Apply pruning
-                    n_pruned = 0
-                    if len(prune_mask) > 0 and torch.any(prune_mask):
-                        n_pruned = int(prune_mask.sum().item())
-                        total_pruned_in_frame += n_pruned
-                        keep_mask = ~prune_mask
-                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
-                            if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
-                                self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
 
                     # Add new Gaussians with Morton deduplication & robot cylinder exclusion
                     if len(new_g['xyz']) > 0 and len(self.robot_base_pos) >= 3:
@@ -785,10 +797,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     self.tracked_objects[oid]['last_quat'] = quat
                     tracked_poses[oid] = (new_pos, quat)
 
-                    # Rotate obstacle surface normals with estimated SE(3) rotation
-                    obj_mask = (self.scene_gaussians['obj_id'] == oid)
-                    if torch.any(obj_mask) and 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(obj_mask):
-                        self.scene_gaussians['normal'][obj_mask] = self.scene_gaussians['normal'][obj_mask] @ R_fine.T
+                    # Pure VG-Mapping: Gaussians have surface normals assigned directly from TSDF
+                    # gradients upon initialization; no artificial rototranslation of normals.
 
             t_se3_total = (time.perf_counter() - t_s3) * 1000.0
 
@@ -995,17 +1005,19 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 if k in g_loaded:
                     self.scene_gaussians[k] = g_loaded[k].to(self.device)
 
-            # Re-initialize TSDF Voxel Pipeline and restore F, W tensors
+            # Re-initialize TSDF Voxel Pipeline and restore F, W tensors (with weight clamping)
             self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
                 pybullet_client=None,
                 voxel_size=self.voxel_size,
                 grid_dim=self.grid_dim,
                 origin=self.grid_origin,
+                max_weight=self.max_weight,
+                tau_p=self.tau_p,
                 device=self.device
             )
             tsdf_loaded = torch.load(tsdf_path, map_location=self.device, weights_only=False)
             self.vg_pipeline.tsdf_map.F.copy_(tsdf_loaded['F'].to(self.device))
-            self.vg_pipeline.tsdf_map.W.copy_(tsdf_loaded['W'].to(self.device))
+            self.vg_pipeline.tsdf_map.W.copy_(torch.clamp(tsdf_loaded['W'].to(self.device), min=0.0, max=self.max_weight))
 
             # Load tracked objects
             if os.path.exists(t_obj_path):
