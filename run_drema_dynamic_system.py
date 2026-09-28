@@ -152,12 +152,27 @@ class DremaDynamicSystem:
         urdf_path = config.get_nested("digital_twin.urdf_path", "assets/franka_panda/panda.urdf")
 
         if twin_engine == "pybullet":
+            tracking_mode = str(config.get_nested("digital_twin.tracking_mode", "constraint")).lower()
+            constraint_max_force = float(config.get_nested("digital_twin.constraint_max_force", 300.0))
+            kp_pos = float(config.get_nested("digital_twin.kp_pos", 250.0))
+            kd_pos = float(config.get_nested("digital_twin.kd_pos", 30.0))
+            kp_rot = float(config.get_nested("digital_twin.kp_rot", 15.0))
+            kd_rot = float(config.get_nested("digital_twin.kd_rot", 1.5))
+            sim_substeps = int(config.get_nested("digital_twin.sim_substeps", 2))
+
             self.digital_twin: BaseDigitalTwin = PyBulletDigitalTwin(
                 visualize=twin_gui,
                 table_z=table_z,
-                robot_urdf_path=urdf_path
+                robot_urdf_path=urdf_path,
+                tracking_mode=tracking_mode,
+                constraint_max_force=constraint_max_force,
+                kp_pos=kp_pos,
+                kd_pos=kd_pos,
+                kp_rot=kp_rot,
+                kd_rot=kd_rot,
+                sim_substeps=sim_substeps
             )
-            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: {twin_engine.capitalize()}) initialized.")
+            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: {twin_engine.capitalize()}, Tracking: {tracking_mode}) initialized.")
         else:
             raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported digital twin engine: '{twin_engine}' (expected 'pybullet', 'mujoco')")
 

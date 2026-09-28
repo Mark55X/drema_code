@@ -5,7 +5,12 @@ Defines the required simulation contract for physics backends (e.g., PyBullet, I
 """
 
 from abc import ABC, abstractmethod
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Union
+
+
+# Default physical / visual rendering attributes across all digital twin backends
+DEFAULT_TABLE_COLOR: Tuple[float, float, float, float] = (0.82, 0.82, 0.82, 1.0)
+DEFAULT_OBSTACLE_COLOR: Tuple[float, float, float, float] = (0.2, 0.45, 0.85, 1.0)
 
 
 class BaseDigitalTwin(ABC):
@@ -20,8 +25,8 @@ class BaseDigitalTwin(ABC):
         base_position: Tuple[float, float, float],
         base_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1),
         joint_positions: Optional[List[float]] = None
-    ) -> int:
-        """Loads or updates the manipulator arm at the specified world base pose."""
+    ) -> bool:
+        """Loads or updates the manipulator arm at the specified world base pose. Returns True on success."""
         pass
 
     @abstractmethod
@@ -37,19 +42,11 @@ class BaseDigitalTwin(ABC):
     def spawn_scanned_table(
         self,
         table_z: float,
-        bounds: Tuple[float, float, float, float]
+        bounds: Optional[Tuple[float, float, float, float]] = None,
+        mesh_file_path: Optional[str] = None,
+        color: Tuple[float, float, float, float] = DEFAULT_TABLE_COLOR
     ) -> int:
         """Spawns the tabletop support structure discovered by initial 3D scan."""
-        pass
-
-    @abstractmethod
-    def draw_voxel_grid_bbox(
-        self,
-        origin: Tuple[float, float, float],
-        dim: Tuple[int, int, int],
-        voxel_size: float
-    ) -> None:
-        """Renders bounding box wireframe of the active TSDF voxel workspace."""
         pass
 
     @abstractmethod
@@ -59,10 +56,10 @@ class BaseDigitalTwin(ABC):
         initial_pos: Tuple[float, float, float],
         initial_quat: Tuple[float, float, float, float] = (0, 0, 0, 1),
         name: str = "obstacle",
-        is_target: bool = False,
-        mass: float = 0.0,
-        color: Optional[List[float]] = None,
-        obj_id: Optional[int] = None
+        mass: float = 1.0,
+        color: Optional[Union[List[float], Tuple[float, ...]]] = None,
+        obj_id: Optional[int] = None,
+        **kwargs
     ) -> int:
         """Spawns an extracted Marching Cubes surface mesh obstacle into the physics engine."""
         pass

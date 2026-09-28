@@ -39,10 +39,10 @@ def test_digital_twin():
     print("\n--- [TEST 1] Digital Twin (PyBullet) Contract & Execution ---")
     twin = PyBulletDigitalTwin(visualize=False, table_z=0.75)
     
-    # 1. Load robot
-    robot_id = twin.load_robot(base_position=(0.0, 0.0, 0.0), joint_positions=[0.0]*7)
-    assert robot_id >= 0, "Robot failed to load"
-    print("  ✓ Robot loaded with ID:", robot_id)
+    # 1. Load robot on table surface
+    success = twin.load_robot(base_position=(0.0, 0.0, 0.75), joint_positions=[0.0]*7)
+    assert success is True and twin.robot_id >= 0, "Robot failed to load"
+    print("  ✓ Robot loaded with ID:", twin.robot_id)
     
     # 2. Table
     table_id = twin.spawn_scanned_table(table_z=0.75, bounds=(-0.5, 0.8, -0.4, 0.4))
@@ -60,10 +60,12 @@ def test_digital_twin():
     assert obs_body_id >= 0, "Obstacle failed to spawn"
     print("  ✓ Obstacle spawned with body ID:", obs_body_id)
     
-    # 4. Sync pose
+    # 4. Sync pose (dynamic tracking constraint converges over physics steps)
     twin.sync_object_pose(obj_id=0, position=(0.45, 0.05, 0.80), orientation=(0, 0, 0, 1))
+    for _ in range(25):
+        twin.step()
     pos, quat = twin.get_object_pose(obj_id=0)
-    assert abs(pos[0] - 0.45) < 1e-3, f"Unexpected pos: {pos}"
+    assert abs(pos[0] - 0.45) < 1e-2 and abs(pos[1] - 0.05) < 1e-2, f"Unexpected pos: {pos}"
     print("  ✓ Object pose successfully synchronized to:", pos)
     
     # 5. Step simulation

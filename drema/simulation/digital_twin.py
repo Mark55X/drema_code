@@ -5,8 +5,7 @@ PyBullet Digital Twin for DREMA Dynamic Inference System.
 Agnostic & Dynamic Scene Manager:
 - Only the static workcell baseline is loaded at startup (Ground plane, Table workspace, Franka Panda robot).
 - All scene objects (obstacles, containers, manipulated objects, target) are dynamically spawned
-  and updated at runtime as they are discovered and reconstructed by the VG-Mapping pipeline
-  from point clouds and 3D surface meshes.
+  and updated at runtime as they are discovered and reconstructed by the Perception pipeline.
 """
 
 import os
@@ -16,7 +15,7 @@ from typing import Optional, Tuple, List, Dict, Union
 
 import pybullet as p
 import pybullet_data
-from .base_twin import BaseDigitalTwin
+from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
 
 
 class PyBulletDigitalTwin(BaseDigitalTwin):
@@ -28,15 +27,28 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         self,
         visualize: bool = False,
         table_z: float = 0.75,
-        robot_urdf_path: Optional[str] = None
+        robot_urdf_path: Optional[str] = None,
+        tracking_mode: str = "constraint",
+        constraint_max_force: float = 300.0,
+        kp_pos: float = 250.0,
+        kd_pos: float = 30.0,
+        kp_rot: float = 15.0,
+        kd_rot: float = 1.5,
+        sim_substeps: int = 1
     ):
         self.visualize = visualize
         self.table_z = table_z
+        self.tracking_mode = tracking_mode.lower()
+        self.constraint_max_force = float(constraint_max_force)
+        self.kp_pos = float(kp_pos)
+        self.kd_pos = float(kd_pos)
+        self.kp_rot = float(kp_rot)
+        self.kd_rot = float(kd_rot)
+        self.sim_substeps = max(1, int(sim_substeps))
 
         self.client_id = -1
         self.robot_id = -1
         self.table_id = -1
-        self.target_body_id = -1
 
         # Dynamic registry of objects spawned by perception (obj_id -> object metadata)
         self.tracked_objects: Dict[int, Dict] = {}
@@ -66,41 +78,43 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         if robot_urdf_path is None:
             robot_urdf_path = "franka_panda/panda.urdf"
         self.robot_urdf_path = robot_urdf_path
-        self.robot_id = -1
 
     def load_robot(
         self,
         base_position: Tuple[float, float, float],
         base_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1),
         joint_positions: Optional[List[float]] = None
-    ) -> int:
+    ) -> bool:
         """
         Dynamically loads or updates Franka Panda robot in PyBullet at the given world position.
+        Returns True if loaded/updated successfully, False otherwise.
         """
         if self.client_id < 0:
-            return -1
+            return False
 
         if self.robot_id >= 0:
             try:
                 p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
                 if joint_positions is not None:
                     self.sync_robot_state(joint_positions)
-                return self.robot_id
+                return True
             except Exception as e:
-                print(f"[DigitalTwin Warning] Failed to update robot pose: {e}")
+                print(f"[PYBULLET DIGITAL TWIN WARNING] Failed to update robot pose: {e}")
+                return False
 
         # Load URDF at the exact base position received dynamically
         try:
             self.robot_id = p.loadURDF(self.robot_urdf_path, list(base_position), list(base_orientation), useFixedBase=True)
-            print(f"✓ Digital Twin: Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
+            print(f"[PYBULLET DIGITAL TWIN] Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
         except Exception as e:
-            print(f"[DigitalTwin Warning] Failed to load Franka Panda URDF: {e}")
-            return -1
+            print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to load Franka Panda URDF: {e}")
+            self.robot_id = -1
+            return False
 
         if joint_positions is not None:
             self.sync_robot_state(joint_positions)
 
-        return self.robot_id
+        return True
 
     def set_robot_base_pose(
         self,
@@ -114,52 +128,18 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             try:
                 p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
             except Exception as e:
-                print(f"[DigitalTwin Warning] Failed to reset robot base pose: {e}")
-
-    def get_robot_link_positions(self) -> List[Tuple[float, float, float]]:
-        """Returns the 3D world positions of all Franka robot links in PyBullet."""
-        if self.client_id < 0 or self.robot_id < 0:
-            return []
-        try:
-            positions = [p.getBasePositionAndOrientation(self.robot_id)[0]]
-            num_joints = p.getNumJoints(self.robot_id)
-            for i in range(num_joints):
-                state = p.getLinkState(self.robot_id, i)
-                positions.append(state[0])
-            return positions
-        except Exception:
-            return []
-
-    def get_dense_robot_skeleton_points(self, num_samples_per_link: int = 4) -> List[Tuple[float, float, float]]:
-        """
-        Returns dense 3D points sampled along Franka robot link segments for robust pointcloud/depth masking.
-        """
-        if self.client_id < 0 or self.robot_id < 0:
-            return []
-        try:
-            link_pos = self.get_robot_link_positions()
-            if len(link_pos) <= 1:
-                return link_pos
-            dense_points = [link_pos[0]]
-            for i in range(len(link_pos) - 1):
-                p1 = np.array(link_pos[i], dtype=np.float32)
-                p2 = np.array(link_pos[i + 1], dtype=np.float32)
-                alphas = np.linspace(0.0, 1.0, num_samples_per_link + 2)[1:]
-                for a in alphas:
-                    pt = (1.0 - a) * p1 + a * p2
-                    dense_points.append(tuple(pt.tolist()))
-            return dense_points
-        except Exception:
-            return self.get_robot_link_positions()
+                print(f"[PYBULLET DIGITAL TWIN WARNING] Failed to reset robot base pose: {e}")
 
     def spawn_scanned_table(
         self,
         table_z: float,
         bounds: Optional[Tuple[float, float, float, float]] = None,
-        mesh_file_path: Optional[str] = None
+        mesh_file_path: Optional[str] = None,
+        color: Tuple[float, float, float, float] = DEFAULT_TABLE_COLOR
     ) -> int:
         """
         Dynamically spawns the tabletop workspace surface from real 3D scanning data at t=0.
+        Accepts either an extracted 3D mesh or planar bounding box (xmin, xmax, ymin, ymax).
         Does NOT rely on hardcoded table geometry!
         """
         if self.client_id < 0:
@@ -178,144 +158,46 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         if mesh_file_path and os.path.exists(mesh_file_path):
             try:
                 col_id = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_file_path)
-                vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_file_path, rgbaColor=[0.75, 0.75, 0.75, 1.0])
+                vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_file_path, rgbaColor=list(color))
                 self.table_id = p.createMultiBody(
                     baseMass=0,
                     baseCollisionShapeIndex=col_id,
                     baseVisualShapeIndex=vis_id,
                     basePosition=[0, 0, 0]
                 )
-                print(f"✓ Digital Twin: Spawned scanned table from 3D surface mesh: {mesh_file_path} (ID: {self.table_id})")
+                print(f"[PYBULLET DIGITAL TWIN] Spawned scanned table from 3D surface mesh: {mesh_file_path} (ID: {self.table_id})")
                 return self.table_id
             except Exception as e:
-                print(f"[DigitalTwin Warning] Failed to load table mesh {mesh_file_path}: {e}. Falling back to planar bounds.")
+                print(f"[PYBULLET DIGITAL TWIN WARNING] Failed to load table mesh {mesh_file_path}: {e}. Falling back to planar bounds if available.")
 
         # Spawn table structure extending from ground Z=0 to surface Z=table_z
         if bounds is not None:
             xmin, xmax, ymin, ymax = bounds
             cx = (xmin + xmax) / 2.0
             cy = (ymin + ymax) / 2.0
-            hx = max(0.35, (xmax - xmin) / 2.0)
-            hy = max(0.35, (ymax - ymin) / 2.0)
-        else:
-            cx, cy = 0.30, 0.0
-            hx, hy = 0.80, 0.55
+            hx = max(0.01, (xmax - xmin) / 2.0)
+            hy = max(0.01, (ymax - ymin) / 2.0)
 
-        # Table body reaches from Z=0 to table_z
-        hz = self.table_z / 2.0
-        table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
-        table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, hz], rgbaColor=[0.82, 0.82, 0.82, 1.0])
-        self.table_id = p.createMultiBody(
-            baseMass=0,
-            baseCollisionShapeIndex=table_col,
-            baseVisualShapeIndex=table_vis,
-            basePosition=[cx, cy, hz]
-        )
-        print(f"✓ Digital Twin: Spawned scanned table structure with bounds X[{cx-hx:.2f}, {cx+hx:.2f}], Y[{cy-hy:.2f}, {cy+hy:.2f}], Z=[0.0, {self.table_z:.3f}]m (ID: {self.table_id})")
-        return self.table_id
-
-    def draw_voxel_grid_bbox(
-        self,
-        origin: Tuple[float, float, float],
-        dim: Tuple[int, int, int],
-        voxel_size: float,
-        color: Tuple[float, float, float] = (0.0, 0.9, 0.25),
-        line_width: float = 2.0
-    ):
-        """
-        Draws the 12 wireframe edges and center coordinate cross of the TSDF Voxel Grid in PyBullet GUI.
-        """
-        if self.client_id < 0:
-            return
-
-        x0, y0, z0 = origin
-        x1 = x0 + dim[0] * voxel_size
-        y1 = y0 + dim[1] * voxel_size
-        z1 = z0 + dim[2] * voxel_size
-
-        edges = [
-            # Bottom 4 edges
-            ([x0, y0, z0], [x1, y0, z0]), ([x1, y0, z0], [x1, y1, z0]),
-            ([x1, y1, z0], [x0, y1, z0]), ([x0, y1, z0], [x0, y0, z0]),
-            # Top 4 edges
-            ([x0, y0, z1], [x1, y0, z1]), ([x1, y0, z1], [x1, y1, z1]),
-            ([x1, y1, z1], [x0, y1, z1]), ([x0, y1, z1], [x0, y0, z1]),
-            # 4 Vertical edges
-            ([x0, y0, z0], [x0, y0, z1]), ([x1, y0, z0], [x1, y0, z1]),
-            ([x1, y1, z0], [x1, y1, z1]), ([x0, y1, z0], [x0, y1, z1]),
-        ]
-        for p0, p1 in edges:
-            p.addUserDebugLine(p0, p1, lineColorRGB=list(color), lineWidth=line_width)
-
-        # Center marker coordinate cross
-        cx = (x0 + x1) / 2.0
-        cy = (y0 + y1) / 2.0
-        cz = (z0 + z1) / 2.0
-        d = 0.06
-        p.addUserDebugLine([cx - d, cy, cz], [cx + d, cy, cz], lineColorRGB=[1, 0, 0], lineWidth=4)
-        p.addUserDebugLine([cx, cy - d, cz], [cx, cy + d, cz], lineColorRGB=[0, 1, 0], lineWidth=4)
-        p.addUserDebugLine([cx, cy, cz - d], [cx, cy, cz + d], lineColorRGB=[0, 0, 1], lineWidth=4)
-
-        # 3D Text Label in PyBullet Scene
-        p.addUserDebugText(
-            f"Voxel Grid: {dim[0]}x{dim[1]}x{dim[2]} ({voxel_size*100:.1f}cm)\nCenter: [{cx:.2f}, {cy:.2f}, {cz:.2f}]",
-            [cx - 0.15, cy, z1 + 0.03],
-            textColorRGB=[0.0, 1.0, 0.4],
-            textSize=1.1,
-            lifeTime=0
-        )
-        print(f"✓ Digital Twin: Voxel Grid wireframe bbox rendered in PyBullet (Center: [{cx:.3f}, {cy:.3f}, {cz:.3f}])")
-
-    # -------------------------------------------------------------------------
-    # Generic Dynamic Object Spawning (Called by VG-Mapping pipeline)
-    # -------------------------------------------------------------------------
-
-    def spawn_mesh_object(
-        self,
-        obj_id: int,
-        mesh_file_path: str,
-        initial_position: Tuple[float, float, float],
-        initial_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1),
-        color: Tuple[float, float, float, float] = (0.2, 0.45, 0.85, 1.0),
-        is_target: bool = False
-    ) -> int:
-        """
-        Dynamically inserts an object into the Digital Twin from a 3D surface mesh
-        extracted by VG-Mapping at t=0.
-        """
-        if self.client_id < 0:
-            return -1
-
-        # If object was already spawned, remove old body first
-        if obj_id in self.tracked_objects:
-            self.remove_object(obj_id)
-
-        try:
-            col_id = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_file_path)
-            vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_file_path, rgbaColor=list(color))
-            body_id = p.createMultiBody(
-                baseMass=0.1 if not is_target else 0,
-                baseCollisionShapeIndex=col_id,
-                baseVisualShapeIndex=vis_id,
-                basePosition=list(initial_position),
-                baseOrientation=list(initial_orientation)
+            # Table body reaches from Z=0 to table_z
+            hz = self.table_z / 2.0
+            table_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[hx, hy, hz])
+            table_vis = p.createVisualShape(p.GEOM_BOX, halfExtents=[hx, hy, hz], rgbaColor=list(color))
+            self.table_id = p.createMultiBody(
+                baseMass=0,
+                baseCollisionShapeIndex=table_col,
+                baseVisualShapeIndex=table_vis,
+                basePosition=[cx, cy, hz]
             )
+            print(f"[PYBULLET DIGITAL TWIN] Spawned scanned table structure with bounds X[{cx-hx:.2f}, {cx+hx:.2f}], Y[{cy-hy:.2f}, {cy+hy:.2f}], Z=[0.0, {self.table_z:.3f}]m (ID: {self.table_id})")
+            return self.table_id
 
-            self.tracked_objects[obj_id] = {
-                'body_id': body_id,
-                'mesh_path': mesh_file_path,
-                'is_target': is_target,
-                'color': color,
-                'canonical_position': initial_position
-            }
-            if is_target:
-                self.target_body_id = body_id
+        print("[PYBULLET DIGITAL TWIN WARNING] Neither valid mesh_file_path nor table bounds provided. Table not spawned.")
+        return -1
 
-            print(f"✓ Digital Twin: Spawned mesh object ID {obj_id} (PyBullet Body ID: {body_id}, Target={is_target})")
-            return body_id
-        except Exception as e:
-            print(f"[DigitalTwin Error] Failed to spawn mesh object {obj_id}: {e}")
-            return -1
+
+    # -------------------------------------------------------------------------
+    # Generic Dynamic Object Spawning (Called by Perception pipeline)
+    # -------------------------------------------------------------------------
 
     def spawn_scanned_mesh_obstacle(
         self,
@@ -323,72 +205,103 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         initial_pos: Tuple[float, float, float],
         initial_quat: Tuple[float, float, float, float] = (0, 0, 0, 1),
         name: str = "obstacle",
-        is_target: bool = False,
-        mass: float = 0.0,
-        color: Optional[List[float]] = None,
-        obj_id: Optional[int] = None
-    ) -> int:
-        """Alias matching BaseDigitalTwin contract."""
-        target_obj_id = obj_id if obj_id is not None else len(self.tracked_objects)
-        col = tuple(color) if color is not None else (0.2, 0.45, 0.85, 1.0)
-        return self.spawn_mesh_object(
-            obj_id=target_obj_id,
-            mesh_file_path=mesh_path,
-            initial_position=initial_pos,
-            initial_orientation=initial_quat,
-            color=col,
-            is_target=is_target
-        )
-
-    def spawn_box_object(
-        self,
-        obj_id: int,
-        half_extents: Tuple[float, float, float],
-        initial_position: Tuple[float, float, float],
-        initial_orientation: Tuple[float, float, float, float] = (0, 0, 0, 1),
-        color: Tuple[float, float, float, float] = (0.8, 0.2, 0.2, 1.0),
-        is_target: bool = False
+        mass: float = 1.0,
+        color: Optional[Union[List[float], Tuple[float, ...]]] = None,
+        obj_id: Optional[int] = None,
+        **kwargs
     ) -> int:
         """
-        Dynamically inserts a bounding primitive object into the Digital Twin.
+        Dynamically spawns a real 3D surface mesh obstacle extracted by Perception at t=0
+        into the PyBullet Digital Twin with realistic rigid body physical dynamics.
         """
         if self.client_id < 0:
             return -1
 
-        if obj_id in self.tracked_objects:
-            self.remove_object(obj_id)
+        target_obj_id = obj_id if obj_id is not None else len(self.tracked_objects)
 
-        col_id = p.createCollisionShape(p.GEOM_BOX, halfExtents=list(half_extents))
-        vis_id = p.createVisualShape(p.GEOM_BOX, halfExtents=list(half_extents), rgbaColor=list(color))
-        body_id = p.createMultiBody(
-            baseMass=0.1 if not is_target else 0,
-            baseCollisionShapeIndex=col_id,
-            baseVisualShapeIndex=vis_id,
-            basePosition=list(initial_position),
-            baseOrientation=list(initial_orientation)
-        )
+        if target_obj_id in self.tracked_objects:
+            self.remove_object(target_obj_id)
 
-        self.tracked_objects[obj_id] = {
-            'body_id': body_id,
-            'half_extents': half_extents,
-            'is_target': is_target,
-            'color': color,
-            'canonical_position': initial_position
-        }
-        if is_target:
-            self.target_body_id = body_id
+        col = tuple(color) if color is not None else DEFAULT_OBSTACLE_COLOR
 
-        return body_id
+        try:
+            col_id = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_path)
+            vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_path, rgbaColor=list(col))
+            body_id = p.createMultiBody(
+                baseMass=mass,
+                baseCollisionShapeIndex=col_id,
+                baseVisualShapeIndex=vis_id,
+                basePosition=list(initial_pos),
+                baseOrientation=list(initial_quat)
+            )
+
+            # Configure realistic physical contact dynamics (friction, non-bouncy restitution)
+            if mass > 0:
+                p.changeDynamics(
+                    body_id,
+                    -1,
+                    lateralFriction=0.5,
+                    spinningFriction=0.01,
+                    rollingFriction=0.001,
+                    restitution=0.1
+                )
+
+            self.tracked_objects[target_obj_id] = {
+                'body_id': body_id,
+                'mesh_path': mesh_path,
+                'name': name,
+                'mass': mass,
+                'color': col,
+                'canonical_position': initial_pos,
+                'target_pos': initial_pos,
+                'target_quat': initial_quat
+            }
+
+            # Initialize 6-DoF tracking constraint immediately if in constraint mode
+            if self.tracking_mode == "constraint":
+                cid = p.createConstraint(
+                    parentBodyUniqueId=body_id,
+                    parentLinkIndex=-1,
+                    childBodyUniqueId=-1,
+                    childLinkIndex=-1,
+                    jointType=p.JOINT_FIXED,
+                    jointAxis=[0.0, 0.0, 0.0],
+                    parentFramePosition=[0.0, 0.0, 0.0],
+                    childFramePosition=list(initial_pos),
+                    childFrameOrientation=list(initial_quat)
+                )
+                p.changeConstraint(cid, maxForce=self.constraint_max_force)
+                self.tracked_objects[target_obj_id]['constraint_id'] = cid
+
+            print(f"[PYBULLET DIGITAL TWIN] Spawned mesh obstacle ID {target_obj_id} ('{name}', Mass={mass}kg, PyBullet Body ID: {body_id})")
+            return body_id
+        except Exception as e:
+            print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to spawn mesh obstacle {target_obj_id}: {e}")
+            return -1
+
+    def spawn_mesh_object(self, *args, **kwargs) -> int:
+        """Backward-compatible alias for spawn_scanned_mesh_obstacle."""
+        if 'mesh_file_path' in kwargs:
+            kwargs['mesh_path'] = kwargs.pop('mesh_file_path')
+        if 'initial_position' in kwargs:
+            kwargs['initial_pos'] = kwargs.pop('initial_position')
+        if 'initial_orientation' in kwargs:
+            kwargs['initial_quat'] = kwargs.pop('initial_orientation')
+        return self.spawn_scanned_mesh_obstacle(*args, **kwargs)
 
     def remove_object(self, obj_id: int):
-        """Removes an object from PyBullet."""
+        """Removes an object from PyBullet and cleans up its tracking constraint if present."""
         if self.client_id < 0:
             return
         if obj_id in self.tracked_objects:
             body_id = self.tracked_objects[obj_id]['body_id']
+            constraint_id = self.tracked_objects[obj_id].get('constraint_id', -1)
+            if constraint_id >= 0:
+                try:
+                    p.removeConstraint(constraint_id)
+                except Exception:
+                    pass
             p.removeBody(body_id)
-            if self.target_body_id == body_id:
-                self.target_body_id = -1
             del self.tracked_objects[obj_id]
 
     def clear_dynamic_objects(self):
@@ -396,7 +309,6 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         for obj_id in list(self.tracked_objects.keys()):
             self.remove_object(obj_id)
         self.tracked_objects.clear()
-        self.target_body_id = -1
 
     # -------------------------------------------------------------------------
     # State Synchronization & Physics Queries
@@ -423,16 +335,36 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     ):
         """
         Synchronizes the 3D position and orientation of an object tracked by RecurGS SE(3).
+        Operates dynamically according to the selected tracking_mode:
+        - "constraint": 6-DoF constraint attaching rigid body to world target with finite maxForce.
+        - "pd_force": Virtual spring-damper PD force/torque with feedforward gravity compensation.
+        - "teleport": Hard kinematic teleportation via resetBasePositionAndOrientation.
         """
-        if obj_id not in self.tracked_objects:
+        if obj_id not in self.tracked_objects or self.client_id < 0:
             return
 
-        body_id = self.tracked_objects[obj_id]['body_id']
+        obj_data = self.tracked_objects[obj_id]
+        body_id = obj_data['body_id']
+        pos = (float(position[0]), float(position[1]), float(position[2]))
+        orn = (float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3]))
 
-        # Enforce table support boundary
-        pos_z = max(position[2], self.table_z + 0.005)
-        pos = (float(position[0]), float(position[1]), float(pos_z))
-        p.resetBasePositionAndOrientation(body_id, pos, orientation)
+        obj_data['target_pos'] = pos
+        obj_data['target_quat'] = orn
+
+        if self.tracking_mode == "constraint":
+            cid = obj_data.get('constraint_id', -1)
+            if cid >= 0:
+                p.changeConstraint(
+                    cid,
+                    jointChildPivot=list(pos),
+                    jointChildFrameOrientation=list(orn),
+                    maxForce=self.constraint_max_force
+                )
+        elif self.tracking_mode == "pd_force":
+            # Target stored, forces applied dynamically in step()
+            pass
+        elif self.tracking_mode == "teleport":
+            p.resetBasePositionAndOrientation(body_id, list(pos), list(orn))
 
     def get_object_pose(
         self,
@@ -457,10 +389,6 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         min_distance = float('inf')
 
         for obj_id, obj_data in self.tracked_objects.items():
-            # Only evaluate collisions against obstacles (ignore the target to reach)
-            if obj_data.get('is_target', False):
-                continue
-
             body_id = obj_data['body_id']
             contact_pts = p.getClosestPoints(
                 bodyA=self.robot_id,
@@ -476,8 +404,55 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         return float(min_distance)
 
     def step(self):
-        if self.client_id >= 0:
+        """Advances physical simulation forward (with sub-stepping and PD tracking if active)."""
+        if self.client_id < 0:
+            return
+
+        for _ in range(self.sim_substeps):
+            if self.tracking_mode == "pd_force":
+                self._apply_pd_tracking_forces()
             p.stepSimulation()
+
+    def _apply_pd_tracking_forces(self):
+        """Applies virtual spring-damper PD forces and torques for 'pd_force' tracking mode."""
+        for obj_id, obj_data in self.tracked_objects.items():
+            if 'target_pos' not in obj_data:
+                continue
+
+            body_id = obj_data['body_id']
+            mass = float(obj_data.get('mass', 1.0))
+            target_pos = np.array(obj_data['target_pos'], dtype=np.float32)
+            target_quat = np.array(obj_data['target_quat'], dtype=np.float32)
+
+            curr_pos_t, curr_quat_t = p.getBasePositionAndOrientation(body_id)
+            lin_vel_t, ang_vel_t = p.getBaseVelocity(body_id)
+
+            curr_pos = np.array(curr_pos_t, dtype=np.float32)
+            curr_quat = np.array(curr_quat_t, dtype=np.float32)
+            lin_vel = np.array(lin_vel_t, dtype=np.float32)
+            ang_vel = np.array(ang_vel_t, dtype=np.float32)
+
+            # 1. Linear PD force with feedforward gravity compensation (m * g)
+            grav_comp = np.array([0.0, 0.0, mass * 9.81], dtype=np.float32)
+            force = self.kp_pos * (target_pos - curr_pos) - self.kd_pos * lin_vel + grav_comp
+            p.applyExternalForce(body_id, -1, force.tolist(), curr_pos.tolist(), p.WORLD_FRAME)
+
+            # 2. Rotational PD torque via quaternion difference: q_rel = q_target * inv(q_curr)
+            q_inv = np.array([-curr_quat[0], -curr_quat[1], -curr_quat[2], curr_quat[3]], dtype=np.float32)
+            w1, x1, y1, z1 = target_quat[3], target_quat[0], target_quat[1], target_quat[2]
+            w2, x2, y2, z2 = q_inv[3], q_inv[0], q_inv[1], q_inv[2]
+            qw = w1*w2 - x1*x2 - y1*y2 - z1*z2
+            qx = w1*x2 + x1*w2 + y1*z2 - z1*y2
+            qy = w1*y2 - x1*z2 + y1*w2 + z1*x2
+            qz = w1*z2 + x1*y2 - y1*x2 + z1*w2
+
+            q_rel_vec = np.array([qx, qy, qz], dtype=np.float32)
+            if qw < 0.0:
+                q_rel_vec = -q_rel_vec  # Shortest geodesic path on S^3
+
+            rot_error = 2.0 * q_rel_vec
+            torque = self.kp_rot * rot_error - self.kd_rot * ang_vel
+            p.applyExternalTorque(body_id, -1, torque.tolist(), p.WORLD_FRAME)
 
     def step_simulation(self):
         self.step()

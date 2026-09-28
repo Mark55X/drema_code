@@ -338,8 +338,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             device=self.device
         )
 
-        if digital_twin is not None:
-            digital_twin.draw_voxel_grid_bbox(origin=self.grid_origin, dim=self.grid_dim, voxel_size=self.voxel_size)
 
         # 6. Ingest All Scan Frames into VG-Mapping (TSDF + 3DGS)
         num_views = len(scan_frames)
@@ -1041,7 +1039,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             # Spawn into Digital Twin
             if digital_twin is not None:
                 digital_twin.spawn_scanned_table(table_z=self.z_table, bounds=self.table_bounds)
-                digital_twin.draw_voxel_grid_bbox(origin=self.grid_origin, dim=self.grid_dim, voxel_size=self.voxel_size)
                 for obs in self.discovered_obstacles:
                     if os.path.exists(obs.mesh_path):
                         pb_id = digital_twin.spawn_scanned_mesh_obstacle(

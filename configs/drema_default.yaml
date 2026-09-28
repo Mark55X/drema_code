@@ -81,6 +81,13 @@ digital_twin:
   gui: true                          # Show native physics visualizer window
   time_step: 0.002                   # Physics simulation time step in seconds
   urdf_path: "assets/franka_panda/panda.urdf"
+  tracking_mode: "constraint"        # "constraint" (6-DoF constraint), "pd_force" (spring-damper), or "teleport"
+  constraint_max_force: 300.0        # Maximum force for 6-DoF constraint (N)
+  kp_pos: 250.0                      # Proportional gain for PD position tracking (N/m)
+  kd_pos: 30.0                       # Derivative gain for PD velocity damping (N*s/m)
+  kp_rot: 15.0                       # Proportional gain for PD orientation tracking (N*m/rad)
+  kd_rot: 1.5                        # Derivative gain for PD angular velocity damping (N*m*s/rad)
+  sim_substeps: 2                    # Micro-steps per simulation step for high contact stability
 
 # ------------------------------------------------------------------------------
 # 5. Controller (MP-PMPPI / Future GPU MuJoCo Rollouts)
