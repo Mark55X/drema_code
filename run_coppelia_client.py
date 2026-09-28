@@ -51,7 +51,9 @@ class CoppeliaSimulationClient:
         cam_fps: float = 10.0,
         ctrl_fps: float = 50.0,
         reachability_radius: float = 0.95,
-        scan_resolution: Tuple[int, int] = (1280, 720)
+        scan_resolution: Tuple[int, int] = (1280, 720),
+        ping_timeout: float = 1.5,
+        ping_max_retries: int = 3
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -61,6 +63,8 @@ class CoppeliaSimulationClient:
         self.ctrl_fps = ctrl_fps
         self.reachability_radius = reachability_radius
         self.scan_resolution = tuple(scan_resolution)
+        self.ping_timeout = float(ping_timeout)
+        self.ping_max_retries = int(ping_max_retries)
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -73,11 +77,12 @@ class CoppeliaSimulationClient:
         self._reset_requested = False
         self.server_connected = False
         self._last_ping_time = 0.0
+        self._failed_pings = 0
 
         # Initialize gRPC Client
         print(f"[CoppeliaClient] Connecting to DREMA suite at {self.server_address}...")
         self.client = DremaGrpcClient(target_address=self.server_address)
-        self.server_connected = self.client.ping(timeout=0.5)
+        self.server_connected = self.client.ping(timeout=self.ping_timeout)
         if self.server_connected:
             print(f"✓ Connected to DREMA Dynamic Inference Suite!")
         else:
@@ -439,15 +444,19 @@ class CoppeliaSimulationClient:
                 # Periodic non-blocking connection check to DREMA suite
                 if loop_start - self._last_ping_time > 1.5:
                     self._last_ping_time = loop_start
-                    is_alive = self.client.ping(timeout=0.1)
-                    if is_alive and not self.server_connected:
-                        self.server_connected = True
-                        print("\n✓ [CoppeliaClient] Connected to DREMA Dynamic Inference Suite!\n")
-                        if not self.initial_scan_done:
-                            self.perform_initial_scan()
-                    elif not is_alive and self.server_connected:
-                        self.server_connected = False
-                        print("\n[Notice] [CoppeliaClient] DREMA Suite disconnected. Holding position.\n")
+                    is_alive = self.client.ping(timeout=self.ping_timeout)
+                    if is_alive:
+                        self._failed_pings = 0
+                        if not self.server_connected:
+                            self.server_connected = True
+                            print("\n✓ [CoppeliaClient] Connected to DREMA Dynamic Inference Suite!\n")
+                            if not self.initial_scan_done:
+                                self.perform_initial_scan()
+                    else:
+                        self._failed_pings += 1
+                        if self._failed_pings >= self.ping_max_retries and self.server_connected:
+                            self.server_connected = False
+                            print(f"\n[Notice] [CoppeliaClient] DREMA Suite disconnected (missed {self.ping_max_retries} consecutive pings). Holding position.\n")
 
                 self.step_counter += 1
 
@@ -552,6 +561,8 @@ def parse_args():
     parser.add_argument("--scan_resolution", type=int, nargs=2, default=[1280, 720], metavar=("WIDTH", "HEIGHT"),
                         help="Orbital scan camera resolution [width, height] (default: 1280 720)")
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
+    parser.add_argument("--ping_timeout", type=float, default=1.5, help="gRPC ping timeout in seconds (default: 1.5)")
+    parser.add_argument("--ping_retries", type=int, default=3, help="Consecutive failed pings before holding (default: 3)")
     return parser.parse_args()
 
 
@@ -565,6 +576,8 @@ if __name__ == "__main__":
         cam_fps=args.cam_fps,
         ctrl_fps=args.ctrl_fps,
         reachability_radius=args.reachability_radius,
-        scan_resolution=args.scan_resolution
+        scan_resolution=args.scan_resolution,
+        ping_timeout=args.ping_timeout,
+        ping_max_retries=args.ping_retries
     )
     client.run()

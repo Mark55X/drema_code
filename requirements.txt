@@ -13,3 +13,16 @@ viser>=0.2.0
 imageio
 imageio-ffmpeg
 pycollada
+
+# Additional dependencies for DREMA Dynamic System
+torch
+torchvision
+grpcio
+grpcio-tools
+protobuf
+pyyaml
+PyMCubes
+scipy
+pillow
+tqdm
+omegaconf

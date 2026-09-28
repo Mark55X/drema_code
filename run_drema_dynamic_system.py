@@ -255,8 +255,6 @@ class DremaDynamicSystem:
                 name="/voxel_grid/table_plane",
                 width=ext_x,
                 height=ext_y,
-                width_segments=max(4, int(ext_x / 0.10)),
-                height_segments=max(4, int(ext_y / 0.10)),
                 plane="xy",
                 position=(cx, cy, gz)
             )
@@ -301,32 +299,32 @@ class DremaDynamicSystem:
         )
 
         # 6. Interactive Visibility Checkboxes
-        cb_bbox = self.viser_server.gui.add_checkbox("Show Voxel Grid BBox & Center", initial_value=True)
-        @cb_bbox.on_update
+        self.cb_bbox = self.viser_server.gui.add_checkbox("Show Voxel Grid BBox & Center", initial_value=True)
+        @self.cb_bbox.on_update
         def _(_):
-            is_vis = cb_bbox.value
+            is_vis = self.cb_bbox.value
             for k in ['vg_bbox', 'vg_base', 'vg_center', 'vg_label']:
                 if k in self.viser_handles and self.viser_handles[k] is not None:
                     self.viser_handles[k].visible = is_vis
 
-        cb_gaussians = self.viser_server.gui.add_checkbox("Show 3D Gaussians", initial_value=True)
-        @cb_gaussians.on_update
+        self.cb_gaussians = self.viser_server.gui.add_checkbox("Show 3D Gaussians", initial_value=True)
+        @self.cb_gaussians.on_update
         def _(_):
             if 'gaussians' in self.viser_handles and self.viser_handles['gaussians'] is not None:
-                self.viser_handles['gaussians'].visible = cb_gaussians.value
+                self.viser_handles['gaussians'].visible = self.cb_gaussians.value
 
-        cb_voxels = self.viser_server.gui.add_checkbox("Show TSDF Surface Voxels", initial_value=True)
-        @cb_voxels.on_update
+        self.cb_voxels = self.viser_server.gui.add_checkbox("Show TSDF Surface Voxels", initial_value=True)
+        @self.cb_voxels.on_update
         def _(_):
             if 'surface_voxels' in self.viser_handles and self.viser_handles['surface_voxels'] is not None:
-                self.viser_handles['surface_voxels'].visible = cb_voxels.value
+                self.viser_handles['surface_voxels'].visible = self.cb_voxels.value
 
-        cb_meshes = self.viser_server.gui.add_checkbox("Show Obstacle Meshes", initial_value=True)
-        @cb_meshes.on_update
+        self.cb_meshes = self.viser_server.gui.add_checkbox("Show Obstacle Meshes", initial_value=True)
+        @self.cb_meshes.on_update
         def _(_):
             for k, handle in self.viser_handles.items():
                 if k.startswith("mesh_") and handle is not None:
-                    handle.visible = cb_meshes.value
+                    handle.visible = self.cb_meshes.value
 
     def _update_viser_surface_voxels(self):
         """Extracts and displays discrete TSDF surface voxels in Viser 3D Web Visualizer."""
@@ -335,13 +333,16 @@ class DremaDynamicSystem:
         vox_data = self.perception.get_viser_surface_voxels()
         if vox_data is not None:
             try:
-                self.viser_handles['surface_voxels'] = self.viser_server.scene.add_point_cloud(
+                handle = self.viser_server.scene.add_point_cloud(
                     name="/voxel_grid/surface_voxels",
                     points=vox_data['points'],
                     colors=vox_data['colors'],
                     point_size=vox_data['point_size'],
                     point_shape="square"
                 )
+                if hasattr(self, 'cb_voxels') and self.cb_voxels is not None:
+                    handle.visible = self.cb_voxels.value
+                self.viser_handles['surface_voxels'] = handle
             except Exception:
                 pass
 
@@ -519,9 +520,10 @@ class DremaDynamicSystem:
 
             self.total_frames_processed += 1
 
-            # Periodically refresh Viser 3D Gaussians
+            # Periodically refresh Viser 3D Gaussians and TSDF surface voxels
             if self.total_frames_processed % viser_decimation == 0:
                 self._update_viser_gaussians()
+                self._update_viser_surface_voxels()
 
             if self.total_frames_processed % 10 == 0:
                 print(f"[DREMA DYNAMIC SYSTEM] [Dynamic Inference #{timestep:04d}] Active Gaussians: {res.active_gaussians_count:,} | Loop Latency: {res.latency_ms:.1f}ms | Tracked Objects: {len(res.tracked_object_poses)}")
@@ -552,6 +554,8 @@ class DremaDynamicSystem:
                 opacities=splats_data['opacities'],
                 scale=1.0
             )
+            if hasattr(self, 'cb_gaussians') and self.cb_gaussians is not None:
+                h.visible = self.cb_gaussians.value
             self.viser_handles['gaussians'] = h
         except Exception:
             # Fallback to point cloud if add_gaussian_splats encounters an issue
@@ -563,6 +567,8 @@ class DremaDynamicSystem:
                     point_size=0.008,
                     point_shape="circle"
                 )
+                if hasattr(self, 'cb_gaussians') and self.cb_gaussians is not None:
+                    h.visible = self.cb_gaussians.value
                 self.viser_handles['gaussians'] = h
             except Exception:
                 pass
@@ -636,6 +642,10 @@ class DremaDynamicSystem:
 
         while not self.stop_event.is_set():
             time.sleep(1.0)
+
+
+# Backwards compatibility alias
+DremaDynamicSuite = DremaDynamicSystem
 
 
 def parse_args():

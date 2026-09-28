@@ -137,6 +137,16 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.se3_tol = float(tr_cfg.get("tolerance", 0.0001))
         self.proximity_radius = float(tr_cfg.get("proximity_search_radius", 0.25))
 
+        # Mapping & Raycast Pruning configuration
+        map_cfg = config.get_nested("perception.mapping", {})
+        self.raycast_stride = int(map_cfg.get("raycast_stride", 2))
+        self.raycast_steps = map_cfg.get("raycast_steps", None)
+
+        # Diagnostics & Timing Breakdown
+        diag_cfg = config.get_nested("perception.diagnostics", {})
+        self.log_interval_frames = int(diag_cfg.get("log_interval_frames", 10))
+        self.enable_timing_breakdown = bool(diag_cfg.get("enable_timing_breakdown", True))
+
         # Caching configuration
         cache_cfg = config.get_nested("perception.cache", {})
         self.cache_enabled = bool(cache_cfg.get("enabled", False))
@@ -585,8 +595,14 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         digital_twin: Optional[Any] = None
     ) -> StreamingUpdateResult:
         """Processes incoming multi-camera streaming frames and updates dynamic 3DGS & tracking."""
-        t0 = time.time()
+        t0 = time.perf_counter()
+        t_tsdf_total = 0.0
+        t_vdc_total = 0.0
+        t_se3_total = 0.0
+        total_pruned_in_frame = 0
+        total_added_in_frame = 0
         tracked_poses = {}
+        tracked_deltas = {}
 
         if self.vg_pipeline is not None and len(camera_views) > 0:
             workspace_bounds_t = self.workspace_bounds_t
@@ -602,14 +618,17 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     d_masked, mask_t = self._apply_semantic_robot_mask(depth_t=d_tensor, mask_np=mask_np)
 
                     # Step 1: TSDF integration (robot masked to 0)
+                    t_s1 = time.perf_counter()
                     self.vg_pipeline.step_1_ingest_frame(
                         rgb=rgb_tensor,
                         depth=d_masked,
                         intrinsic=k_tensor,
                         camera_pose=t_tensor
                     )
+                    t_tsdf_total += (time.perf_counter() - t_s1) * 1000.0
 
                     # Step 2: VDC variation detection & raycast pruning
+                    t_s2 = time.perf_counter()
                     rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
 
@@ -626,11 +645,16 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         is_initial_timestep=False,
                         num_views=len(camera_views),
                         robot_ids=(self.robot_ids | self.virtual_ids),
-                        target_object_ids=self.dynamic_object_ids
+                        target_object_ids=self.dynamic_object_ids,
+                        raycast_stride=self.raycast_stride,
+                        raycast_steps=self.raycast_steps
                     )
 
                     # Apply pruning
+                    n_pruned = 0
                     if len(prune_mask) > 0 and torch.any(prune_mask):
+                        n_pruned = int(prune_mask.sum().item())
+                        total_pruned_in_frame += n_pruned
                         keep_mask = ~prune_mask
                         for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
                             if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
@@ -655,6 +679,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         else:
                             non_dup = torch.ones_like(added_morton, dtype=torch.bool)
 
+                        n_added = int(non_dup.sum().item())
+                        total_added_in_frame += n_added
+
                         for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
                             if k in new_g:
                                 val = new_g[k]
@@ -664,11 +691,14 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 val = torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
                             self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val[non_dup]], dim=0)
 
-                except Exception:
-                    pass
+                    t_vdc_total += (time.perf_counter() - t_s2) * 1000.0
+
+                except Exception as e:
+                    print(f"[VG MAPPING PERCEPTION Warning] Error processing camera view '{cam_name}': {e}")
 
         # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
         if len(self.tracked_objects) > 0 and len(self.scene_gaussians['xyz']) > 0:
+            t_s3 = time.perf_counter()
             objects_source = {}
             objects_target = {}
             initial_T_coarse_dict = {}
@@ -745,6 +775,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     new_pos = (float(pos_w[0].item()), float(pos_w[1].item()), pos_z)
                     quat = rotation_matrix_to_quaternion(R_fine)
 
+                    # Compute displacement delta relative to previous position
+                    old_pos = np.array(self.tracked_objects[oid]['last_pos'])
+                    delta_p = np.array(new_pos) - old_pos
+                    tracked_deltas[oid] = delta_p
+
                     if digital_twin is not None:
                         digital_twin.sync_object_pose(oid, new_pos, quat)
 
@@ -757,12 +792,45 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     if torch.any(obj_mask) and 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(obj_mask):
                         self.scene_gaussians['normal'][obj_mask] = self.scene_gaussians['normal'][obj_mask] @ R_fine.T
 
-        elapsed_ms = (time.time() - t0) * 1000.0
+            t_se3_total = (time.perf_counter() - t_s3) * 1000.0
+
+        total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
+
+        # Periodic structured diagnostic report
+        if self.enable_timing_breakdown and (timestep % self.log_interval_frames == 0 or timestep <= 2):
+            tsdf_active_voxels = 0
+            w_max = 0.0
+            w_mean = 0.0
+            if self.vg_pipeline is not None and self.vg_pipeline.tsdf_map is not None:
+                with torch.no_grad():
+                    tsdf_m = self.vg_pipeline.tsdf_map
+                    tsdf_active_voxels = int(((tsdf_m.W > 0.5) & (tsdf_m.F.abs() < 0.12)).sum().item())
+                    w_max = float(tsdf_m.W.max().item())
+                    w_pos = tsdf_m.W[tsdf_m.W > 0]
+                    w_mean = float(w_pos.mean().item()) if len(w_pos) > 0 else 0.0
+
+            fps = 1000.0 / max(1.0, total_elapsed_ms)
+            num_cams = len(camera_views)
+            active_g = len(self.scene_gaussians.get('xyz', []))
+
+            print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
+            print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
+            print(f"  ├─ Step 2 (VDC Raycast & Prune): {t_vdc_total:.1f}ms | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
+            if len(tracked_deltas) > 0:
+                for oid, d_p in tracked_deltas.items():
+                    name_o = self.tracked_objects[oid]['name']
+                    pos_o = self.tracked_objects[oid]['last_pos']
+                    print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
+            else:
+                print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
+            print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
+            print(f"  └─ Total Step Latency: {total_elapsed_ms:.1f}ms ({fps:.1f} Hz)\n")
+
         return StreamingUpdateResult(
             timestep=timestep,
             active_gaussians_count=len(self.scene_gaussians.get('xyz', [])),
             tracked_object_poses=tracked_poses,
-            latency_ms=elapsed_ms
+            latency_ms=total_elapsed_ms
         )
 
     def get_viser_splats_data(self) -> Optional[Dict[str, np.ndarray]]:

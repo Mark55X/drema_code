@@ -23,7 +23,7 @@ from drema.config import load_config
 from drema.simulation.digital_twin import PyBulletDigitalTwin
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.perception.base_perception import InitialScanResult, StreamingUpdateResult
-from run_drema_dynamic_system import DremaDynamicSystem, DremaDynamicSuite
+from run_drema_dynamic_system import DremaDynamicSystem
 from drema.communication.grpc_client import DremaGrpcClient
 from drema.communication.proto import drema_comm_pb2
 

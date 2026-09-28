@@ -15,13 +15,26 @@ system:
     max_splats: 50000               # Max Gaussians displayed in web browser for responsive 60fps
 
 # ------------------------------------------------------------------------------
-# 2. Perception & 3D Dynamic Reconstruction Pipeline
+# 2. Client & Networking Calibration (Local vs SSH Tunnel)
+# ------------------------------------------------------------------------------
+communication:
+  client:
+    ping_timeout_s: 1.5             # gRPC ping timeout (high enough to prevent false disconnects over SSH jump proxies)
+    ping_max_retries: 3             # Consecutive failed pings before declaring server disconnected
+
+# ------------------------------------------------------------------------------
+# 3. Perception & 3D Dynamic Reconstruction Pipeline
 # ------------------------------------------------------------------------------
 perception:
   module: "vg_mapping_recurgs"       # Perception backend identifier ("vg_mapping_recurgs")
   frequency_hz: 10.0                 # Target perception / dynamic tracking loop rate (Hz)
   queue_max_size: 5                  # Max camera observation queue size (prevents frame latency lag)
   voxel_size: 0.01                   # TSDF volumetric grid resolution in meters (0.01 = 1cm)
+
+  # Diagnostics & Timing Breakdown
+  diagnostics:
+    log_interval_frames: 10          # Print [VG MAPPING PERCEPTION] detailed timing breakdown every N frames
+    enable_timing_breakdown: true    # Profile Step 1 (TSDF), Step 2 (VDC), Step 3 (SE3 Tracking)
 
   # Workspace & Table Segmentation Priors
   workspace:
@@ -30,17 +43,24 @@ perception:
     robot_base_radius: 0.13          # Exclusion cylinder radius around robot base in meters
     obstacle_min_clearance_z: 0.015  # Minimum clearance above table to isolate objects from surface noise
 
+  # Online Raycast Pruning & VDC Mapping
+  mapping:
+    raycast_stride: 2                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
+    raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
+    tau_s: 0.15                      # SSIM appearance variation detection threshold
+    tau_w: null                      # Geometry variation weight threshold (null = view count based)
+
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:
     scale_tangent_min: 0.012         # Min radius across surface tangent plane (meters) to seal voxel gaps
     scale_normal_min: 0.003          # Min thickness through surface normal (meters)
     opacity_init: 0.95               # Initial opacity for reconstructed surface primitives
 
-  # RecurGS SE(3) Rigid Object Tracking
+  # RecurGS SE(3) Rigid Object Tracking (Calibrate for GPU balance with MuJoCo controller)
   tracking:
     se3_iterations: 15               # Lie algebra gradient optimization iterations per frame
     se3_icp_iterations: 12           # Coarse ICP alignment iterations
-    subsample: 256                   # Subsampled points per object for real-time tracking
+    subsample: 256                   # Subsampled points per object (increase to 512/1024 for higher accuracy)
     learning_rate: 0.003             # Step size in se(3) tangent space
     tolerance: 0.0001                # Convergence criterion
     proximity_search_radius: 0.25    # Bounding sphere search radius around last known position in meters
@@ -52,16 +72,16 @@ perception:
     cache_dir: "cache/scene_init"    # Directory where scene_gaussians.pt, tsdf.pt, meshes are stored
 
 # ------------------------------------------------------------------------------
-# 3. Digital Twin Engine
+# 4. Digital Twin Engine
 # ------------------------------------------------------------------------------
 digital_twin:
-  engine: "pybullet"                 # Physics engine backend ("pybullet" or "isaac")
+  engine: "pybullet"                 # Physics engine backend ("pybullet", "mujoco", or "isaac")
   gui: true                          # Show native physics visualizer window
   time_step: 0.002                   # Physics simulation time step in seconds
   urdf_path: "assets/franka_panda/panda.urdf"
 
 # ------------------------------------------------------------------------------
-# 4. Controller (MP-PMPPI)
+# 5. Controller (MP-PMPPI / Future GPU MuJoCo Rollouts)
 # ------------------------------------------------------------------------------
 controller:
   engine: "mp_pmppi"                 # Controller architecture
