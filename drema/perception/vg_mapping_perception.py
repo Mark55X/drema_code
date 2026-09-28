@@ -679,8 +679,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         dist_base = torch.sqrt((p_xy[:, 0] - rx) ** 2 + (p_xy[:, 1] - ry) ** 2)
                         keep_geom = (dist_base > self.robot_base_radius) | (new_g['xyz'][:, 2] < (rz - 0.05))
                         if not torch.all(keep_geom):
+                            n_g_orig = len(new_g['xyz'])
                             for k in list(new_g.keys()):
-                                if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(new_g['xyz']):
+                                if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == n_g_orig:
                                     new_g[k] = new_g[k][keep_geom]
 
                     if len(new_g['xyz']) > 0:

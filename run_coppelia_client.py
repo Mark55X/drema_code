@@ -502,11 +502,16 @@ class CoppeliaSimulationClient:
                     )
 
                 # 2. Read Robot State & Scene Target (if defined in task)
-                if not q and hasattr(arm, 'get_joint_positions'):
-                    q = arm.get_joint_positions()
-                dq = arm.get_joint_velocities()
-                ee_pose = arm.get_tip().get_pose().tolist()
-                gripper_open = float(gripper.get_open_amount()[0])
+                try:
+                    if not q and hasattr(arm, 'get_joint_positions'):
+                        q = arm.get_joint_positions()
+                    dq = arm.get_joint_velocities()
+                    ee_pose = arm.get_tip().get_pose().tolist()
+                    gripper_open = float(gripper.get_open_amount()[0])
+                except Exception:
+                    if not self.running:
+                        break
+                    continue
 
                 target_pose = []
                 target_available = False
