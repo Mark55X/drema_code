@@ -122,6 +122,15 @@ class DremaGrpcClient:
         except Exception:
             return False
 
+    def ping_status(self, timeout: float = 1.5) -> Tuple[bool, str]:
+        """Checks if DREMA Dynamic Inference Suite server is alive and returns status."""
+        try:
+            req = drema_comm_pb2.PingRequest(client_id="coppelia_client", timestamp=time.time())
+            res = self.stub.Ping(req, timeout=timeout)
+            return bool(res.alive), str(res.suite_status)
+        except Exception:
+            return False, ""
+
     def start_streaming(self):
         """Starts the background non-blocking camera frame streaming thread."""
         if self._streaming_thread and self._streaming_thread.is_alive():
@@ -221,17 +230,20 @@ class DremaGrpcClient:
         robot_base_pos: Optional[List[float]] = None,
         reachability_radius: float = 0.95,
         joint_positions: Optional[List[float]] = None,
-        chunk_size: int = 4
+        chunk_size: int = 2,
+        chunk_timeout_s: float = 180.0,
+        max_chunk_retries: int = 3
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes the 360° orbital scan frames to DREMA suite in chunks to avoid gRPC payload overflow.
+        Includes automatic retry logic and configurable per-chunk timeouts for reliable transfer over SSH tunnels.
         Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip, mask])
         """
         total_views = len(cameras_list)
         if total_views == 0:
             return None
 
-        print(f"[GrpcClient] Transmitting {total_views} initial scan views to DREMA in chunks of {chunk_size}...")
+        print(f"[GrpcClient] Transmitting {total_views} initial scan views to DREMA in chunks of {chunk_size} (timeout={chunk_timeout_s}s)...")
         
         last_res = None
         for start_idx in range(0, total_views, chunk_size):
@@ -268,15 +280,24 @@ class DremaGrpcClient:
                 joint_positions=(joint_positions or []) if is_last else []
             )
 
-            try:
-                # Generous timeout on final chunk to allow TSDF volumetric integration and Marching Cubes
-                timeout = 600.0 if is_last else 30.0
-                last_res = self.stub.SendFrame(obs, timeout=timeout)
-                if not is_last and (start_idx + len(chunk)) % 20 == 0:
-                    print(f"   [GrpcClient] Transmitted {start_idx + len(chunk)}/{total_views} views to DREMA...")
-            except Exception as e:
-                print(f"[GrpcClient Error] push_initial_scan_batch failed at chunk [{start_idx}:{start_idx+len(chunk)}]: {e}")
-                return None
+            timeout = 600.0 if is_last else chunk_timeout_s
+            chunk_success = False
+
+            for attempt in range(1, max_chunk_retries + 1):
+                try:
+                    last_res = self.stub.SendFrame(obs, timeout=timeout)
+                    chunk_success = True
+                    break
+                except Exception as e:
+                    if attempt < max_chunk_retries:
+                        print(f"[GrpcClient Warning] Chunk [{start_idx}:{start_idx+len(chunk)}] attempt {attempt}/{max_chunk_retries} failed ({e}). Retrying in 2.0s...")
+                        time.sleep(2.0)
+                    else:
+                        print(f"[GrpcClient Error] push_initial_scan_batch failed at chunk [{start_idx}:{start_idx+len(chunk)}] after {max_chunk_retries} attempts: {e}")
+                        return None
+
+            if not is_last and (start_idx + len(chunk)) % 20 == 0:
+                print(f"   [GrpcClient] Transmitted {start_idx + len(chunk)}/{total_views} views to DREMA...")
 
         return last_res
 

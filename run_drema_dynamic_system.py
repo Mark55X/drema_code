@@ -204,7 +204,8 @@ class DremaDynamicSystem:
             port=self.port,
             on_frame_callback=self.on_frame_received,
             on_action_callback=self.on_request_action,
-            on_reset_callback=self.on_reset_episode
+            on_reset_callback=self.on_reset_episode,
+            is_scan_ready_callback=lambda: self.initial_scan_ready
         )
 
     def _add_viser_obstacle_mesh(self, obj_name: str, idx: int, comp: trimesh.Trimesh):
@@ -419,8 +420,11 @@ class DremaDynamicSystem:
                 self.digital_twin.sync_robot_state(self.robot_joint_positions)
 
         if obs.is_initial_scan:
+            existing_names = {f['name'] for f in self.accumulated_scan_frames}
             for f in obs.cameras:
                 name, rgb, depth, extrinsics, intrinsics, near_clip, far_clip, mask = unpack_camera_frame(f)
+                if name in existing_names:
+                    continue
                 pcd = pointcloud_from_depth_and_camera_params(depth, extrinsics, intrinsics)
                 valid = (depth > near_clip) & (depth < far_clip)
                 pts = pcd[valid]
@@ -611,6 +615,14 @@ class DremaDynamicSystem:
 
     def start(self):
         """Starts the DREMA gRPC Server."""
+        if bool(self.config.get_nested("perception.cache.enabled", False)):
+            cache_dir = self.config.get_nested("perception.cache.cache_dir", "cache/scene_init")
+            if os.path.exists(os.path.join(cache_dir, "scene_gaussians.pt")):
+                try:
+                    print(f"\n[DREMA DYNAMIC SYSTEM] Restoring initial scene from cache '{cache_dir}' at startup...")
+                    self._process_initial_scene_scan()
+                except Exception as e:
+                    print(f"[DREMA DYNAMIC SYSTEM] [Cache Note] Startup cache restore skipped: {e}")
         self.server.start()
 
     def stop(self):

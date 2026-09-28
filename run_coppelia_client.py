@@ -52,6 +52,9 @@ class CoppeliaSimulationClient:
         ctrl_fps: float = 50.0,
         reachability_radius: float = 0.95,
         scan_resolution: Tuple[int, int] = (1280, 720),
+        scan_steps: int = 50,
+        scan_chunk_size: int = 2,
+        scan_chunk_timeout: float = 180.0,
         ping_timeout: float = 1.5,
         ping_max_retries: int = 3
     ):
@@ -63,6 +66,9 @@ class CoppeliaSimulationClient:
         self.ctrl_fps = ctrl_fps
         self.reachability_radius = reachability_radius
         self.scan_resolution = tuple(scan_resolution)
+        self.scan_steps = int(scan_steps)
+        self.scan_chunk_size = int(scan_chunk_size)
+        self.scan_chunk_timeout = float(scan_chunk_timeout)
         self.ping_timeout = float(ping_timeout)
         self.ping_max_retries = int(ping_max_retries)
 
@@ -76,15 +82,20 @@ class CoppeliaSimulationClient:
         self.step_counter = 0
         self._reset_requested = False
         self.server_connected = False
+        self.initial_scan_done = False
         self._last_ping_time = 0.0
         self._failed_pings = 0
 
         # Initialize gRPC Client
         print(f"[CoppeliaClient] Connecting to DREMA suite at {self.server_address}...")
         self.client = DremaGrpcClient(target_address=self.server_address)
-        self.server_connected = self.client.ping(timeout=self.ping_timeout)
+        is_alive, status = self.client.ping_status(timeout=self.ping_timeout)
+        self.server_connected = is_alive
         if self.server_connected:
-            print(f"✓ Connected to DREMA Dynamic Inference Suite!")
+            print(f"✓ Connected to DREMA Dynamic Inference Suite! (Status: {status})")
+            if status == "SCAN_READY":
+                print("✓ DREMA server already has scene initialized (from disk cache or previous scan)! Ready for dynamic streaming.")
+                self.initial_scan_done = True
         else:
             print(f"[Notice] DREMA Suite server not responding yet at {self.server_address}. Simulation will run and connect automatically as soon as it goes online.")
 
@@ -230,23 +241,26 @@ class CoppeliaSimulationClient:
                 except Exception:
                     pass
 
-            # Send ALL views in ONE single batch message with robot reachability and real initial joints
+            # Send views in robust chunks with automatic retry
             res = self.client.push_initial_scan_batch(
                 all_scan_cameras,
                 semantic_labels=semantic_labels,
                 robot_base_pos=robot_base_pos,
                 reachability_radius=self.reachability_radius,
-                joint_positions=robot_joint_positions
+                joint_positions=robot_joint_positions,
+                chunk_size=self.scan_chunk_size,
+                chunk_timeout_s=self.scan_chunk_timeout
             )
 
             if res and res.initial_scan_ready:
-                print(f"\n✓ [CoppeliaClient] 360° orbital scan complete! All {len(all_scan_cameras)} views sent in single batch. DREMA scene populated.")
+                print(f"\n✓ [CoppeliaClient] 360° orbital scan complete! All {len(all_scan_cameras)} views sent. DREMA scene populated.")
                 self.initial_scan_done = True
                 return True
             else:
-                print(f"[CoppeliaClient Warning] DREMA server acknowledged initial scan with status: {res}")
-                self.initial_scan_done = True
-                return True
+                print(f"\n❌ [CoppeliaClient Error] DREMA server failed to acknowledge initial scan (status: {res})!")
+                print(f"   Dynamic tracking cannot proceed until the scene is initialized. Type 'scan' or 'reset' to retry.")
+                self.initial_scan_done = False
+                return False
 
         except Exception as e:
             print(f"[CoppeliaClient Error] Orbital scan failed: {e}")
@@ -342,6 +356,9 @@ class CoppeliaSimulationClient:
                 if cmd in ['start', 'run', '']:
                     self.task_active = True
                     print(f"\n[CLI] >>> TASK STARTED! Robot closed-loop control engaged (f_ctrl={self.ctrl_fps}Hz).\n")
+                elif cmd in ['scan', 's']:
+                    print("\n[CLI] >>> Initiating initial scene scan...")
+                    self.perform_initial_scan(num_steps=self.scan_steps)
                 elif cmd in ['stop', 'pause', 'halt']:
                     self.task_active = False
                     print("\n[CLI] >>> TASK PAUSED! Robot holding position (streaming continues).\n")
@@ -415,9 +432,9 @@ class CoppeliaSimulationClient:
         arm = robot.arm
         gripper = robot.gripper
 
-        # If server is already online at launch, perform initial scan immediately
+        # If server is already online at launch, perform initial scan if needed
         if self.server_connected and not self.initial_scan_done:
-            self.perform_initial_scan()
+            self.perform_initial_scan(num_steps=self.scan_steps)
 
         try:
             while self.running:
@@ -437,21 +454,24 @@ class CoppeliaSimulationClient:
                     descriptions, self.current_obs = self.task.reset()
                     print("\n[CLI] >>> EPISODE RESET COMPLETE! Re-scanning initial scene...\n")
                     if self.server_connected:
-                        self.perform_initial_scan()
+                        self.perform_initial_scan(num_steps=self.scan_steps)
                     print("\n[CLI] >>> Ready. Press 'start' to resume dynamic task.\n")
                     continue
 
                 # Periodic non-blocking connection check to DREMA suite
                 if loop_start - self._last_ping_time > 1.5:
                     self._last_ping_time = loop_start
-                    is_alive = self.client.ping(timeout=self.ping_timeout)
+                    is_alive, status = self.client.ping_status(timeout=self.ping_timeout)
                     if is_alive:
                         self._failed_pings = 0
                         if not self.server_connected:
                             self.server_connected = True
-                            print("\n✓ [CoppeliaClient] Connected to DREMA Dynamic Inference Suite!\n")
-                            if not self.initial_scan_done:
-                                self.perform_initial_scan()
+                            print(f"\n✓ [CoppeliaClient] Connected to DREMA Dynamic Inference Suite! (Status: {status})\n")
+                            if status == "SCAN_READY":
+                                print("✓ [CoppeliaClient] DREMA server already has scene initialized! Ready for dynamic streaming.\n")
+                                self.initial_scan_done = True
+                            elif not self.initial_scan_done:
+                                self.perform_initial_scan(num_steps=self.scan_steps)
                     else:
                         self._failed_pings += 1
                         if self._failed_pings >= self.ping_max_retries and self.server_connected:
@@ -460,11 +480,11 @@ class CoppeliaSimulationClient:
 
                 self.step_counter += 1
 
-                # 1. Perception Step (f_cam ≈ 10 Hz): capture and push frames to gRPC queue if connected
+                # 1. Perception Step (f_cam ≈ 10 Hz): capture and push frames only when scene is initialized
                 robot_base_pos = list(arm.get_position()) if hasattr(arm, 'get_position') else [0.0, 0.0, 0.0]
                 q = list(arm.get_joint_positions()) if hasattr(arm, 'get_joint_positions') else []
                 is_cam_step = (self.step_counter % self.cam_decimation == 0)
-                if is_cam_step and self.server_connected:
+                if is_cam_step and self.server_connected and self.initial_scan_done:
                     cam_data = self.capture_camera_data()
                     blocking_send = (self.sync_mode == "stepped")
                     self.client.push_frame_observation(
@@ -560,6 +580,9 @@ def parse_args():
     parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--scan_resolution", type=int, nargs=2, default=[1280, 720], metavar=("WIDTH", "HEIGHT"),
                         help="Orbital scan camera resolution [width, height] (default: 1280 720)")
+    parser.add_argument("--scan_steps", type=int, default=50, help="Number of orbital rotation steps at t=0 (default: 50)")
+    parser.add_argument("--scan_chunk_size", type=int, default=2, help="Number of views per gRPC transmission chunk (default: 2)")
+    parser.add_argument("--scan_chunk_timeout", type=float, default=180.0, help="Timeout in seconds per chunk transmission (default: 180.0)")
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
     parser.add_argument("--ping_timeout", type=float, default=1.5, help="gRPC ping timeout in seconds (default: 1.5)")
     parser.add_argument("--ping_retries", type=int, default=3, help="Consecutive failed pings before holding (default: 3)")
@@ -577,6 +600,9 @@ if __name__ == "__main__":
         ctrl_fps=args.ctrl_fps,
         reachability_radius=args.reachability_radius,
         scan_resolution=args.scan_resolution,
+        scan_steps=args.scan_steps,
+        scan_chunk_size=args.scan_chunk_size,
+        scan_chunk_timeout=args.scan_chunk_timeout,
         ping_timeout=args.ping_timeout,
         ping_max_retries=args.ping_retries
     )

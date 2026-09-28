@@ -21,6 +21,8 @@ communication:
   client:
     ping_timeout_s: 1.5             # gRPC ping timeout (high enough to prevent false disconnects over SSH jump proxies)
     ping_max_retries: 3             # Consecutive failed pings before declaring server disconnected
+    scan_chunk_size: 2              # Number of views per chunk transmission (halves message size for SSH stability)
+    scan_chunk_timeout_s: 180.0     # Generous timeout per chunk over SSH jump proxy
 
 # ------------------------------------------------------------------------------
 # 3. Perception & 3D Dynamic Reconstruction Pipeline
@@ -65,10 +67,10 @@ perception:
     tolerance: 0.0001                # Convergence criterion
     proximity_search_radius: 0.25    # Bounding sphere search radius around last known position in meters
 
-  # Initial Scan (t=0) Caching
+  # Initial Scan (t=0) Caching (Instant restoration in <0.1s without re-streaming over SSH)
   cache:
-    enabled: false                   # When True, attempts instant restore of t=0 scan from disk
-    save_on_scan: false              # When True, saves t=0 scan tensors and meshes to disk
+    enabled: true                    # When True, attempts instant restore of t=0 scan from disk
+    save_on_scan: true               # When True, saves t=0 scan tensors and meshes to disk
     cache_dir: "cache/scene_init"    # Directory where scene_gaussians.pt, tsdf.pt, meshes are stored
 
 # ------------------------------------------------------------------------------

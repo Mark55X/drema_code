@@ -1,6 +1,6 @@
 #!/usr/bin/env python
 """
-PyBullet Digital Twin for DREMA Dynamic Inference Suite.
+PyBullet Digital Twin for DREMA Dynamic Inference System.
 
 Agnostic & Dynamic Scene Manager:
 - Only the static workcell baseline is loaded at startup (Ground plane, Table workspace, Franka Panda robot).

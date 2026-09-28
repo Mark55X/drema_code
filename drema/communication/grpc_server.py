@@ -24,21 +24,25 @@ class DremaInferenceServicer(drema_comm_pb2_grpc.DremaInferenceServiceServicer):
         self,
         on_frame_callback: Optional[Callable[[drema_comm_pb2.FrameObservation], None]] = None,
         on_action_callback: Optional[Callable[[drema_comm_pb2.RobotState], drema_comm_pb2.ControlAction]] = None,
-        on_reset_callback: Optional[Callable[[drema_comm_pb2.ResetRequest], bool]] = None
+        on_reset_callback: Optional[Callable[[drema_comm_pb2.ResetRequest], bool]] = None,
+        is_scan_ready_callback: Optional[Callable[[], bool]] = None
     ):
         self.on_frame_callback = on_frame_callback
         self.on_action_callback = on_action_callback
         self.on_reset_callback = on_reset_callback
+        self.is_scan_ready_callback = is_scan_ready_callback
 
         self.received_frames_count = 0
         self.last_timestep = 0
         self.lock = threading.Lock()
 
     def Ping(self, request: drema_comm_pb2.PingRequest, context) -> drema_comm_pb2.PingResponse:
+        is_ready = bool(self.is_scan_ready_callback()) if self.is_scan_ready_callback else False
+        status_str = "SCAN_READY" if is_ready else "AWAITING_SCAN"
         return drema_comm_pb2.PingResponse(
             alive=True,
             server_timestamp=time.time(),
-            suite_status="DREMA Inference Suite Online"
+            suite_status=status_str
         )
 
     def SendFrame(self, request: drema_comm_pb2.FrameObservation, context) -> drema_comm_pb2.StreamStatus:
@@ -132,7 +136,8 @@ class DremaGrpcServer:
         max_workers: int = 4,
         on_frame_callback: Optional[Callable[[drema_comm_pb2.FrameObservation], None]] = None,
         on_action_callback: Optional[Callable[[drema_comm_pb2.RobotState], drema_comm_pb2.ControlAction]] = None,
-        on_reset_callback: Optional[Callable[[drema_comm_pb2.ResetRequest], bool]] = None
+        on_reset_callback: Optional[Callable[[drema_comm_pb2.ResetRequest], bool]] = None,
+        is_scan_ready_callback: Optional[Callable[[], bool]] = None
     ):
         self.port = port
         self.server = grpc.server(
@@ -146,7 +151,8 @@ class DremaGrpcServer:
         self.servicer = DremaInferenceServicer(
             on_frame_callback=on_frame_callback,
             on_action_callback=on_action_callback,
-            on_reset_callback=on_reset_callback
+            on_reset_callback=on_reset_callback,
+            is_scan_ready_callback=is_scan_ready_callback
         )
         drema_comm_pb2_grpc.add_DremaInferenceServiceServicer_to_server(self.servicer, self.server)
         self.server.add_insecure_port(f"[::]:{self.port}")
