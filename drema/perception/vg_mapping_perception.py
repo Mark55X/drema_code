@@ -702,6 +702,37 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         if self.vg_pipeline is not None and len(camera_views) > 0:
             workspace_bounds_t = self.workspace_bounds_t
 
+            # Multi-view confirmed surface fusion:
+            # Pre-gather 3D surface voxels actively confirmed present across ALL camera views in this timestep
+            # to guarantee that a grazing ray from one view never prunes an active surface visible to another view.
+            active_surface_morton_list = []
+            for c_name, c_data in camera_views.items():
+                try:
+                    c_d = torch.from_numpy(c_data['depth'].copy()).unsqueeze(0).to(self.device)
+                    c_k = torch.from_numpy(c_data['intrinsics'].copy()).to(self.device)
+                    c_p = torch.from_numpy(c_data['extrinsics'].copy()).to(self.device)
+                    c_d_masked, _ = self._apply_semantic_robot_mask(depth_t=c_d, mask_np=c_data.get('mask'))
+                    H_c, W_c = c_d_masked.shape[1], c_d_masked.shape[2]
+                    v_g, u_g = torch.meshgrid(torch.arange(0, H_c, 2, device=self.device), torch.arange(0, W_c, 2, device=self.device), indexing='ij')
+                    u_f, v_f = u_g.flatten(), v_g.flatten()
+                    d_f = c_d_masked[0, v_f, u_f]
+                    valid_d = (d_f > 0.1) & (d_f < 3.5)
+                    if torch.any(valid_d):
+                        u_v, v_v, d_v = u_f[valid_d], v_f[valid_d], d_f[valid_d]
+                        x_c = (u_v.float() - c_k[0, 2]) * d_v / c_k[0, 0]
+                        y_c = (v_v.float() - c_k[1, 2]) * d_v / c_k[1, 1]
+                        p_cam_v = torch.stack([x_c, y_c, d_v], dim=-1)
+                        p_w_v = p_cam_v @ c_p[:3, :3].T + c_p[:3, 3]
+                        m_v = self.vg_pipeline.tsdf_map.point_to_morton(p_w_v)
+                        active_surface_morton_list.append(m_v[m_v >= 0])
+                except Exception:
+                    pass
+
+            if len(active_surface_morton_list) > 0:
+                all_active_surface_mortons = torch.cat(active_surface_morton_list).unique()
+            else:
+                all_active_surface_mortons = None
+
             for cam_name, cam_data in camera_views.items():
                 try:
                     d_tensor = torch.from_numpy(cam_data['depth'].copy()).unsqueeze(0).to(self.device)
@@ -721,7 +752,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         tsdf_map=self.vg_pipeline.tsdf_map,
                         gaussian_morton_codes=self.scene_gaussians['morton'],
                         stride=self.raycast_stride,
-                        num_steps=self.raycast_steps
+                        num_steps=self.raycast_steps,
+                        confirmed_surface_mortons=all_active_surface_mortons
                     )
 
                     n_pruned = 0
