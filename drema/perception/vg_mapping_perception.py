@@ -676,7 +676,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     cov3D_precomp=None
                 )
             return torch.clamp(rendered_img, 0.0, 1.0)
-        except Exception:
+        except Exception as e:
+            if not getattr(self, '_render_warned', False):
+                print(f"[VG MAPPING PERCEPTION Warning] 3DGS forward rasterization failed: {e}")
+                self._render_warned = True
             return None
 
     def update_streaming_frame(
