@@ -384,48 +384,53 @@ class CoppeliaSimulationClient:
         """Extracts RGB, Depth, Extrinsics, Intrinsics, and Masks from all vision sensors."""
         cam_dict = {}
         for name, cam in self.cameras.items():
-            if cam is not None:
-                try:
-                    cam.handle_explicitly()
-                except Exception:
-                    pass
+            try:
+                if cam is not None:
+                    try:
+                        cam.handle_explicitly()
+                    except Exception:
+                        pass
 
-            # RGB: uint8 [0, 255]
-            rgb_float = cam.capture_rgb()
-            rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
+                # RGB: uint8 [0, 255]
+                rgb_float = cam.capture_rgb()
+                rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
 
-            # Depth: float32 in meters
-            depth_m = cam.capture_depth(in_meters=True).astype(np.float32)
+                # Depth: float32 in meters
+                depth_m = cam.capture_depth(in_meters=True).astype(np.float32)
 
-            # 4x4 Cam-to-world pose
-            ext = np.array(cam.get_matrix(), dtype=np.float32).reshape((4, 4))
+                # 4x4 Cam-to-world pose
+                ext = np.array(cam.get_matrix(), dtype=np.float32).reshape((4, 4))
 
-            # 3x3 Intrinsic matrix
-            intrinsic = np.array(cam.get_intrinsic_matrix(), dtype=np.float32)
+                # 3x3 Intrinsic matrix
+                intrinsic = np.array(cam.get_intrinsic_matrix(), dtype=np.float32)
 
-            near_clip = float(cam.get_near_clipping_plane()) if hasattr(cam, 'get_near_clipping_plane') else 0.01
-            far_clip = float(cam.get_far_clipping_plane()) if hasattr(cam, 'get_far_clipping_plane') else 3.5
+                near_clip = float(cam.get_near_clipping_plane()) if hasattr(cam, 'get_near_clipping_plane') else 0.01
+                far_clip = float(cam.get_far_clipping_plane()) if hasattr(cam, 'get_far_clipping_plane') else 3.5
 
-            mask_cam = self.mask_cameras.get(name)
-            mask_int32 = None
-            if mask_cam is not None:
-                try:
-                    mask_cam.handle_explicitly()
-                    m_rgb = mask_cam.capture_rgb()
-                    m_255 = (np.clip(m_rgb, 0.0, 1.0) * 255.0).astype(int)
-                    mask_int32 = (m_255[:, :, 0] + m_255[:, :, 1] * 256 + m_255[:, :, 2] * 256 * 256).astype(np.int32)
-                except Exception:
-                    mask_int32 = None
+                mask_cam = self.mask_cameras.get(name)
+                mask_int32 = None
+                if mask_cam is not None:
+                    try:
+                        mask_cam.handle_explicitly()
+                        m_rgb = mask_cam.capture_rgb()
+                        m_255 = (np.clip(m_rgb, 0.0, 1.0) * 255.0).astype(int)
+                        mask_int32 = (m_255[:, :, 0] + m_255[:, :, 1] * 256 + m_255[:, :, 2] * 256 * 256).astype(np.int32)
+                    except Exception:
+                        mask_int32 = None
 
-            cam_dict[name] = {
-                'rgb': rgb_uint8,
-                'depth': depth_m,
-                'extrinsics': ext,
-                'intrinsics': intrinsic,
-                'near_clipping': near_clip,
-                'far_clipping': far_clip,
-                'mask': mask_int32
-            }
+                cam_dict[name] = {
+                    'rgb': rgb_uint8,
+                    'depth': depth_m,
+                    'extrinsics': ext,
+                    'intrinsics': intrinsic,
+                    'near_clipping': near_clip,
+                    'far_clipping': far_clip,
+                    'mask': mask_int32
+                }
+            except Exception:
+                if not self.running:
+                    return cam_dict
+                continue
         return cam_dict
 
     def run(self):

@@ -783,9 +783,12 @@ def parse_args():
                         help="Reconstruct initial scene from cached raw frames (scan_frames.pt) instead of loading precomputed Gaussians")
 
     # Perception & Tracking Overrides
+    parser.add_argument("--closed_loop_avd", dest="closed_loop_avd", action="store_true", default=None, help="Enable closed-loop 3DGS rendering + AVD variation detection (paper Section III-B)")
+    parser.add_argument("--no_closed_loop_avd", dest="closed_loop_avd", action="store_false", help="Disable closed-loop 3DGS rendering (bypass AVD)")
+    parser.add_argument("--tau_s", type=float, default=None, help="SSIM threshold for AVD variation detection (paper: 0.6)")
     parser.add_argument("--raycast_stride", type=int, default=None, help="Pixel stride for raycast pruning (1 = full dense, 2 = 2x subsampled)")
-    parser.add_argument("--tau_p", type=float, default=None, help="TSDF surface pruning threshold (e.g. 0.35)")
-    parser.add_argument("--max_weight", type=float, default=None, help="TSDF maximum integration weight clamp (e.g. 10.0)")
+    parser.add_argument("--tau_p", type=float, default=None, help="TSDF surface pruning threshold (e.g. 0.2)")
+    parser.add_argument("--max_weight", type=float, default=None, help="TSDF maximum integration weight clamp (e.g. 3.0)")
     parser.add_argument("--safety_margin_factor", type=float, default=None, help="Stopping distance factor for raycast pruning (paper: 1.0)")
     parser.add_argument("--se3_iterations", type=int, default=None, help="Lie algebra SE(3) optimization iterations (overrides config)")
     parser.add_argument("--se3_icp_iterations", type=int, default=None, help="Coarse ICP iterations (overrides config)")
@@ -821,6 +824,10 @@ if __name__ == "__main__":
         cfg.set_nested("perception.cache.cache_dir", args.cache_dir)
     if args.recompute_scan is not None:
         cfg.set_nested("perception.cache.recompute_scan", args.recompute_scan)
+    if args.closed_loop_avd is not None:
+        cfg.set_nested("perception.mapping.closed_loop_avd", args.closed_loop_avd)
+    if args.tau_s is not None:
+        cfg.set_nested("perception.mapping.tau_s", args.tau_s)
     if args.raycast_stride is not None:
         cfg.set_nested("perception.mapping.raycast_stride", args.raycast_stride)
     if args.tau_p is not None:

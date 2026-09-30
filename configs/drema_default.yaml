@@ -48,10 +48,11 @@ perception:
 
   # Online Raycast Pruning & VDC Mapping
   mapping:
+    closed_loop_avd: true            # Enable closed-loop 3DGS rendering + AVD variation detection (paper Section III-B)
     raycast_stride: 1                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
     raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
-    tau_s: 0.15                      # SSIM appearance variation detection threshold
-    tau_p: 0.35                      # Pruning TSDF surface threshold (paper: 0.2, widened to 0.35 for robust hull capture)
+    tau_s: 0.6                       # SSIM appearance variation detection threshold (paper Section III-B.1: tau_s = 0.6)
+    tau_p: 0.2                       # Pruning TSDF surface threshold (paper Section III-B.2: tau_p = 0.2)
     tau_w: null                      # Geometry variation weight threshold (null = view count based)
     max_weight: 3.0                  # Max TSDF weight clamp to enable rapid dynamic clearing in 2-3 frames
     safety_margin_factor: 1.0        # Stopping distance factor for raycast pruning (paper Eq. 17: 1.0 * voxel_size = 1cm)

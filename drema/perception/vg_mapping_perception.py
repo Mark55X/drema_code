@@ -139,10 +139,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         # Mapping & Raycast Pruning configuration
         map_cfg = config.get_nested("perception.mapping", {})
-        self.raycast_stride = int(map_cfg.get("raycast_stride", 2))
+        self.closed_loop_avd = bool(map_cfg.get("closed_loop_avd", True))
+        self.raycast_stride = int(map_cfg.get("raycast_stride", 1))
         self.raycast_steps = map_cfg.get("raycast_steps", None)
+        self.tau_s = float(map_cfg.get("tau_s", 0.6))
         self.tau_p = float(map_cfg.get("tau_p", 0.2))
-        self.max_weight = float(map_cfg.get("max_weight", 15.0))
+        self.max_weight = float(map_cfg.get("max_weight", 3.0))
         self.safety_margin_factor = float(map_cfg.get("safety_margin_factor", 1.0))
 
         # Diagnostics & Timing Breakdown
@@ -339,6 +341,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             grid_dim=self.grid_dim,
             origin=self.grid_origin,
             max_weight=self.max_weight,
+            tau_s=self.tau_s,
             tau_p=self.tau_p,
             safety_margin_factor=self.safety_margin_factor,
             device=self.device
@@ -591,6 +594,91 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             restored_from_cache=False
         )
 
+    def render_scene_view(
+        self,
+        intrinsic: torch.Tensor,
+        camera_pose: torch.Tensor,
+        width: int,
+        height: int,
+        bg_color: Optional[torch.Tensor] = None
+    ) -> Optional[torch.Tensor]:
+        """
+        Closed-Loop 3DGS Forward Rasterization for Appearance-based Variation Detection (AVD).
+        Renders the active Gaussian map from the viewpoint of the camera (paper Section III-B.1).
+        """
+        N = len(self.scene_gaussians['xyz'])
+        if N == 0:
+            if bg_color is None:
+                return torch.zeros((3, height, width), device=self.device, dtype=torch.float32)
+            return bg_color.view(3, 1, 1).repeat(1, height, width)
+
+        try:
+            import math
+            from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+            from drema.gaussian_splatting_utils.graphics_utils import getProjectionMatrix
+
+            fx = float(intrinsic[0, 0].item())
+            fy = float(intrinsic[1, 1].item())
+            tanfovx = float(width / (2.0 * fx))
+            tanfovy = float(height / (2.0 * fy))
+            fovx = float(2.0 * math.atan(tanfovx))
+            fovy = float(2.0 * math.atan(tanfovy))
+
+            c2w = camera_pose.to(self.device)
+            cam_center = c2w[:3, 3]
+            w2c = torch.inverse(c2w)
+            world_view_transform = w2c.transpose(0, 1).contiguous()
+            projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=fovx, fovY=fovy).transpose(0, 1).to(self.device)
+            full_proj_transform = (world_view_transform.unsqueeze(0).bmm(projmatrix.unsqueeze(0))).squeeze(0).contiguous()
+
+            if bg_color is None:
+                bg = torch.zeros(3, device=self.device, dtype=torch.float32)
+            else:
+                bg = bg_color.to(self.device, dtype=torch.float32)
+
+            raster_settings = GaussianRasterizationSettings(
+                image_height=int(height),
+                image_width=int(width),
+                tanfovx=tanfovx,
+                tanfovy=tanfovy,
+                bg=bg,
+                scale_modifier=1.0,
+                viewmatrix=world_view_transform,
+                projmatrix=full_proj_transform,
+                sh_degree=0,
+                campos=cam_center,
+                prefiltered=False,
+                debug=False
+            )
+
+            rasterizer = GaussianRasterizer(raster_settings=raster_settings)
+
+            means3D = self.scene_gaussians['xyz'].contiguous()
+            screenspace_points = torch.zeros_like(means3D, requires_grad=False)
+            colors_precomp = self.scene_gaussians['rgb'].contiguous()
+            scales = self.scene_gaussians['scale'].contiguous()
+
+            # Paper Eq. 15-16: Rotation is identity matrix (quaternion w=1, x=0, y=0, z=0)
+            rotations = torch.zeros((N, 4), device=self.device, dtype=torch.float32)
+            rotations[:, 0] = 1.0
+
+            opacities = torch.full((N, 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
+            with torch.no_grad():
+                rendered_img, _ = rasterizer(
+                    means3D=means3D,
+                    means2D=screenspace_points,
+                    shs=None,
+                    colors_precomp=colors_precomp,
+                    opacities=opacities,
+                    scales=scales,
+                    rotations=rotations,
+                    cov3D_precomp=None
+                )
+            return torch.clamp(rendered_img, 0.0, 1.0)
+        except Exception:
+            return None
+
     def update_streaming_frame(
         self,
         timestep: int,
@@ -653,7 +741,17 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     t_tsdf_total += (time.perf_counter() - t_s1) * 1000.0
 
                     # Step 3: VDC variation detection & initialization on newly observed surfaces
-                    rendered_rgb = rgb_tensor.clone()
+                    if self.closed_loop_avd:
+                        rendered_rgb = self.render_scene_view(
+                            intrinsic=k_tensor,
+                            camera_pose=t_tensor,
+                            width=rgb_tensor.shape[2],
+                            height=rgb_tensor.shape[1]
+                        )
+                        if rendered_rgb is None:
+                            rendered_rgb = rgb_tensor.clone()
+                    else:
+                        rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
 
                     new_g = self.vg_pipeline.vdc.detect_and_initialize_gaussians(
@@ -1015,6 +1113,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 grid_dim=self.grid_dim,
                 origin=self.grid_origin,
                 max_weight=self.max_weight,
+                tau_s=self.tau_s,
                 tau_p=self.tau_p,
                 safety_margin_factor=self.safety_margin_factor,
                 device=self.device

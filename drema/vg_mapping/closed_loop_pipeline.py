@@ -57,6 +57,7 @@ class DREMAClosedLoopVGMappingPipeline:
         grid_dim: Tuple[int, int, int] = (128, 128, 128),
         origin: Tuple[float, float, float] = (-0.64, -0.64, -0.64),
         max_weight: float = 15.0,
+        tau_s: float = 0.6,
         tau_p: float = 0.2,
         safety_margin_factor: float = 1.0,
         device: str = "cuda" if torch.cuda.is_available() else "cpu"
@@ -64,7 +65,7 @@ class DREMAClosedLoopVGMappingPipeline:
         self.p = pybullet_client
         self.device = device
         self.tsdf_map = TSDFVoxelMap(voxel_size=voxel_size, grid_dim=grid_dim, origin=origin, max_weight=max_weight, device=device)
-        self.vdc = VariationAwareDensityController(tau_p=tau_p, safety_margin_factor=safety_margin_factor, device=device)
+        self.vdc = VariationAwareDensityController(tau_s=tau_s, tau_p=tau_p, safety_margin_factor=safety_margin_factor, device=device)
         self.se3_aligner = RecurGSLieAlgebraAligner(device=device)
 
         self.tracked_objects: Dict[int, Dict[str, torch.Tensor]] = {}
