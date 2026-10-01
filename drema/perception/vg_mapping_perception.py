@@ -704,6 +704,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         total_added_in_frame = 0
         tracked_poses = {}
         tracked_deltas = {}
+        all_active_surface_mortons = None
 
         if self.vg_pipeline is not None and len(camera_views) > 0:
             workspace_bounds_t = self.workspace_bounds_t
@@ -980,6 +981,44 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     name_o = self.tracked_objects[oid]['name']
                     pos_o = self.tracked_objects[oid]['last_pos']
                     print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
+
+                    # Generic diagnostic: dynamic object surface retention vs orphan stains
+                    if len(self.scene_gaussians.get('xyz', [])) > 0:
+                        with torch.no_grad():
+                            g_xyz = self.scene_gaussians['xyz']
+                            g_rgb = self.scene_gaussians['rgb']
+                            g_morton = self.scene_gaussians['morton']
+                            g_obj_id = self.scene_gaussians.get('obj_id', None)
+
+                            # Generic match by semantic ID or canonical color similarity
+                            col_raw = self.tracked_objects[oid].get('color', [0.2, 0.4, 0.8])
+                            obj_col = torch.tensor(col_raw[:3], device=self.device, dtype=torch.float32)
+                            col_dist = torch.norm(g_rgb - obj_col, dim=1)
+                            if g_obj_id is not None and torch.any(g_obj_id == oid):
+                                is_this_obj = (g_obj_id == oid) | (col_dist < 0.25)
+                            else:
+                                is_this_obj = (col_dist < 0.25)
+
+                            dims = self.tracked_objects[oid].get('dims', [0.1, 0.1, 0.1])
+                            r_bbox = max(float(dims[0]), float(dims[1])) * 0.75 + 0.05
+                            pos_tensor = torch.tensor(pos_o[:2], device=self.device, dtype=torch.float32)
+                            d_xy = torch.norm(g_xyz[:, :2] - pos_tensor, dim=1)
+
+                            active_on_obj = int((is_this_obj & (d_xy <= r_bbox)).sum().item())
+                            orphans = is_this_obj & (d_xy > r_bbox)
+
+                            s_vox = self.voxel_size
+                            orphans_on_table = orphans & (torch.abs(g_xyz[:, 2] - self.z_table) <= (s_vox * 1.5))
+                            orphans_in_air = orphans & (g_xyz[:, 2] > (self.z_table + s_vox * 1.5))
+                            n_orph_tab = int(orphans_on_table.sum().item())
+                            n_orph_air = int(orphans_in_air.sum().item())
+
+                            n_shielded = 0
+                            if all_active_surface_mortons is not None and len(all_active_surface_mortons) > 0 and n_orph_tab > 0:
+                                shielded_mask = orphans_on_table & torch.isin(g_morton, all_active_surface_mortons)
+                                n_shielded = int(shielded_mask.sum().item())
+
+                            print(f"  │    └─ Obj #{oid} ('{name_o}') Stains Diagnostic: {active_on_obj:,} on body | {n_orph_tab} orphans on table | {n_orph_air} orphans in air | {n_shielded}/{max(1, n_orph_tab)} table orphans shielded by confirmed table surface")
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
