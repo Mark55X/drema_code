@@ -470,7 +470,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         # Optional Paper-Compliant Photometric SGD on Initial Scan (Sec. III-B.3)
         if self.enable_sgd and retained_count > 0 and len(scan_frames) > 0:
             n_scan_iters = max(10, self.sgd_steps * 2)
-            print(f"\n[VG-Mapping Initial Scan] Executing Photometric SGD Optimization ({n_scan_iters} iterations across {len(scan_frames)} scan views)...")
+            # Sample up to 20 evenly distributed 360 views around the orbit for fast and stable SGD
+            n_sample = min(20, len(scan_frames))
+            step_idx = max(1, len(scan_frames) // n_sample)
+            selected_scan_frames = [scan_frames[i] for i in range(0, len(scan_frames), step_idx)][:n_sample]
+
+            print(f"\n[VG-Mapping Initial Scan] Executing Photometric SGD Optimization ({n_scan_iters} iterations across {len(selected_scan_frames)} representative 360° views)...")
             t_sgd_scan_start = time.perf_counter()
             try:
                 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
@@ -494,7 +499,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 rotations[:, 0] = 1.0
 
                 prepped_scan_views = []
-                for f_data in scan_frames:
+                for f_data in selected_scan_frames:
                     c2w_t = torch.from_numpy(f_data['extrinsics'].copy()).to(self.device, dtype=torch.float32)
                     k_t = torch.from_numpy(f_data['intrinsics'].copy()).to(self.device, dtype=torch.float32)
                     raw_rgb = f_data['rgb']
@@ -544,6 +549,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         'gt_rgb_4d': gt_rgb.unsqueeze(0)
                     })
 
+                n_views = max(1, len(prepped_scan_views))
                 for it in range(n_scan_iters):
                     sgd_opt.zero_grad()
                     step_loss = torch.tensor(0.0, device=self.device)
@@ -564,7 +570,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         ll1 = l1_loss(rendered, pv['gt_rgb'])
                         ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
                         view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
-                        step_loss = step_loss + view_loss
+                        step_loss = step_loss + (view_loss / n_views)
 
                     step_loss.backward()
                     sgd_opt.step()
@@ -1122,7 +1128,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             ll1 = l1_loss(rendered, pv['gt_rgb'])
                             ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
                             view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
-                            step_loss = step_loss + view_loss
+                            step_loss = step_loss + (view_loss / max(1, len(prepped_views)))
 
                         step_loss.backward()
                         sgd_opt.step()
