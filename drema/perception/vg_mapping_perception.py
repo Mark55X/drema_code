@@ -1817,7 +1817,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
-            print(f"  └─ Total Step Latency: {total_elapsed_ms:.1f}ms ({fps:.1f} Hz)\n")
+            vram_str = ""
+            if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+                vram_mb = torch.cuda.max_memory_allocated() / (1024**2)
+                vram_str = f" | GPU VRAM: {vram_mb:.0f}MB"
+            print(f"  └─ Total Step Latency: {total_elapsed_ms:.1f}ms ({fps:.1f} Hz){vram_str}\n")
 
         return StreamingUpdateResult(
             timestep=timestep,

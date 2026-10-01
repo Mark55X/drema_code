@@ -1,0 +1,108 @@
+# ==============================================================================
+# Benchmark Profile 2: Balanced Real-Time (Recommended Profile)
+# Expected: ~7.5 - 10.0 Hz | Raycast Stride: 2 (2x subsampled) | tau_s: 0.35
+# Features: Zero table churn (tau_s=0.35), 4x faster raycast pruning, high accuracy tracking
+# ==============================================================================
+
+system:
+  device: "auto"
+  grpc_port: 50051
+  viser:
+    enabled: true
+    port: 8080
+    update_decimation: 3
+    max_splats: 50000
+
+communication:
+  client:
+    ping_timeout_s: 1.5
+    ping_max_retries: 3
+    scan_chunk_size: 2
+    scan_chunk_timeout_s: 180.0
+    cam_resolution: [256, 256]
+
+perception:
+  module: "vg_mapping_recurgs"
+  frequency_hz: 10.0
+  queue_max_size: 5
+  voxel_size: 0.01
+
+  diagnostics:
+    log_interval_frames: 10
+    enable_timing_breakdown: true
+
+  workspace:
+    table_z_prior: 0.75
+    reachability_radius: 0.95
+    robot_base_radius: 0.13
+    obstacle_min_clearance_z: 0.015
+    workspace_margin: 0.05
+    table_thickness: 0.05
+    table_bounds_fallback: [-0.50, 1.10, -0.55, 0.55]
+
+  mapping:
+    closed_loop_avd: true
+    raycast_stride: 2                # 2x subsampled raycast (cuts pruning from ~90ms to ~22ms)
+    raycast_steps: null
+    tau_s: 0.35                      # Robust SSIM threshold (eliminates false AVD on static table)
+    tau_p: 0.2
+    tau_w: 1.0
+    max_weight: 10.0
+    safety_margin_factor: 1.0
+
+    object_mesh_voxel_size: 0.005
+    object_mesh_sdf_trunc: 0.02
+    object_mesh_max_weight: 15.0
+    depth_near: 0.1
+    depth_far: 3.0
+    taubin_iterations: 3
+
+  gaussians:
+    scale_tangent_min: 0.012
+    scale_normal_min: 0.003
+    opacity_init: 0.95
+
+  sgd:
+    enabled: false
+    steps: 5
+    lr_color: 0.01
+    lr_opacity: 0.05
+    lambda_ssim: 0.2
+    prune_opacity_threshold: 0.05
+
+  tracking:
+    se3_iterations: 12               # Balanced Lie algebra iterations
+    se3_icp_iterations: 8            # Balanced ICP iterations
+    subsample: 256
+    learning_rate: 0.003
+    tolerance: 0.0001
+    proximity_search_radius: 0.25
+
+  cache:
+    enabled: true
+    save_on_scan: true
+    cache_dir: "cache/scene_init"
+
+digital_twin:
+  engine: "pybullet"
+  gui: true
+  time_step: 0.002
+  urdf_path: "assets/franka_panda/panda.urdf"
+  mujoco_model_path: "assets/franka_panda/panda.xml"
+  tracking_mode: "constraint"
+  constraint_max_force: 300.0
+  kp_pos: 250.0
+  kd_pos: 30.0
+  kp_rot: 15.0
+  kd_rot: 1.5
+  sim_substeps: 2
+
+controller:
+  engine: "mp_pmppi"
+  frequency_hz: 20.0
+  dt: 0.05
+  horizon: 15
+  max_joint_velocity: 0.50
+  max_joint_acc: 0.50
+  num_samples_per_planner: 24
+  top_k: 12
