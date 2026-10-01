@@ -144,6 +144,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.raycast_steps = map_cfg.get("raycast_steps", None)
         self.tau_s = float(map_cfg.get("tau_s", 0.6))
         self.tau_p = float(map_cfg.get("tau_p", 0.2))
+        self.tau_floater = float(map_cfg.get("tau_floater", 0.95))
         self.max_weight = float(map_cfg.get("max_weight", 3.0))
         self.safety_margin_factor = float(map_cfg.get("safety_margin_factor", 1.0))
 
@@ -343,6 +344,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             max_weight=self.max_weight,
             tau_s=self.tau_s,
             tau_p=self.tau_p,
+            tau_floater=self.tau_floater,
             safety_margin_factor=self.safety_margin_factor,
             device=self.device
         )
@@ -750,7 +752,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                     d_masked, mask_t = self._apply_semantic_robot_mask(depth_t=d_tensor, mask_np=mask_np)
 
-                    # Step 1: Raycast Pruning of deleted objects and floaters against prior TSDF map (Eq. 17)
+                    # Step 1: Raycast Pruning of deleted objects against prior TSDF map (Eq. 17)
+                    # + Direct Floater Pruning for confirmed free space where F > tau_floater (Paper Sec. III-B.2)
                     t_prune_start = time.perf_counter()
                     prune_mask = self.vg_pipeline.vdc.prune_gaussians_via_morton(
                         depth_obs=d_masked,
@@ -763,11 +766,18 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         confirmed_surface_mortons=all_active_surface_mortons
                     )
 
+                    floater_mask = self.vg_pipeline.vdc.prune_floaters_via_tsdf(
+                        gaussian_xyz=self.scene_gaussians['xyz'],
+                        tsdf_map=self.vg_pipeline.tsdf_map,
+                        tau_floater=self.tau_floater
+                    )
+                    total_prune_mask = prune_mask | floater_mask
+
                     n_pruned = 0
-                    if len(prune_mask) > 0 and torch.any(prune_mask):
-                        n_pruned = int(prune_mask.sum().item())
+                    if len(total_prune_mask) > 0 and torch.any(total_prune_mask):
+                        n_pruned = int(total_prune_mask.sum().item())
                         total_pruned_in_frame += n_pruned
-                        keep_mask = ~prune_mask
+                        keep_mask = ~total_prune_mask
                         for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
                             if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
                                 self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
@@ -832,14 +842,40 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                     new_g[k] = new_g[k][keep_geom]
 
                     if len(new_g['xyz']) > 0:
-                        added_morton = new_g['morton']
-                        if len(self.scene_gaussians['morton']) > 0:
-                            occupied = torch.isin(added_morton, self.scene_gaussians['morton'])
-                            non_dup = ~occupied
-                        else:
-                            non_dup = torch.ones_like(added_morton, dtype=torch.bool)
+                        # 0. Filter out invalid sentinel morton codes if any (< 0)
+                        valid_m = (new_g['morton'] >= 0)
+                        if not torch.all(valid_m):
+                            for k in list(new_g.keys()):
+                                if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(valid_m):
+                                    new_g[k] = new_g[k][valid_m]
 
-                        n_added = int(non_dup.sum().item())
+                        # 1. Deduplicate within the newly initialized batch (keep 1 Gaussian per voxel)
+                        added_m = new_g['morton']
+                        if len(added_m) > 1:
+                            perm = torch.argsort(added_m)
+                            sorted_m = added_m[perm]
+                            uniq_mask = torch.ones_like(sorted_m, dtype=torch.bool)
+                            uniq_mask[1:] = (sorted_m[1:] != sorted_m[:-1])
+                            keep_idx = perm[uniq_mask]
+                            for k in list(new_g.keys()):
+                                if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(added_m):
+                                    new_g[k] = new_g[k][keep_idx]
+
+                        # 2. Hybrid AVD Eviction & Re-initialization (Paper Sec. III-B.1 & III-B.2):
+                        # When AVD detects an appearance mismatch (or GVD detects geometric update)
+                        # on a voxel that already holds prior Gaussians, those prior Gaussians are
+                        # outdated. We evict the stale Gaussians so the freshly observed surface
+                        # Gaussian takes over without duplicating voxels or leaving stale stains.
+                        if len(self.scene_gaussians['morton']) > 0 and len(new_g['morton']) > 0:
+                            stale_mask = torch.isin(self.scene_gaussians['morton'], new_g['morton']) & (self.scene_gaussians['morton'] >= 0)
+                            if torch.any(stale_mask):
+                                keep_mask = ~stale_mask
+                                for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                                    if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
+                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+
+                        # 3. Commit newly initialized surface Gaussians
+                        n_added = len(new_g['xyz'])
                         total_added_in_frame += n_added
 
                         for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
@@ -849,7 +885,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 val = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(new_g['xyz']), 1)
                             else:
                                 val = torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
-                            self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val[non_dup]], dim=0)
+                            self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val], dim=0)
 
                     t_detect_total += (time.perf_counter() - t_det_start) * 1000.0
 
@@ -982,12 +1018,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     pos_o = self.tracked_objects[oid]['last_pos']
                     print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
 
-                    # Generic diagnostic: dynamic object surface retention vs orphan stains
+                    # Generic tracking verification: dynamic object surface retention vs orphan stains
                     if len(self.scene_gaussians.get('xyz', [])) > 0:
                         with torch.no_grad():
                             g_xyz = self.scene_gaussians['xyz']
                             g_rgb = self.scene_gaussians['rgb']
-                            g_morton = self.scene_gaussians['morton']
                             g_obj_id = self.scene_gaussians.get('obj_id', None)
 
                             # Generic match by semantic ID or canonical color similarity
@@ -1006,19 +1041,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                             active_on_obj = int((is_this_obj & (d_xy <= r_bbox)).sum().item())
                             orphans = is_this_obj & (d_xy > r_bbox)
-
-                            s_vox = self.voxel_size
-                            orphans_on_table = orphans & (torch.abs(g_xyz[:, 2] - self.z_table) <= (s_vox * 1.5))
-                            orphans_in_air = orphans & (g_xyz[:, 2] > (self.z_table + s_vox * 1.5))
-                            n_orph_tab = int(orphans_on_table.sum().item())
-                            n_orph_air = int(orphans_in_air.sum().item())
-
-                            n_shielded = 0
-                            if all_active_surface_mortons is not None and len(all_active_surface_mortons) > 0 and n_orph_tab > 0:
-                                shielded_mask = orphans_on_table & torch.isin(g_morton, all_active_surface_mortons)
-                                n_shielded = int(shielded_mask.sum().item())
-
-                            print(f"  │    └─ Obj #{oid} ('{name_o}') Stains Diagnostic: {active_on_obj:,} on body | {n_orph_tab} orphans on table | {n_orph_air} orphans in air | {n_shielded}/{max(1, n_orph_tab)} table orphans shielded by confirmed table surface")
+                            n_orph = int(orphans.sum().item())
+                            print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | {n_orph} orphan stains ({'CLEAN' if n_orph == 0 else 'resolving'})")
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
@@ -1204,6 +1228,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 max_weight=self.max_weight,
                 tau_s=self.tau_s,
                 tau_p=self.tau_p,
+                tau_floater=self.tau_floater,
                 safety_margin_factor=self.safety_margin_factor,
                 device=self.device
             )
