@@ -551,13 +551,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
                     mask_np = f_data.get('mask')
                     if mask_np is not None:
-                        mask_raw = torch.from_numpy(mask_np.copy()).to(self.device)
+                        mask_raw = torch.from_numpy(mask_np.copy()).to(self.device).squeeze()
                         filter_ids = self.robot_ids | self.virtual_ids
                         if len(filter_ids) > 0:
                             f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
                             is_robot = torch.isin(mask_raw, f_ids)
                             f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
-                            dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2).squeeze() > 0.5)
+                            dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2)[0, 0] > 0.5)
                             v_mask = (~dilated_robot).float()
                         else:
                             v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
@@ -1132,13 +1132,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
                         mask_np = c_data.get('mask')
                         if mask_np is not None:
-                            mask_raw = torch.from_numpy(mask_np.copy()).to(self.device)
+                            mask_raw = torch.from_numpy(mask_np.copy()).to(self.device).squeeze()
                             filter_ids = self.robot_ids | self.virtual_ids
                             if len(filter_ids) > 0:
                                 f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
                                 is_robot = torch.isin(mask_raw, f_ids)
                                 f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
-                                dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2).squeeze() > 0.5)
+                                dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2)[0, 0] > 0.5)
                                 v_mask = (~dilated_robot).float()
                             else:
                                 v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)

@@ -101,17 +101,16 @@ def masked_l1_loss(network_output: torch.Tensor, gt: torch.Tensor, mask: Optiona
         return torch.abs(network_output - gt).mean()
 
     diff = torch.abs(network_output - gt)
-    if mask.dim() == 2:
-        m = (mask > 0.5).unsqueeze(0).expand_as(diff)
-    elif mask.dim() == 3 and mask.shape[0] == 1:
-        m = (mask > 0.5).expand_as(diff)
-    elif mask.dim() == 4 and mask.shape[1] == 1:
-        m = (mask > 0.5).expand_as(diff)
-    else:
-        m = (mask > 0.5)
+    m = (mask > 0.5).to(device=diff.device, dtype=diff.dtype)
+    if m.dim() == 2:
+        m = m.unsqueeze(0).expand_as(diff)
+    elif m.dim() == 3 and m.shape[0] == 1:
+        m = m.expand_as(diff)
+    elif m.dim() == 4 and m.shape[1] == 1:
+        m = m.expand_as(diff)
 
     denom = m.sum().clamp(min=1.0)
-    return (diff * m.float()).sum() / denom
+    return (diff * m).sum() / denom
 
 
 def masked_ssim(img1: torch.Tensor, img2: torch.Tensor, mask: Optional[torch.Tensor] = None, window_size: int = 11) -> torch.Tensor:
@@ -150,20 +149,25 @@ def masked_ssim(img1: torch.Tensor, img2: torch.Tensor, mask: Optional[torch.Ten
     C2_val = 0.03 ** 2
     ssim_map = ((2 * mu1_mu2 + C1_val) * (2 * sigma12 + C2_val)) / ((mu1_sq + mu2_sq + C1_val) * (sigma1_sq + sigma2_sq + C2_val))
 
-    if mask.dim() == 2:
-        m_2d = (mask > 0.5).float().unsqueeze(0).unsqueeze(0)
-    elif mask.dim() == 3:
-        m_2d = (mask > 0.5).float().unsqueeze(0)
+    m_cast = (mask > 0.5).to(device=img1.device, dtype=img1.dtype)
+    if m_cast.dim() == 2:
+        m_2d = m_cast.unsqueeze(0).unsqueeze(0)
+    elif m_cast.dim() == 3:
+        m_2d = m_cast.unsqueeze(0)
     else:
-        m_2d = (mask > 0.5).float()
+        m_2d = m_cast
 
     r = window_size // 2
     # Erode valid mask so boundary patches containing masked pixels are not averaged
     eroded_mask = 1.0 - F.max_pool2d(1.0 - m_2d, kernel_size=2 * r + 1, stride=1, padding=r)
-    eroded_mask = (eroded_mask > 0.5).float()
+    eroded_mask = (eroded_mask > 0.5).type_as(img1)
 
-    if ssim_map.dim() == 4:
-        eroded_mask = eroded_mask.expand_as(ssim_map)
+    if eroded_mask.sum() == 0:
+        if m_2d.sum() == 0:
+            return torch.tensor(1.0, device=img1.device, dtype=img1.dtype)
+        eval_mask = m_2d.expand_as(ssim_map) if ssim_map.dim() == 4 else m_2d
+    else:
+        eval_mask = eroded_mask.expand_as(ssim_map) if ssim_map.dim() == 4 else eroded_mask
 
-    denom = eroded_mask.sum().clamp(min=1.0)
-    return (ssim_map * eroded_mask).sum() / denom
+    denom = eval_mask.sum().clamp(min=1.0)
+    return (ssim_map * eval_mask).sum() / denom
