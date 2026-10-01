@@ -14,6 +14,10 @@ from typing import Optional, Tuple, List, Dict, Any, Set
 import numpy as np
 import torch
 import trimesh
+try:
+    import trimesh.smoothing
+except Exception:
+    pass
 
 # Ensure parent master-thesis directory is in sys.path for vgmapping_drema
 thesis_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
@@ -21,9 +25,135 @@ if thesis_root not in sys.path:
     sys.path.insert(0, thesis_root)
 
 import mcubes
+from vgmapping_drema.tsdf import TSDFVoxelMap
 from .base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult, DiscoveredObstacle
 from ..vg_mapping.closed_loop_pipeline import DREMAClosedLoopVGMappingPipeline, rotation_matrix_to_quaternion
 from ..config import ConfigDict
+
+
+def extract_semantic_object_mesh_from_scan(
+    scan_frames: List[Dict[str, Any]],
+    target_obj_id: int,
+    voxel_size: float = 0.005,
+    sdf_trunc: float = 0.02,
+    depth_near: float = 0.1,
+    depth_far: float = 3.0,
+    max_weight: float = 15.0,
+    device: str = "cuda"
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Extracts a pristine, complete 3D surface mesh for a specific semantic object ID
+    from the initial scan frames following the original DREMA architecture:
+    - Isolates depth observations to only pixels where mask == target_obj_id (depth[mask != id] = 0).
+    - Eliminates the supporting tabletop and background entirely from this object's reconstruction.
+    - Constructs a focused, high-resolution TSDF grid around the object bounds.
+    - Extracts solid surface via Marching Cubes without any artificial vertical z_cutoff,
+      preserving the complete bottom contact surface of the object intact.
+    """
+    valid_frames = []
+    pts_sample = []
+
+    for f in scan_frames:
+        mask = f.get('mask')
+        if mask is None:
+            continue
+        if isinstance(mask, torch.Tensor):
+            mask_np = mask.cpu().numpy()
+        else:
+            mask_np = np.asarray(mask)
+        if mask_np.ndim == 3:
+            mask_np = mask_np.squeeze(0)
+
+        obj_pixels = (mask_np == target_obj_id)
+        if not np.any(obj_pixels):
+            continue
+
+        depth = f.get('depth')
+        if depth is None:
+            continue
+        if isinstance(depth, torch.Tensor):
+            depth_np = depth.cpu().numpy()
+        else:
+            depth_np = np.asarray(depth)
+        if depth_np.ndim == 3:
+            depth_np = depth_np.squeeze(0)
+
+        d_vals = depth_np[obj_pixels]
+        valid_d = (d_vals > depth_near) & (d_vals < depth_far)
+        if not np.any(valid_d):
+            continue
+
+        valid_frames.append((f, obj_pixels))
+
+        v_coords, u_coords = np.nonzero(obj_pixels)
+        v_coords = v_coords[valid_d]
+        u_coords = u_coords[valid_d]
+        d_vals = d_vals[valid_d]
+
+        K = f['intrinsics']
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+
+        x_c = (u_coords.astype(float) - cx) * d_vals / fx
+        y_c = (v_coords.astype(float) - cy) * d_vals / fy
+        p_c = np.stack([x_c, y_c, d_vals], axis=-1)
+
+        c2w = f['extrinsics']
+        p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
+        pts_sample.append(p_w)
+
+    if len(pts_sample) == 0:
+        return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
+
+    all_pts = np.vstack(pts_sample)
+    # Bounding box with 2-voxel safety boundary for zero-crossing contouring
+    margin = 2.0 * voxel_size
+    p_min = np.min(all_pts, axis=0) - margin
+    p_max = np.max(all_pts, axis=0) + margin
+
+    dim_x = int(np.ceil((p_max[0] - p_min[0]) / voxel_size))
+    dim_y = int(np.ceil((p_max[1] - p_min[1]) / voxel_size))
+    dim_z = int(np.ceil((p_max[2] - p_min[2]) / voxel_size))
+
+    # Pad to multiple of 8 for CUDA block memory alignment
+    dim_x = max(16, min(256, ((dim_x + 7) // 8) * 8))
+    dim_y = max(16, min(256, ((dim_y + 7) // 8) * 8))
+    dim_z = max(16, min(256, ((dim_z + 7) // 8) * 8))
+
+    origin = (float(p_min[0]), float(p_min[1]), float(p_min[2]))
+    grid_dim = (dim_x, dim_y, dim_z)
+    noise_threshold = 2.0 * voxel_size
+
+    obj_tsdf = TSDFVoxelMap(
+        voxel_size=voxel_size,
+        truncation_margin=sdf_trunc,
+        noise_threshold=noise_threshold,
+        grid_dim=grid_dim,
+        origin=origin,
+        max_weight=max_weight,
+        device=device
+    )
+
+    for f, obj_pixels in valid_frames:
+        depth_raw = f['depth']
+        if isinstance(depth_raw, torch.Tensor):
+            d_t = depth_raw.to(device).clone().float()
+        else:
+            d_t = torch.from_numpy(depth_raw).to(device).float()
+        if d_t.dim() == 2:
+            d_t = d_t.unsqueeze(0)
+
+        # In pure DREMA fashion, zero out all pixels outside this object
+        mask_t = torch.from_numpy(obj_pixels).to(device)
+        d_t[:, ~mask_t] = 0.0
+
+        k_t = torch.from_numpy(f['intrinsics']).to(device).float() if isinstance(f['intrinsics'], np.ndarray) else f['intrinsics'].to(device).float()
+        pose_t = torch.from_numpy(f['extrinsics']).to(device).float() if isinstance(f['extrinsics'], np.ndarray) else f['extrinsics'].to(device).float()
+
+        obj_tsdf.integrate_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
+
+    verts, faces = obj_tsdf.extract_mesh(level=0.0)
+    return verts, faces
 
 
 def extract_obstacle_mesh_from_tsdf(
@@ -121,6 +251,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.reachability_radius = float(ws_cfg.get("reachability_radius", 0.95))
         self.robot_base_radius = float(ws_cfg.get("robot_base_radius", 0.13))
         self.obstacle_min_clearance_z = float(ws_cfg.get("obstacle_min_clearance_z", 0.015))
+        self.workspace_margin = float(ws_cfg.get("workspace_margin", 0.05))
+        self.table_thickness = float(ws_cfg.get("table_thickness", 0.05))
+        self.table_bounds_fallback = tuple(ws_cfg.get("table_bounds_fallback", [-0.50, 1.10, -0.55, 0.55]))
 
         # Gaussians configuration
         gs_cfg = config.get_nested("perception.gaussians", {})
@@ -145,8 +278,18 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.tau_s = float(map_cfg.get("tau_s", 0.6))
         self.tau_p = float(map_cfg.get("tau_p", 0.2))
         self.tau_floater = float(map_cfg.get("tau_floater", 0.95))
-        self.max_weight = float(map_cfg.get("max_weight", 3.0))
+        self.max_weight = float(map_cfg.get("max_weight", 10.0))
+        tau_w_cfg = map_cfg.get("tau_w", None)
+        self.tau_w = float(tau_w_cfg) if tau_w_cfg is not None else 1.0
         self.safety_margin_factor = float(map_cfg.get("safety_margin_factor", 1.0))
+
+        # Dynamic Object Semantic Mesh Extraction (DREMA Architecture)
+        self.object_mesh_voxel_size = float(map_cfg.get("object_mesh_voxel_size", 0.005))
+        self.object_mesh_sdf_trunc = float(map_cfg.get("object_mesh_sdf_trunc", 0.02))
+        self.object_mesh_max_weight = float(map_cfg.get("object_mesh_max_weight", 15.0))
+        self.depth_near = float(map_cfg.get("depth_near", 0.1))
+        self.depth_far = float(map_cfg.get("depth_far", 3.0))
+        self.taubin_iterations = int(map_cfg.get("taubin_iterations", 3))
 
         # Diagnostics & Timing Breakdown
         diag_cfg = config.get_nested("perception.diagnostics", {})
@@ -215,6 +358,68 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             depth_masked[0, dilated] = 0.0
         return depth_masked, mask_t
 
+    def get_all_active_gaussians(self) -> Dict[str, torch.Tensor]:
+        """
+        Assembles all active Gaussians (static background + all tracked dynamic objects)
+        into a unified dictionary for forward rasterization, Viser rendering, and output results.
+        Follows the object-centric architecture: static scene is separated from rigid object models.
+        """
+        if len(self.tracked_objects) == 0:
+            return self.scene_gaussians
+
+        static_xyz = self.scene_gaussians.get('xyz')
+        if static_xyz is not None and len(static_xyz) > 0:
+            n_stat = len(static_xyz)
+            parts_xyz = [static_xyz]
+            parts_rgb = [self.scene_gaussians['rgb']]
+            parts_scale = [self.scene_gaussians['scale']]
+            if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == n_stat:
+                parts_normal = [self.scene_gaussians['normal']]
+            else:
+                parts_normal = [torch.tensor([[0.0, 0.0, 1.0]], device=self.device, dtype=torch.float32).repeat(n_stat, 1)]
+            if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == n_stat:
+                parts_opacity = [self.scene_gaussians['opacity']]
+            else:
+                parts_opacity = [torch.full((n_stat, 1), self.opacity_init, device=self.device, dtype=torch.float32)]
+            # Static background orientation quaternion (qw=1, qx=0, qy=0, qz=0)
+            parts_rotations = [torch.tensor([[1.0, 0.0, 0.0, 0.0]], device=self.device, dtype=torch.float32).repeat(n_stat, 1)]
+        else:
+            parts_xyz, parts_rgb, parts_scale, parts_normal, parts_opacity, parts_rotations = [], [], [], [], [], []
+
+        for oid, obj_data in self.tracked_objects.items():
+            obj_g = obj_data.get('gaussians')
+            if obj_g is not None and len(obj_g.get('xyz', [])) > 0:
+                n_obj = len(obj_g['xyz'])
+                parts_xyz.append(obj_g['xyz'])
+                parts_rgb.append(obj_g['rgb'])
+                parts_scale.append(obj_g['scale'])
+                if 'normal' in obj_g and len(obj_g['normal']) == n_obj:
+                    parts_normal.append(obj_g['normal'])
+                else:
+                    parts_normal.append(torch.tensor([[0.0, 0.0, 1.0]], device=self.device, dtype=torch.float32).repeat(n_obj, 1))
+                if 'opacity' in obj_g and len(obj_g['opacity']) == n_obj:
+                    parts_opacity.append(obj_g['opacity'])
+                else:
+                    parts_opacity.append(torch.full((n_obj, 1), self.opacity_init, device=self.device, dtype=torch.float32))
+
+                # Dynamic object orientation quaternion (convert PyBullet qx, qy, qz, qw to diff-gaussian-rasterization qw, qx, qy, qz)
+                obj_q = obj_data.get('last_quat', (0.0, 0.0, 0.0, 1.0))
+                q_diff = torch.tensor([[obj_q[3], obj_q[0], obj_q[1], obj_q[2]]], device=self.device, dtype=torch.float32).repeat(n_obj, 1)
+                parts_rotations.append(q_diff)
+
+        if len(parts_xyz) == 0:
+            return self.scene_gaussians
+
+        return {
+            'xyz': torch.cat(parts_xyz, dim=0),
+            'rgb': torch.cat(parts_rgb, dim=0),
+            'scale': torch.cat(parts_scale, dim=0),
+            'normal': torch.cat(parts_normal, dim=0),
+            'opacity': torch.cat(parts_opacity, dim=0),
+            'rotations': torch.cat(parts_rotations, dim=0),
+            'morton': self.scene_gaussians.get('morton', torch.empty(0, dtype=torch.int64, device=self.device))
+        }
+
     def process_initial_scan(
         self,
         scan_frames: List[Dict[str, Any]],
@@ -274,16 +479,18 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         z_vals = all_pts[:, 2]
         z_min_scan = float(np.percentile(z_vals, 1))
         z_max_scan = float(np.percentile(z_vals, 99))
-        num_bins = max(30, int((z_max_scan - z_min_scan) / 0.005))
+        hist_bin_width = self.voxel_size * 0.5
+        num_bins = max(30, int((z_max_scan - z_min_scan) / hist_bin_width))
         hist, bin_edges = np.histogram(z_vals, bins=num_bins, range=(z_min_scan, z_max_scan))
         peak_indices = np.argsort(hist)[::-1]
 
         found_table = False
         z_table = self.table_z_prior
         table_pts = None
+        cand_tolerance = self.voxel_size * 0.8
         for p_idx in peak_indices[:10]:
             candidate_z = float(0.5 * (bin_edges[p_idx] + bin_edges[p_idx + 1]))
-            cand_mask = np.abs(z_vals - candidate_z) <= 0.008
+            cand_mask = np.abs(z_vals - candidate_z) <= cand_tolerance
             cand_pts = all_pts[cand_mask]
             if len(cand_pts) >= 400:
                 z_table = candidate_z
@@ -293,8 +500,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         if not found_table or table_pts is None:
             z_table = self.table_z_prior
-            tab_x_min, tab_x_max = -0.50, 1.10
-            tab_y_min, tab_y_max = -0.55, 0.55
+            tab_x_min, tab_x_max = self.table_bounds_fallback[0], self.table_bounds_fallback[1]
+            tab_y_min, tab_y_max = self.table_bounds_fallback[2], self.table_bounds_fallback[3]
         else:
             tab_x_min = float(np.percentile(table_pts[:, 0], 0.5))
             tab_x_max = float(np.percentile(table_pts[:, 0], 99.5))
@@ -304,14 +511,14 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.z_table = z_table
         rb_x, rb_y, rb_z = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
         r_reach = self.reachability_radius
-        margin = 0.05
+        margin = self.workspace_margin
 
         act_x_min = max(tab_x_min, rb_x - r_reach - margin)
         act_x_max = min(tab_x_max, rb_x + r_reach + margin)
         act_y_min = max(tab_y_min, rb_y - r_reach - margin)
         act_y_max = min(tab_y_max, rb_y + r_reach + margin)
-        act_z_min = z_table - 0.05
-        act_z_max = z_table + 0.95
+        act_z_min = z_table - self.table_thickness
+        act_z_max = z_table + self.reachability_radius
 
         self.table_bounds = (act_x_min, act_x_max, act_y_min, act_y_max)
         self.active_workspace_bounds = {
@@ -412,7 +619,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
                 p_xy = new_g['xyz'][:, :2]
                 dist_base = torch.sqrt((p_xy[:, 0] - rx) ** 2 + (p_xy[:, 1] - ry) ** 2)
-                keep_geom = (dist_base > self.robot_base_radius) | (new_g['xyz'][:, 2] < (rz - 0.05))
+                keep_geom = (dist_base > self.robot_base_radius) | (new_g['xyz'][:, 2] < (rz - self.table_thickness))
                 if not torch.all(keep_geom):
                     for k in list(new_g.keys()):
                         if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == n_new_g:
@@ -616,128 +823,293 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             except Exception as e_sgd:
                 print(f"[VG MAPPING PERCEPTION Warning] Error during initial scan SGD optimization: {e_sgd}")
 
-        # 7. Extract Tabletop Obstacle Meshes via Marching Cubes
-        z_cutoff = z_table + self.obstacle_min_clearance_z
-        verts, faces = extract_obstacle_mesh_from_tsdf(
-            self.vg_pipeline.tsdf_map,
-            z_min_cutoff=z_cutoff,
-            z_max_cutoff=act_z_max,
-            x_bounds=(tab_x_min + 0.02, tab_x_max - 0.02),
-            y_bounds=(tab_y_min + 0.02, tab_y_max - 0.02),
-            level=0.0
-        )
-        print(f"✓ [VG-Mapping Marching Cubes] Extracted raw obstacle surface mesh: {len(verts)} vertices, {len(faces)} faces.")
-
+        # 7. Extract Tabletop Obstacle Meshes (DREMA Semantic Architecture + Marching Cubes)
         self.discovered_obstacles.clear()
-        if len(verts) > 0 and len(faces) > 0:
-            mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-            components = mesh.split(only_watertight=False)
+        self.tracked_objects.clear()
+        os.makedirs("assets/scanned_meshes", exist_ok=True)
 
-            valid_components = []
-            for comp in components:
-                ext = comp.bounds[1] - comp.bounds[0]
-                center_c = (comp.bounds[0] + comp.bounds[1]) / 2.0
-                in_table = (
-                    (center_c[0] >= tab_x_min + 0.02) and (center_c[0] <= tab_x_max - 0.02) and
-                    (center_c[1] >= tab_y_min + 0.02) and (center_c[1] <= tab_y_max - 0.02) and
-                    (center_c[2] >= z_table + 0.01) and (center_c[2] <= act_z_max)
+        extracted_any_semantic = False
+        if len(self.dynamic_object_ids) > 0:
+            print(f"\n[DREMA Semantic Reconstruction] Isolating {len(self.dynamic_object_ids)} dynamic object(s) via semantic depth masking...")
+            for obj_id in sorted(list(self.dynamic_object_ids)):
+                obj_name = id_to_name.get(obj_id, f"obstacle_{obj_id}")
+                t_obj_start = time.perf_counter()
+
+                # High-resolution TSDF reconstruction configured via drema_default.yaml
+                verts, faces = extract_semantic_object_mesh_from_scan(
+                    scan_frames=scan_frames,
+                    target_obj_id=obj_id,
+                    voxel_size=self.object_mesh_voxel_size,
+                    sdf_trunc=self.object_mesh_sdf_trunc,
+                    depth_near=self.depth_near,
+                    depth_far=self.depth_far,
+                    max_weight=self.object_mesh_max_weight,
+                    device=self.device
                 )
-                if in_table and np.max(ext) >= 0.02 and len(comp.vertices) >= 20:
-                    valid_components.append(comp)
 
-            if len(valid_components) == 0 and len(verts) >= 20:
-                valid_components = [mesh]
-
-            valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
-            print(f"✓ [VG-Mapping Marching Cubes] Discovered {len(valid_components)} distinct tabletop obstacle mesh(es).")
-
-            available_obj_names = [id_to_name[t] for t in self.dynamic_object_ids if t in id_to_name]
-            os.makedirs("assets/scanned_meshes", exist_ok=True)
-
-            for c_idx, comp in enumerate(valid_components):
-                comp_verts = comp.vertices
-                comp_faces = comp.faces
-                min_b, max_b = comp.bounds[0], comp.bounds[1]
-                centroid = list((min_b + max_b) / 2.0)
-                extents = list(max_b - min_b)
-
-                if len(available_obj_names) > 0:
-                    obj_name = available_obj_names.pop(0)
-                else:
-                    obj_name = f"obstacle_{c_idx}"
-
-                mesh_path = f"assets/scanned_meshes/{obj_name}_{c_idx}.obj"
-                verts_centered = comp_verts - np.array(centroid)
-                comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=comp_faces)
-                comp_centered.export(mesh_path)
-
-                # Discover real RGB color from associated surface Gaussians
-                g_xyz = self.scene_gaussians['xyz']
-                in_box = (
-                    (g_xyz[:, 0] >= min_b[0] - 0.02) & (g_xyz[:, 0] <= max_b[0] + 0.02) &
-                    (g_xyz[:, 1] >= min_b[1] - 0.02) & (g_xyz[:, 1] <= max_b[1] + 0.02) &
-                    (g_xyz[:, 2] >= min_b[2] - 0.01) & (g_xyz[:, 2] <= max_b[2] + 0.02)
-                )
-                if torch.any(in_box):
-                    mean_color = self.scene_gaussians['rgb'][in_box].mean(dim=0).cpu().numpy().tolist()
-                else:
-                    mean_color = [0.15, 0.45, 0.85]
-
-                pb_body_id = -1
-                if digital_twin is not None:
-                    pb_body_id = digital_twin.spawn_scanned_mesh_obstacle(
-                        mesh_path=mesh_path,
-                        initial_pos=centroid,
-                        initial_quat=(0, 0, 0, 1),
-                        name=f"{obj_name}_{c_idx}",
-                        is_target=False,
-                        mass=0.0,
-                        color=mean_color + [1.0],
-                        obj_id=c_idx
+                if len(verts) < 20 or len(faces) < 20:
+                    # Fallback to coarser resolution if point cloud density is sparse
+                    verts, faces = extract_semantic_object_mesh_from_scan(
+                        scan_frames=scan_frames,
+                        target_obj_id=obj_id,
+                        voxel_size=self.object_mesh_voxel_size * 2.0,
+                        sdf_trunc=self.object_mesh_sdf_trunc * 2.0,
+                        depth_near=self.depth_near,
+                        depth_far=self.depth_far,
+                        max_weight=self.object_mesh_max_weight,
+                        device=self.device
                     )
 
-                # Initialize canonical tracking point cloud
-                if torch.any(in_box):
-                    c_xyz = self.scene_gaussians['xyz'][in_box]
-                    c_rgb = self.scene_gaussians['rgb'][in_box]
-                else:
-                    v_t = torch.tensor(comp_verts, dtype=torch.float32, device=self.device)
-                    c_xyz = v_t
-                    c_rgb = torch.tensor(mean_color, dtype=torch.float32, device=self.device).repeat(len(v_t), 1)
+                if len(verts) >= 20 and len(faces) >= 20:
+                    mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+                    # Component filtering: isolate primary outer connected component
+                    components = mesh.split(only_watertight=False)
+                    if len(components) > 1:
+                        mesh = max(components, key=lambda c: len(c.vertices))
 
-                self.tracked_objects[c_idx] = {
-                    'name': obj_name,
-                    'mesh_path': mesh_path,
-                    'initial_pos': centroid,
-                    'initial_quat': (0.0, 0.0, 0.0, 1.0),
-                    'last_pos': centroid,
-                    'last_quat': (0.0, 0.0, 0.0, 1.0),
-                    'dims': extents,
-                    'color': mean_color,
-                    'pybullet_id': pb_body_id,
-                    'is_target': False,
-                    'canonical_points': {
-                        'xyz': c_xyz,
-                        'rgb': c_rgb
+                    # Generic mesh smoothing configured via perception.mapping.taubin_iterations
+                    if self.taubin_iterations > 0 and hasattr(trimesh, 'smoothing'):
+                        try:
+                            mesh = trimesh.smoothing.filter_taubin(mesh, iterations=self.taubin_iterations)
+                        except Exception:
+                            pass
+
+                    min_b, max_b = mesh.bounds[0], mesh.bounds[1]
+                    centroid = list((min_b + max_b) / 2.0)
+                    extents = list(max_b - min_b)
+
+                    mesh_path = f"assets/scanned_meshes/{obj_name}_{obj_id}.obj"
+                    verts_centered = mesh.vertices - np.array(centroid)
+                    comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=mesh.faces)
+                    comp_centered.export(mesh_path)
+
+                    # Surface Gaussians: isolate object primitives based on semantic ID and bounding hull
+                    g_obj_id = self.scene_gaussians.get('obj_id')
+                    margin_xy = 1.5 * self.voxel_size
+                    margin_z = 0.5 * self.voxel_size
+                    g_xyz = self.scene_gaussians['xyz']
+                    box_mask = (
+                        (g_xyz[:, 0] >= min_b[0] - margin_xy) & (g_xyz[:, 0] <= max_b[0] + margin_xy) &
+                        (g_xyz[:, 1] >= min_b[1] - margin_xy) & (g_xyz[:, 1] <= max_b[1] + margin_xy) &
+                        (g_xyz[:, 2] >= min_b[2] - margin_z) & (g_xyz[:, 2] <= max_b[2] + margin_xy)
+                    )
+
+                    if g_obj_id is not None and torch.any(g_obj_id == obj_id):
+                        obj_g_mask = (g_obj_id == obj_id)
+                    else:
+                        obj_g_mask = box_mask
+
+                    if torch.any(obj_g_mask):
+                        c_xyz = self.scene_gaussians['xyz'][obj_g_mask].clone()
+                        c_rgb = self.scene_gaussians['rgb'][obj_g_mask].clone()
+                        c_scale = self.scene_gaussians['scale'][obj_g_mask].clone()
+                        c_normal = self.scene_gaussians['normal'][obj_g_mask].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
+                        c_opacity = self.scene_gaussians['opacity'][obj_g_mask].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
+                        mean_color = c_rgb.mean(dim=0).cpu().numpy().tolist()
+                    else:
+                        v_t = torch.tensor(mesh.vertices, dtype=torch.float32, device=self.device)
+                        mean_color = [0.15, 0.45, 0.85]
+                        c_xyz = v_t
+                        c_rgb = torch.tensor(mean_color, dtype=torch.float32, device=self.device).repeat(len(v_t), 1)
+                        c_scale = torch.full((len(v_t), 3), self.voxel_size * 0.5, dtype=torch.float32, device=self.device)
+                        if hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) == len(v_t):
+                            c_normal = torch.tensor(mesh.vertex_normals, dtype=torch.float32, device=self.device)
+                        else:
+                            c_normal = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(v_t), 1)
+                        c_opacity = torch.full((len(v_t), 1), self.opacity_init, dtype=torch.float32, device=self.device)
+
+                    pb_body_id = -1
+                    if digital_twin is not None:
+                        pb_body_id = digital_twin.spawn_scanned_mesh_obstacle(
+                            mesh_path=mesh_path,
+                            initial_pos=centroid,
+                            initial_quat=(0, 0, 0, 1),
+                            name=f"{obj_name}_{obj_id}",
+                            is_target=False,
+                            mass=0.0,
+                            color=mean_color + [1.0],
+                            obj_id=obj_id
+                        )
+
+                    self.tracked_objects[obj_id] = {
+                        'name': obj_name,
+                        'mesh_path': mesh_path,
+                        'initial_pos': centroid,
+                        'initial_quat': (0.0, 0.0, 0.0, 1.0),
+                        'last_pos': centroid,
+                        'last_quat': (0.0, 0.0, 0.0, 1.0),
+                        'last_T': torch.eye(4, device=self.device, dtype=torch.float32),
+                        'dims': extents,
+                        'color': mean_color,
+                        'pybullet_id': pb_body_id,
+                        'is_target': False,
+                        'canonical_points': {
+                            'xyz': c_xyz.clone(),
+                            'rgb': c_rgb.clone(),
+                            'normal': c_normal.clone(),
+                            'scale': c_scale.clone()
+                        },
+                        'gaussians': {
+                            'xyz': c_xyz.clone(),
+                            'rgb': c_rgb.clone(),
+                            'normal': c_normal.clone(),
+                            'scale': c_scale.clone(),
+                            'opacity': c_opacity.clone()
+                        }
                     }
-                }
 
-                self.discovered_obstacles.append(DiscoveredObstacle(
-                    oid=c_idx,
-                    name=obj_name,
-                    mesh_path=mesh_path,
-                    initial_pos=tuple(centroid),
-                    initial_quat=(0.0, 0.0, 0.0, 1.0),
-                    dims=tuple(extents),
-                    rgb=mean_color,
-                    is_target=False,
-                    pybullet_body_id=pb_body_id
-                ))
+                    # Object-Centric separation: Remove dynamic object primitives from static scene_gaussians
+                    if torch.any(obj_g_mask):
+                        static_keep = ~obj_g_mask
+                        for k in list(self.scene_gaussians.keys()):
+                            if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(static_keep):
+                                self.scene_gaussians[k] = self.scene_gaussians[k][static_keep]
 
-                print(f"✓ Digital Twin: Spawned mesh object ID {c_idx} (PyBullet Body ID: {pb_body_id}, Target=False)")
-                print(f"   -> Object #{c_idx} ('{obj_name}'):")
-                print(f"      Center: [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] m | Extents: [{extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f}] m")
-                print(f"      Associated Gaussians: {in_box.sum().item():,} | Real RGB Color: [{mean_color[0]:.2f}, {mean_color[1]:.2f}, {mean_color[2]:.2f}]")
+                    self.discovered_obstacles.append(DiscoveredObstacle(
+                        oid=obj_id,
+                        name=obj_name,
+                        mesh_path=mesh_path,
+                        initial_pos=tuple(centroid),
+                        initial_quat=(0.0, 0.0, 0.0, 1.0),
+                        dims=tuple(extents),
+                        rgb=mean_color,
+                        is_target=False,
+                        pybullet_body_id=pb_body_id
+                    ))
+
+                    extracted_any_semantic = True
+                    t_obj_ms = (time.perf_counter() - t_obj_start) * 1000.0
+                    print(f"✓ Digital Twin: Spawned mesh object ID {obj_id} ('{obj_name}', PyBullet Body ID: {pb_body_id}) in {t_obj_ms:.1f}ms")
+                    print(f"   -> Object #{obj_id} ('{obj_name}'):")
+                    print(f"      Center: [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] m | Extents: [{extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f}] m")
+                    print(f"      Associated Gaussians: {len(c_xyz):,} | Real RGB Color: [{mean_color[0]:.2f}, {mean_color[1]:.2f}, {mean_color[2]:.2f}]")
+                    print(f"      Surface Mesh: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces (Z range: [{min_b[2]:.3f}, {max_b[2]:.3f}] m, bottom intact!)")
+
+        # Fallback to unsupervised tabletop Marching Cubes if no semantic objects were found/extracted
+        if not extracted_any_semantic:
+            print("[VG-Mapping Marching Cubes] No semantic objects extracted. Falling back to unsupervised tabletop Marching Cubes...")
+            z_cutoff = z_table + self.obstacle_min_clearance_z
+            table_clearance_xy = 2.0 * self.voxel_size
+            verts, faces = extract_obstacle_mesh_from_tsdf(
+                self.vg_pipeline.tsdf_map,
+                z_min_cutoff=z_cutoff,
+                z_max_cutoff=act_z_max,
+                x_bounds=(tab_x_min + table_clearance_xy, tab_x_max - table_clearance_xy),
+                y_bounds=(tab_y_min + table_clearance_xy, tab_y_max - table_clearance_xy),
+                level=0.0
+            )
+            if len(verts) > 0 and len(faces) > 0:
+                mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+                components = mesh.split(only_watertight=False)
+                valid_components = []
+                for comp in components:
+                    ext = comp.bounds[1] - comp.bounds[0]
+                    center_c = (comp.bounds[0] + comp.bounds[1]) / 2.0
+                    in_table = (
+                        (center_c[0] >= tab_x_min + table_clearance_xy) and (center_c[0] <= tab_x_max - table_clearance_xy) and
+                        (center_c[1] >= tab_y_min + table_clearance_xy) and (center_c[1] <= tab_y_max - table_clearance_xy) and
+                        (center_c[2] >= z_table + self.obstacle_min_clearance_z) and (center_c[2] <= act_z_max)
+                    )
+                    if in_table and np.max(ext) >= (2.0 * self.voxel_size) and len(comp.vertices) >= 20:
+                        valid_components.append(comp)
+
+                if len(valid_components) == 0 and len(verts) >= 20:
+                    valid_components = [mesh]
+
+                valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
+                for c_idx, comp in enumerate(valid_components):
+                    comp_verts = comp.vertices
+                    comp_faces = comp.faces
+                    min_b, max_b = comp.bounds[0], comp.bounds[1]
+                    centroid = list((min_b + max_b) / 2.0)
+                    extents = list(max_b - min_b)
+                    obj_name = f"obstacle_{c_idx}"
+                    mesh_path = f"assets/scanned_meshes/{obj_name}_{c_idx}.obj"
+                    verts_centered = comp_verts - np.array(centroid)
+                    comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=comp_faces)
+                    comp_centered.export(mesh_path)
+
+                    g_xyz = self.scene_gaussians['xyz']
+                    margin_xy = 2.0 * self.voxel_size
+                    margin_z = 1.0 * self.voxel_size
+                    in_box = (
+                        (g_xyz[:, 0] >= min_b[0] - margin_xy) & (g_xyz[:, 0] <= max_b[0] + margin_xy) &
+                        (g_xyz[:, 1] >= min_b[1] - margin_xy) & (g_xyz[:, 1] <= max_b[1] + margin_xy) &
+                        (g_xyz[:, 2] >= min_b[2] - margin_z) & (g_xyz[:, 2] <= max_b[2] + margin_xy)
+                    )
+                    if torch.any(in_box):
+                        c_xyz = self.scene_gaussians['xyz'][in_box].clone()
+                        c_rgb = self.scene_gaussians['rgb'][in_box].clone()
+                        c_scale = self.scene_gaussians['scale'][in_box].clone()
+                        c_normal = self.scene_gaussians['normal'][in_box].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
+                        c_opacity = self.scene_gaussians['opacity'][in_box].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
+                        mean_color = c_rgb.mean(dim=0).cpu().numpy().tolist()
+                    else:
+                        v_t = torch.tensor(comp_verts, dtype=torch.float32, device=self.device)
+                        mean_color = [0.15, 0.45, 0.85]
+                        c_xyz = v_t
+                        c_rgb = torch.tensor(mean_color, dtype=torch.float32, device=self.device).repeat(len(comp_verts), 1)
+                        c_scale = torch.full((len(v_t), 3), self.voxel_size * 0.5, dtype=torch.float32, device=self.device)
+                        c_normal = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(v_t), 1)
+                        c_opacity = torch.full((len(v_t), 1), self.opacity_init, dtype=torch.float32, device=self.device)
+
+                    pb_body_id = -1
+                    if digital_twin is not None:
+                        pb_body_id = digital_twin.spawn_scanned_mesh_obstacle(
+                            mesh_path=mesh_path,
+                            initial_pos=centroid,
+                            initial_quat=(0, 0, 0, 1),
+                            name=f"{obj_name}_{c_idx}",
+                            is_target=False,
+                            mass=0.0,
+                            color=mean_color + [1.0],
+                            obj_id=c_idx
+                        )
+
+                    self.tracked_objects[c_idx] = {
+                        'name': obj_name,
+                        'mesh_path': mesh_path,
+                        'initial_pos': centroid,
+                        'initial_quat': (0.0, 0.0, 0.0, 1.0),
+                        'last_pos': centroid,
+                        'last_quat': (0.0, 0.0, 0.0, 1.0),
+                        'last_T': torch.eye(4, device=self.device, dtype=torch.float32),
+                        'dims': extents,
+                        'color': mean_color,
+                        'pybullet_id': pb_body_id,
+                        'is_target': False,
+                        'canonical_points': {
+                            'xyz': c_xyz.clone(),
+                            'rgb': c_rgb.clone(),
+                            'normal': c_normal.clone(),
+                            'scale': c_scale.clone()
+                        },
+                        'gaussians': {
+                            'xyz': c_xyz.clone(),
+                            'rgb': c_rgb.clone(),
+                            'normal': c_normal.clone(),
+                            'scale': c_scale.clone(),
+                            'opacity': c_opacity.clone()
+                        }
+                    }
+
+                    # Object-Centric separation: Remove dynamic object primitives from static scene_gaussians
+                    if torch.any(in_box):
+                        static_keep = ~in_box
+                        for k in list(self.scene_gaussians.keys()):
+                            if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(static_keep):
+                                self.scene_gaussians[k] = self.scene_gaussians[k][static_keep]
+                    self.discovered_obstacles.append(DiscoveredObstacle(
+                        oid=c_idx,
+                        name=obj_name,
+                        mesh_path=mesh_path,
+                        initial_pos=tuple(centroid),
+                        initial_quat=(0.0, 0.0, 0.0, 1.0),
+                        dims=tuple(extents),
+                        rgb=mean_color,
+                        is_target=False,
+                        pybullet_body_id=pb_body_id
+                    ))
 
         # 8. Save to cache if enabled
         if self.cache_save_on_scan:
@@ -768,7 +1140,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         Closed-Loop 3DGS Forward Rasterization for Appearance-based Variation Detection (AVD).
         Renders the active Gaussian map from the viewpoint of the camera (paper Section III-B.1).
         """
-        N = len(self.scene_gaussians['xyz'])
+        active_g = self.get_all_active_gaussians()
+        N = len(active_g.get('xyz', []))
         if N == 0:
             if bg_color is None:
                 return torch.zeros((3, height, width), device=self.device, dtype=torch.float32)
@@ -815,16 +1188,20 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             rasterizer = GaussianRasterizer(raster_settings=raster_settings)
 
-            means3D = self.scene_gaussians['xyz'].contiguous()
+            means3D = active_g['xyz'].contiguous()
             screenspace_points = torch.zeros_like(means3D, requires_grad=False)
-            colors_precomp = self.scene_gaussians['rgb'].contiguous()
-            scales = self.scene_gaussians['scale'].contiguous()
+            colors_precomp = active_g['rgb'].contiguous()
+            scales = active_g['scale'].contiguous()
 
-            # Paper Eq. 15-16: Rotation is identity matrix (quaternion w=1, x=0, y=0, z=0)
-            rotations = torch.zeros((N, 4), device=self.device, dtype=torch.float32)
-            rotations[:, 0] = 1.0
+            # Orientation: use exact dynamic rotations from object poses if available, otherwise identity
+            rotations = active_g.get('rotations')
+            if rotations is None or len(rotations) != N:
+                rotations = torch.zeros((N, 4), device=self.device, dtype=torch.float32)
+                rotations[:, 0] = 1.0
+            else:
+                rotations = rotations.contiguous()
 
-            opacities = self.scene_gaussians.get('opacity', torch.full((N, 1), self.opacity_init, device=self.device, dtype=torch.float32)).contiguous()
+            opacities = active_g.get('opacity', torch.full((N, 1), self.opacity_init, device=self.device, dtype=torch.float32)).contiguous()
 
             with torch.no_grad():
                 rendered_img, _ = rasterizer(
@@ -887,7 +1264,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     v_g, u_g = torch.meshgrid(torch.arange(0, H_c, 2, device=self.device), torch.arange(0, W_c, 2, device=self.device), indexing='ij')
                     u_f, v_f = u_g.flatten(), v_g.flatten()
                     d_f = c_d_masked[0, v_f, u_f]
-                    valid_d = (d_f > 0.1) & (d_f < 3.5)
+                    valid_d = (d_f > self.depth_near) & (d_f < self.depth_far)
                     if torch.any(valid_d):
                         u_v, v_v, d_v = u_f[valid_d], v_f[valid_d], d_f[valid_d]
                         x_c = (u_v.float() - c_k[0, 2]) * d_v / c_k[0, 0]
@@ -987,16 +1364,27 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         workspace_bounds=workspace_bounds_t,
                         is_initial_timestep=False,
                         num_views=len(camera_views),
+                        tau_w=self.tau_w,
                         robot_ids=(self.robot_ids | self.virtual_ids),
-                        target_object_ids=self.dynamic_object_ids
+                        target_object_ids=None
                     )
+
+                    # Object-Centric separation: Filter out any dynamic object primitives from static map
+                    if len(new_g['xyz']) > 0 and len(self.dynamic_object_ids) > 0 and 'obj_id' in new_g:
+                        dyn_t = torch.tensor(list(self.dynamic_object_ids), device=self.device, dtype=new_g['obj_id'].dtype)
+                        is_dyn = torch.isin(new_g['obj_id'], dyn_t)
+                        if torch.any(is_dyn):
+                            keep_static = ~is_dyn
+                            for k in list(new_g.keys()):
+                                if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(keep_static):
+                                    new_g[k] = new_g[k][keep_static]
 
                     # 2. Add new Gaussians with Morton deduplication & robot cylinder exclusion
                     if len(new_g['xyz']) > 0 and len(self.robot_base_pos) >= 3:
                         rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
                         p_xy = new_g['xyz'][:, :2]
                         dist_base = torch.sqrt((p_xy[:, 0] - rx) ** 2 + (p_xy[:, 1] - ry) ** 2)
-                        keep_geom = (dist_base > self.robot_base_radius) | (new_g['xyz'][:, 2] < (rz - 0.05))
+                        keep_geom = (dist_base > self.robot_base_radius) | (new_g['xyz'][:, 2] < (rz - self.table_thickness))
                         if not torch.all(keep_geom):
                             n_g_orig = len(new_g['xyz'])
                             for k in list(new_g.keys()):
@@ -1202,29 +1590,131 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             t_vdc_total = t_prune_total + t_render_total + t_detect_total + t_sgd_total
 
         # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
-        if len(self.tracked_objects) > 0 and len(self.scene_gaussians['xyz']) > 0:
+        # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
+        if len(self.tracked_objects) > 0:
             t_s3 = time.perf_counter()
             objects_source = {}
             objects_target = {}
             initial_T_coarse_dict = {}
 
-            xyz_curr = self.scene_gaussians['xyz']
-            rgb_curr = self.scene_gaussians['rgb']
             ws = self.active_workspace_bounds
             z_tab = self.z_table
+            clearance_z = self.obstacle_min_clearance_z
 
-            table_clean_mask = (
-                (xyz_curr[:, 2] > (z_tab + 0.008)) & (xyz_curr[:, 2] <= ws['z_max']) &
-                (xyz_curr[:, 0] >= ws['x_min']) & (xyz_curr[:, 0] <= ws['x_max']) &
-                (xyz_curr[:, 1] >= ws['y_min']) & (xyz_curr[:, 1] <= ws['y_max'])
-            )
-            cand_xyz = xyz_curr[table_clean_mask]
-            cand_rgb = rgb_curr[table_clean_mask]
+            # Candidate 3D points above tabletop from current camera views (for unmasked fallback)
+            cand_pts_list, cand_rgb_list = [], []
+            for c_name, c_data in camera_views.items():
+                c_d = c_data.get('depth')
+                if c_d is None:
+                    continue
+                d_np = c_d.cpu().numpy() if isinstance(c_d, torch.Tensor) else np.asarray(c_d)
+                if d_np.ndim == 3:
+                    d_np = d_np.squeeze(0)
+                valid_d = (d_np > self.depth_near) & (d_np < self.depth_far)
+                if not np.any(valid_d):
+                    continue
+                v_i, u_i = np.nonzero(valid_d)
+                d_v = d_np[valid_d]
+                K = c_data['intrinsics']
+                fx, fy = float(K[0, 0]), float(K[1, 1])
+                cx, cy = float(K[0, 2]), float(K[1, 2])
+                xc = (u_i.astype(float) - cx) * d_v / fx
+                yc = (v_i.astype(float) - cy) * d_v / fy
+                p_c = np.stack([xc, yc, d_v], axis=-1)
+                c2w = c_data['extrinsics']
+                p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
+                in_roi = (
+                    (p_w[:, 2] > (z_tab + clearance_z)) & (p_w[:, 2] <= ws['z_max']) &
+                    (p_w[:, 0] >= ws['x_min']) & (p_w[:, 0] <= ws['x_max']) &
+                    (p_w[:, 1] >= ws['y_min']) & (p_w[:, 1] <= ws['y_max'])
+                )
+                if np.any(in_roi):
+                    c_rgb_raw = c_data.get('rgb')
+                    if c_rgb_raw is not None:
+                        rgb_np = c_rgb_raw.cpu().numpy() if isinstance(c_rgb_raw, torch.Tensor) else np.asarray(c_rgb_raw)
+                        if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
+                            rgb_np = np.transpose(rgb_np, (1, 2, 0))
+                        if rgb_np.max() > 1.0:
+                            rgb_np = rgb_np / 255.0
+                        cand_rgb_list.append(torch.from_numpy(rgb_np[v_i[in_roi], u_i[in_roi]]).to(self.device).float())
+                    else:
+                        cand_rgb_list.append(torch.full((int(np.sum(in_roi)), 3), 0.5, device=self.device, dtype=torch.float32))
+                    cand_pts_list.append(torch.from_numpy(p_w[in_roi]).to(self.device).float())
+
+            cand_xyz = torch.cat(cand_pts_list, dim=0) if len(cand_pts_list) > 0 else torch.empty((0, 3), device=self.device)
+            cand_rgb = torch.cat(cand_rgb_list, dim=0) if len(cand_rgb_list) > 0 else torch.empty((0, 3), device=self.device)
 
             for oid, obj_info in self.tracked_objects.items():
                 src_xyz = obj_info['canonical_points']['xyz']
                 src_rgb = obj_info['canonical_points']['rgb']
-                if len(src_xyz) == 0 or len(cand_xyz) < 4:
+                if len(src_xyz) == 0:
+                    continue
+
+                # 1. Direct semantic backprojection from current camera frames
+                obs_xyz_list, obs_rgb_list = [], []
+                for c_name, c_data in camera_views.items():
+                    c_mask = c_data.get('mask')
+                    if c_mask is None:
+                        continue
+                    mask_np = c_mask.cpu().numpy() if isinstance(c_mask, torch.Tensor) else np.asarray(c_mask)
+                    if mask_np.ndim == 3:
+                        mask_np = mask_np.squeeze(0)
+                    obj_px = (mask_np == oid)
+                    if not np.any(obj_px):
+                        continue
+
+                    c_d = c_data.get('depth')
+                    if c_d is None:
+                        continue
+                    d_np = c_d.cpu().numpy() if isinstance(c_d, torch.Tensor) else np.asarray(c_d)
+                    if d_np.ndim == 3:
+                        d_np = d_np.squeeze(0)
+                    d_vals = d_np[obj_px]
+                    valid = (d_vals > self.depth_near) & (d_vals < self.depth_far)
+                    if not np.any(valid):
+                        continue
+
+                    v_idx, u_idx = np.nonzero(obj_px)
+                    v_idx, u_idx, d_vals = v_idx[valid], u_idx[valid], d_vals[valid]
+                    K = c_data['intrinsics']
+                    fx, fy = float(K[0, 0]), float(K[1, 1])
+                    cx, cy = float(K[0, 2]), float(K[1, 2])
+                    xc = (u_idx.astype(float) - cx) * d_vals / fx
+                    yc = (v_idx.astype(float) - cy) * d_vals / fy
+                    p_c = np.stack([xc, yc, d_vals], axis=-1)
+                    c2w = c_data['extrinsics']
+                    p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
+
+                    c_rgb_raw = c_data.get('rgb')
+                    if c_rgb_raw is not None:
+                        rgb_np = c_rgb_raw.cpu().numpy() if isinstance(c_rgb_raw, torch.Tensor) else np.asarray(c_rgb_raw)
+                        if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
+                            rgb_np = np.transpose(rgb_np, (1, 2, 0))
+                        if rgb_np.max() > 1.0:
+                            rgb_np = rgb_np / 255.0
+                        obs_rgb_list.append(torch.from_numpy(rgb_np[v_idx, u_idx]).to(self.device).float())
+                    else:
+                        obs_rgb_list.append(torch.full((len(p_w), 3), 0.5, device=self.device, dtype=torch.float32))
+                    obs_xyz_list.append(torch.from_numpy(p_w).to(self.device).float())
+
+                if len(obs_xyz_list) > 0:
+                    tgt_xyz = torch.cat(obs_xyz_list, dim=0)
+                    tgt_rgb = torch.cat(obs_rgb_list, dim=0)
+                else:
+                    # Fallback to proximity search around last known position in candidate points above table
+                    if len(cand_xyz) < 4:
+                        continue
+                    last_p = np.array(obj_info['last_pos'])
+                    dist_p = torch.norm(cand_xyz - torch.tensor(last_p, device=self.device, dtype=torch.float32), dim=1)
+                    near_mask = dist_p < self.proximity_radius
+                    if torch.any(near_mask) and near_mask.sum() >= 4:
+                        tgt_xyz = cand_xyz[near_mask]
+                        tgt_rgb = cand_rgb[near_mask]
+                    else:
+                        tgt_xyz = cand_xyz
+                        tgt_rgb = cand_rgb
+
+                if len(tgt_xyz) < 4:
                     continue
 
                 # Configurable subsample
@@ -1234,17 +1724,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     objects_source[oid] = {'xyz': src_xyz[sub_s], 'rgb': src_rgb[sub_s]}
                 else:
                     objects_source[oid] = {'xyz': src_xyz, 'rgb': src_rgb}
-
-                # Proximity search around last known position
-                last_p = np.array(obj_info['last_pos'])
-                dist_p = torch.norm(cand_xyz - torch.tensor(last_p, device=self.device, dtype=torch.float32), dim=1)
-                near_mask = dist_p < self.proximity_radius
-                if torch.any(near_mask) and near_mask.sum() >= 4:
-                    tgt_xyz = cand_xyz[near_mask]
-                    tgt_rgb = cand_rgb[near_mask]
-                else:
-                    tgt_xyz = cand_xyz
-                    tgt_rgb = cand_rgb
 
                 N_tgt = len(tgt_xyz)
                 if N_tgt > self.se3_subsample:
@@ -1292,27 +1771,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     self.tracked_objects[oid]['last_quat'] = quat
                     tracked_poses[oid] = (new_pos, quat)
 
-                    # Pure VG-Mapping: Gaussians have surface normals assigned directly from TSDF
-                    # gradients upon initialization; no artificial rototranslation of normals.
-
-                    # Dynamic Object Gaussian Management (DREMA RecurGS Tracking):
-                    # Clean up stale Gaussians belonging specifically to this object (obj_id == oid)
-                    # that fall outside the tracked bounding hull as the object moves.
-                    # The static table/background (obj_id != oid) is completely untouched.
-                    if len(self.scene_gaussians.get('xyz', [])) > 0:
-                        g_obj_id = self.scene_gaussians.get('obj_id', None)
-                        if g_obj_id is not None and torch.any(g_obj_id == oid):
-                            dims = self.tracked_objects[oid].get('dims', [0.1, 0.1, 0.1])
-                            r_bbox = max(float(dims[0]), float(dims[1])) * 0.75 + 0.05
-                            pos_tensor = torch.tensor(new_pos[:2], device=self.device, dtype=torch.float32)
-                            d_xy = torch.norm(self.scene_gaussians['xyz'][:, :2] - pos_tensor, dim=1)
-
-                            stale_obj_mask = (g_obj_id == oid) & (d_xy > r_bbox)
-                            if torch.any(stale_obj_mask):
-                                keep_mask = ~stale_obj_mask
-                                for k in list(self.scene_gaussians.keys()):
-                                    if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_mask):
-                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+                    # Rigid kinematic update of this object's 3D Gaussians (DREMA Object-Centric formulation)
+                    canon_xyz = self.tracked_objects[oid]['canonical_points']['xyz']
+                    canon_norm = self.tracked_objects[oid]['canonical_points'].get('normal', torch.zeros_like(canon_xyz))
+                    curr_xyz = (canon_xyz @ R_fine.T) + t_fine
+                    curr_norm = canon_norm @ R_fine.T
+                    self.tracked_objects[oid]['gaussians']['xyz'] = curr_xyz
+                    self.tracked_objects[oid]['gaussians']['normal'] = curr_norm
 
             t_se3_total = (time.perf_counter() - t_s3) * 1000.0
 
@@ -1326,14 +1791,14 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             if self.vg_pipeline is not None and self.vg_pipeline.tsdf_map is not None:
                 with torch.no_grad():
                     tsdf_m = self.vg_pipeline.tsdf_map
-                    tsdf_active_voxels = int(((tsdf_m.W > 0.5) & (tsdf_m.F.abs() < 0.12)).sum().item())
+                    tsdf_active_voxels = int(((tsdf_m.W > 0.5) & (tsdf_m.F.abs() < (2.0 * self.voxel_size))).sum().item())
                     w_max = float(tsdf_m.W.max().item())
                     w_pos = tsdf_m.W[tsdf_m.W > 0]
                     w_mean = float(w_pos.mean().item()) if len(w_pos) > 0 else 0.0
 
             fps = 1000.0 / max(1.0, total_elapsed_ms)
             num_cams = len(camera_views)
-            active_g = len(self.scene_gaussians.get('xyz', []))
+            active_g = len(self.get_all_active_gaussians().get('xyz', []))
 
             print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
@@ -1345,43 +1810,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     pos_o = self.tracked_objects[oid]['last_pos']
                     print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
 
-                    # Generic tracking verification: dynamic object surface retention vs orphan stains
-                    if len(self.scene_gaussians.get('xyz', [])) > 0:
-                        with torch.no_grad():
-                            g_xyz = self.scene_gaussians['xyz']
-                            g_rgb = self.scene_gaussians['rgb']
-                            g_obj_id = self.scene_gaussians.get('obj_id', None)
-
-                            # Generic match by semantic ID or canonical color similarity
-                            col_raw = self.tracked_objects[oid].get('color', [0.2, 0.4, 0.8])
-                            obj_col = torch.tensor(col_raw[:3], device=self.device, dtype=torch.float32)
-                            col_dist = torch.norm(g_rgb - obj_col, dim=1)
-                            if g_obj_id is not None and torch.any(g_obj_id == oid):
-                                is_this_obj = (g_obj_id == oid)
-                            else:
-                                is_this_obj = (col_dist < 0.25)
-
-                            dims = self.tracked_objects[oid].get('dims', [0.1, 0.1, 0.1])
-                            r_bbox = max(float(dims[0]), float(dims[1])) * 0.75 + 0.05
-                            pos_tensor = torch.tensor(pos_o[:2], device=self.device, dtype=torch.float32)
-                            d_xy = torch.norm(g_xyz[:, :2] - pos_tensor, dim=1)
-
-                            active_on_obj = int((is_this_obj & (d_xy <= r_bbox)).sum().item())
-                            orphans = is_this_obj & (d_xy > r_bbox)
-                            n_orph = int(orphans.sum().item())
-                            if n_orph > 0 and self.vg_pipeline is not None and self.vg_pipeline.tsdf_map is not None:
-                                orph_xyz = g_xyz[orphans]
-                                orph_m = self.scene_gaussians['morton'][orphans]
-                                orph_f, orph_w = self.vg_pipeline.tsdf_map.query_tsdf_and_weight(orph_xyz)
-                                z_min, z_max = float(orph_xyz[:, 2].min().item()), float(orph_xyz[:, 2].max().item())
-                                f_mean = float(orph_f.mean().item())
-                                w_mean_orph = float(orph_w.mean().item())
-                                in_surf = 0
-                                if all_active_surface_mortons is not None and len(all_active_surface_mortons) > 0:
-                                    in_surf = int(torch.isin(orph_m, all_active_surface_mortons).sum().item())
-                                print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | {n_orph} orphan stains (Z=[{z_min:.3f}, {z_max:.3f}], F_mean={f_mean:.2f}, W_mean={w_mean_orph:.1f}, {in_surf}/{n_orph} on camera surface)")
-                            else:
-                                print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | 0 orphan stains (CLEAN)")
+                    # Object-Centric tracking verification
+                    active_on_obj = len(self.tracked_objects[oid].get('gaussians', {}).get('xyz', []))
+                    stray_in_static = int((self.scene_gaussians['obj_id'] == oid).sum().item()) if 'obj_id' in self.scene_gaussians else 0
+                    print(f"  │    └─ Obj #{oid} ('{name_o}') Object-Centric Model: {active_on_obj:,} Gaussians on body (Rigid SE(3)) | {stray_in_static} stray in static background (CLEAN)")
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
@@ -1389,23 +1821,28 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         return StreamingUpdateResult(
             timestep=timestep,
-            active_gaussians_count=len(self.scene_gaussians.get('xyz', [])),
+            active_gaussians_count=len(self.get_all_active_gaussians().get('xyz', [])),
             tracked_object_poses=tracked_poses,
             latency_ms=total_elapsed_ms
         )
 
     def get_viser_splats_data(self) -> Optional[Dict[str, np.ndarray]]:
         """Returns centers, covariances, rgbs, and opacities formatted for Viser 3D Web Visualizer."""
-        if len(self.scene_gaussians['xyz']) == 0:
+        active_g = self.get_all_active_gaussians()
+        if len(active_g.get('xyz', [])) == 0:
             return None
 
-        pts_np = self.scene_gaussians['xyz'].detach().cpu().numpy()
-        rgb_np = np.clip(self.scene_gaussians['rgb'].detach().cpu().numpy(), 0.0, 1.0)
-        scale_np = self.scene_gaussians['scale'].detach().cpu().numpy()
+        pts_np = active_g['xyz'].detach().cpu().numpy()
+        rgb_np = np.clip(active_g['rgb'].detach().cpu().numpy(), 0.0, 1.0)
+        scale_np = active_g['scale'].detach().cpu().numpy()
 
         normals_np = None
-        if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(pts_np):
-            normals_np = self.scene_gaussians['normal'].detach().cpu().numpy()
+        if 'normal' in active_g and len(active_g['normal']) == len(pts_np):
+            normals_np = active_g['normal'].detach().cpu().numpy()
+
+        opacities_np = None
+        if 'opacity' in active_g and len(active_g['opacity']) == len(pts_np):
+            opacities_np = active_g['opacity'].detach().cpu().numpy()
 
         # Max splats cap for browser 60fps responsiveness
         max_splats = int(self.config.get_nested("system.viser.max_splats", 50000))
@@ -1416,6 +1853,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             scale_np = scale_np[sub]
             if normals_np is not None:
                 normals_np = normals_np[sub]
+            if opacities_np is not None:
+                opacities_np = opacities_np[sub]
 
         # Normalize surface normal vectors
         if normals_np is not None:
@@ -1435,7 +1874,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         nnT = normals_clean[:, :, None] @ normals_clean[:, None, :]
         eye3 = np.eye(3, dtype=np.float32)[None, :, :]
         covariances = (s_tan[:, :, None] ** 2) * eye3 + (s_norm[:, :, None] ** 2 - s_tan[:, :, None] ** 2) * nnT
-        opacities = np.full((len(pts_np), 1), self.opacity_init, dtype=np.float32)
+        opacities = opacities_np if opacities_np is not None else np.full((len(pts_np), 1), self.opacity_init, dtype=np.float32)
 
         return {
             'centers': pts_np,
@@ -1469,6 +1908,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     'xyz': obj['canonical_points']['xyz'].detach().cpu(),
                     'rgb': obj['canonical_points']['rgb'].detach().cpu()
                 }
+                if 'normal' in obj['canonical_points']:
+                    obj_c['canonical_points']['normal'] = obj['canonical_points']['normal'].detach().cpu()
+                if 'scale' in obj['canonical_points']:
+                    obj_c['canonical_points']['scale'] = obj['canonical_points']['scale'].detach().cpu()
+                if 'gaussians' in obj:
+                    obj_c['gaussians'] = {k: v.detach().cpu() for k, v in obj['gaussians'].items()}
                 if 'last_T' in obj_c and isinstance(obj_c['last_T'], torch.Tensor):
                     obj_c['last_T'] = obj_c['last_T'].detach().cpu()
                 t_obj_cpu[oid] = obj_c
@@ -1587,6 +2032,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         'xyz': obj['canonical_points']['xyz'].to(self.device),
                         'rgb': obj['canonical_points']['rgb'].to(self.device)
                     }
+                    if 'normal' in obj['canonical_points']:
+                        obj_dev['canonical_points']['normal'] = obj['canonical_points']['normal'].to(self.device)
+                    if 'scale' in obj['canonical_points']:
+                        obj_dev['canonical_points']['scale'] = obj['canonical_points']['scale'].to(self.device)
+                    if 'gaussians' in obj:
+                        obj_dev['gaussians'] = {k: v.to(self.device) for k, v in obj['gaussians'].items()}
                     if 'last_T' in obj_dev and isinstance(obj_dev['last_T'], torch.Tensor):
                         obj_dev['last_T'] = obj_dev['last_T'].to(self.device)
                     self.tracked_objects[oid] = obj_dev
@@ -1654,7 +2105,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         try:
             with torch.no_grad():
                 tsdf_map = self.vg_pipeline.tsdf_map
-                surf_mask = (tsdf_map.W > 0.5) & (tsdf_map.F.abs() < 0.12)
+                surf_mask = (tsdf_map.W > 0.5) & (tsdf_map.F.abs() < (2.0 * self.voxel_size))
                 if surf_mask.any():
                     surf_pts = tsdf_map.voxel_centers[surf_mask].detach().cpu().numpy()
                     surf_colors = np.zeros_like(surf_pts)

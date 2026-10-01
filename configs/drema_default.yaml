@@ -45,6 +45,9 @@ perception:
     reachability_radius: 0.95        # Franka Panda reachability radius in meters
     robot_base_radius: 0.13          # Exclusion cylinder radius around robot base in meters
     obstacle_min_clearance_z: 0.015  # Minimum clearance above table to isolate objects from surface noise
+    workspace_margin: 0.05           # Lateral safety expansion margin for workspace TSDF bounds in meters
+    table_thickness: 0.05            # Estimated vertical thickness below tabletop surface in meters
+    table_bounds_fallback: [-0.50, 1.10, -0.55, 0.55] # Fallback horizontal table bounds [xmin, xmax, ymin, ymax]
 
   # Online Raycast Pruning & VDC Mapping
   mapping:
@@ -53,9 +56,17 @@ perception:
     raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
     tau_s: 0.6                       # SSIM appearance variation detection threshold (paper Section III-B.1: tau_s = 0.6)
     tau_p: 0.2                       # Pruning TSDF surface threshold (paper Section III-B.2: tau_p = 0.2)
-    tau_w: null                      # Geometry variation weight threshold (null = view count based)
-    max_weight: 3.0                  # Max TSDF weight clamp to enable rapid dynamic clearing in 2-3 frames
+    tau_w: 1.0                       # Geometry variation weight threshold (voxels with W <= tau_w trigger GVD)
+    max_weight: 10.0                 # Max TSDF weight clamp (allows stable accumulation W > tau_w to prevent static churn)
     safety_margin_factor: 1.0        # Stopping distance factor for raycast pruning (paper Eq. 17: 1.0 * voxel_size = 1cm)
+
+    # Dynamic Object Semantic Mesh Extraction (DREMA Architecture)
+    object_mesh_voxel_size: 0.005    # Voxel length for object TSDF integration (5mm fine resolution)
+    object_mesh_sdf_trunc: 0.02      # TSDF truncation margin for object reconstruction (2cm)
+    object_mesh_max_weight: 15.0     # Max TSDF weight clamp for object mesh reconstruction
+    depth_near: 0.1                  # Minimum valid camera sensor depth in meters
+    depth_far: 3.0                   # Maximum valid camera sensor depth in meters
+    taubin_iterations: 3             # Number of Taubin smoothing iterations (0 to disable)
 
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:
