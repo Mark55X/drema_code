@@ -493,7 +493,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 ])
 
                 means3D = self.scene_gaussians['xyz']
-                screenspace_pts = torch.zeros_like(means3D)
+                screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
+                try:
+                    screenspace_pts.retain_grad()
+                except Exception:
+                    pass
                 scales = self.scene_gaussians['scale']
                 rotations = torch.zeros((retained_count, 4), device=self.device, dtype=torch.float32)
                 rotations[:, 0] = 1.0
@@ -1052,7 +1056,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     ])
 
                     means3D = self.scene_gaussians['xyz']
-                    screenspace_pts = torch.zeros_like(means3D)
+                    screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
+                    try:
+                        screenspace_pts.retain_grad()
+                    except Exception:
+                        pass
                     scales = self.scene_gaussians['scale']
                     rotations = torch.zeros((N_g, 4), device=self.device, dtype=torch.float32)
                     rotations[:, 0] = 1.0
