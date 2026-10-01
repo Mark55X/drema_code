@@ -150,7 +150,7 @@ def extract_semantic_object_mesh_from_scan(
         k_t = torch.from_numpy(f['intrinsics']).to(device).float() if isinstance(f['intrinsics'], np.ndarray) else f['intrinsics'].to(device).float()
         pose_t = torch.from_numpy(f['extrinsics']).to(device).float() if isinstance(f['extrinsics'], np.ndarray) else f['extrinsics'].to(device).float()
 
-        obj_tsdf.integrate_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
+        obj_tsdf.integrate_depth_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
 
     verts, faces = obj_tsdf.extract_mesh(level=0.0)
     return verts, faces

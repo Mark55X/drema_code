@@ -151,6 +151,8 @@ def test_perception_and_caching():
     
     # Synthetic frame data
     H, W = 64, 64
+    mock_mask = np.zeros((H, W), dtype=np.int32)
+    mock_mask[24:40, 24:40] = 20  # Semantic object 'Roof' ID 20
     mock_frame = {
         'name': 'cam_orbit_0',
         'rgb': np.full((H, W, 3), 180, dtype=np.uint8),
@@ -159,7 +161,7 @@ def test_perception_and_caching():
         'extrinsics': np.eye(4, dtype=np.float32),
         'near_clip': 0.1,
         'far_clip': 3.0,
-        'mask': np.zeros((H, W), dtype=np.int32),
+        'mask': mock_mask,
         'point_cloud': all_mock_pts
     }
     
