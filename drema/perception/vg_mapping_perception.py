@@ -675,6 +675,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     rotations=rotations,
                     cov3D_precomp=None
                 )
+            if not getattr(self, '_render_logged', False):
+                print(f"✓ [VG MAPPING PERCEPTION] Closed-Loop 3DGS Forward Rasterizer active (rasterizing {N:,} Gaussians at {width}x{height} via diff-gaussian-rasterization)")
+                self._render_logged = True
             return torch.clamp(rendered_img, 0.0, 1.0)
         except Exception as e:
             if not getattr(self, '_render_warned', False):
@@ -692,6 +695,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         """Processes incoming multi-camera streaming frames and updates dynamic 3DGS & tracking."""
         t0 = time.perf_counter()
         t_tsdf_total = 0.0
+        t_prune_total = 0.0
+        t_render_total = 0.0
+        t_detect_total = 0.0
         t_vdc_total = 0.0
         t_se3_total = 0.0
         total_pruned_in_frame = 0
@@ -744,7 +750,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     d_masked, mask_t = self._apply_semantic_robot_mask(depth_t=d_tensor, mask_np=mask_np)
 
                     # Step 1: Raycast Pruning of deleted objects and floaters against prior TSDF map (Eq. 17)
-                    t_s2 = time.perf_counter()
+                    t_prune_start = time.perf_counter()
                     prune_mask = self.vg_pipeline.vdc.prune_gaussians_via_morton(
                         depth_obs=d_masked,
                         intrinsic=k_tensor,
@@ -764,6 +770,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
                             if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
                                 self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+                    t_prune_total += (time.perf_counter() - t_prune_start) * 1000.0
 
                     # Step 2: TSDF integration of current observation (updates F and W)
                     t_s1 = time.perf_counter()
@@ -775,7 +782,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     )
                     t_tsdf_total += (time.perf_counter() - t_s1) * 1000.0
 
-                    # Step 3: VDC variation detection & initialization on newly observed surfaces
+                    # Step 3: Closed-Loop 3DGS Forward Rasterization (render active Gaussian map)
+                    t_render_start = time.perf_counter()
                     if self.closed_loop_avd:
                         rendered_rgb = self.render_scene_view(
                             intrinsic=k_tensor,
@@ -788,7 +796,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     else:
                         rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
+                    if torch.cuda.is_available() and self.device.type == 'cuda':
+                        torch.cuda.synchronize(self.device)
+                    t_render_total += (time.perf_counter() - t_render_start) * 1000.0
 
+                    # Step 4: VDC variation detection & initialization on newly observed surfaces
+                    t_det_start = time.perf_counter()
                     new_g = self.vg_pipeline.vdc.detect_and_initialize_gaussians(
                         rgb_obs=rgb_tensor,
                         depth_obs=d_masked,
@@ -837,10 +850,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 val = torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
                             self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val[non_dup]], dim=0)
 
-                    t_vdc_total += (time.perf_counter() - t_s2) * 1000.0
+                    t_detect_total += (time.perf_counter() - t_det_start) * 1000.0
 
                 except Exception as e:
                     print(f"[VG MAPPING PERCEPTION Warning] Error processing camera view '{cam_name}': {e}")
+
+            t_vdc_total = t_prune_total + t_render_total + t_detect_total
 
         # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
         if len(self.tracked_objects) > 0 and len(self.scene_gaussians['xyz']) > 0:
@@ -959,7 +974,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
-            print(f"  ├─ Step 2 (VDC Raycast & Prune): {t_vdc_total:.1f}ms | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
+            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms] | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
             if len(tracked_deltas) > 0:
                 for oid, d_p in tracked_deltas.items():
                     name_o = self.tracked_objects[oid]['name']

@@ -239,16 +239,34 @@ class DremaDynamicSystem:
             is_scan_ready_callback=lambda: self.initial_scan_ready
         )
 
-    def _add_viser_obstacle_mesh(self, obj_name: str, idx: int, comp: trimesh.Trimesh):
-        """Adds an extracted Marching Cubes obstacle surface mesh to the Viser 3D scene."""
+    def _add_viser_obstacle_mesh(
+        self,
+        obj_name: str,
+        idx: int,
+        comp: trimesh.Trimesh,
+        position: Tuple[float, float, float] = (0.0, 0.0, 0.0),
+        quat_xyzw: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 1.0)
+    ):
+        """Adds an extracted Marching Cubes obstacle surface mesh to the Viser 3D scene at its initial 3D pose."""
         if self.viser_server is not None and comp is not None:
             try:
+                # Convert (x, y, z, w) quaternion from perception/PyBullet to Viser (w, x, y, z)
+                if len(quat_xyzw) == 4:
+                    qx, qy, qz, qw = quat_xyzw
+                    wxyz = (float(qw), float(qx), float(qy), float(qz))
+                else:
+                    wxyz = (1.0, 0.0, 0.0, 0.0)
+
+                pos = tuple(float(p) for p in position) if len(position) >= 3 else (0.0, 0.0, 0.0)
+
                 self.viser_handles[f"mesh_{idx}"] = self.viser_server.scene.add_mesh_trimesh(
                     name=f"/marching_cubes/{obj_name}_{idx}",
-                    mesh=comp
+                    mesh=comp,
+                    position=pos,
+                    wxyz=wxyz
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                print(f"[Viser Warning] Failed to add obstacle mesh {obj_name}_{idx}: {e}")
 
     def _init_viser_voxel_grid(
         self,
@@ -415,9 +433,15 @@ class DremaDynamicSystem:
                 if os.path.exists(obs.mesh_path):
                     try:
                         comp = trimesh.load(obs.mesh_path)
-                        self._add_viser_obstacle_mesh(obs.name, obs.oid, comp)
-                    except Exception:
-                        pass
+                        self._add_viser_obstacle_mesh(
+                            obj_name=obs.name,
+                            idx=obs.oid,
+                            comp=comp,
+                            position=obs.initial_pos,
+                            quat_xyzw=obs.initial_quat
+                        )
+                    except Exception as e:
+                        print(f"[Viser Warning] Failed to load mesh {obs.mesh_path}: {e}")
 
             # Update initial 3D Gaussians in Viser
             self._update_viser_gaussians()
