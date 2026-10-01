@@ -864,6 +864,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         t_vdc_total = 0.0
         t_se3_total = 0.0
         total_pruned_in_frame = 0
+        total_evicted_in_frame = 0
         total_added_in_frame = 0
         tracked_poses = {}
         tracked_deltas = {}
@@ -1022,13 +1023,18 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(added_m):
                                     new_g[k] = new_g[k][keep_idx]
 
-                        # 2. Filter out additions to voxels that are already densely occupied
+                        # 2. VG-Mapping Voxel Eviction & Re-initialization (Paper Sec. III-B.1 & III-B.2):
+                        # When AVD/GVD detects variation on already-occupied voxels and initializes
+                        # fresh primitives, evict the stale primitives in those voxels so the newly
+                        # observed surface replaces them cleanly without leaving ghost footprints.
                         if len(self.scene_gaussians['morton']) > 0 and len(new_g['morton']) > 0:
-                            unoccupied = ~torch.isin(new_g['morton'], self.scene_gaussians['morton'])
-                            if not torch.all(unoccupied):
-                                for k in list(new_g.keys()):
-                                    if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(unoccupied):
-                                        new_g[k] = new_g[k][unoccupied]
+                            stale_mask = torch.isin(self.scene_gaussians['morton'], new_g['morton']) & (self.scene_gaussians['morton'] >= 0)
+                            if torch.any(stale_mask):
+                                total_evicted_in_frame += int(stale_mask.sum().item())
+                                keep_mask = ~stale_mask
+                                for k in list(self.scene_gaussians.keys()):
+                                    if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_mask):
+                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
 
                         # 3. Commit newly initialized surface Gaussians
                         n_added = len(new_g['xyz'])
@@ -1332,7 +1338,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
             sgd_log = f" | SGD ({self.sgd_steps} iters): {t_sgd_total:.1f}ms" if (self.enable_sgd and self.sgd_steps > 0) else ""
-            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms{sgd_log}] | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
+            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms{sgd_log}] | Pruned: {total_pruned_in_frame} | Evicted: {total_evicted_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
             if len(tracked_deltas) > 0:
                 for oid, d_p in tracked_deltas.items():
                     name_o = self.tracked_objects[oid]['name']
