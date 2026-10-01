@@ -479,7 +479,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             t_sgd_scan_start = time.perf_counter()
             try:
                 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-                from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
+                from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim, masked_l1_loss, masked_ssim
                 from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
                 import math
 
@@ -547,10 +547,27 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         prefiltered=False,
                         debug=False
                     )
+
+                    # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
+                    mask_np = f_data.get('mask')
+                    if mask_np is not None:
+                        mask_raw = torch.from_numpy(mask_np.copy()).to(self.device)
+                        filter_ids = self.robot_ids | self.virtual_ids
+                        if len(filter_ids) > 0:
+                            f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
+                            is_robot = torch.isin(mask_raw, f_ids)
+                            f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
+                            dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2).squeeze() > 0.5)
+                            v_mask = (~dilated_robot).float()
+                        else:
+                            v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+                    else:
+                        v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+
                     prepped_scan_views.append({
                         'rasterizer': GaussianRasterizer(raster_settings=c_settings),
                         'gt_rgb': gt_rgb,
-                        'gt_rgb_4d': gt_rgb.unsqueeze(0)
+                        'valid_mask': v_mask
                     })
 
                 n_views = max(1, len(prepped_scan_views))
@@ -571,8 +588,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             rotations=rotations,
                             cov3D_precomp=None
                         )
-                        ll1 = l1_loss(rendered, pv['gt_rgb'])
-                        ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
+                        v_mask = pv.get('valid_mask')
+                        ll1 = masked_l1_loss(rendered, pv['gt_rgb'], v_mask)
+                        ssim_val = masked_ssim(rendered, pv['gt_rgb'], v_mask)
                         view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
                         step_loss = step_loss + (view_loss / n_views)
 
@@ -1038,7 +1056,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 t_sgd_start = time.perf_counter()
                 try:
                     from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-                    from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
+                    from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim, masked_l1_loss, masked_ssim
                     from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
                     import math
 
@@ -1110,10 +1128,27 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             prefiltered=False,
                             debug=False
                         )
+
+                        # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
+                        mask_np = c_data.get('mask')
+                        if mask_np is not None:
+                            mask_raw = torch.from_numpy(mask_np.copy()).to(self.device)
+                            filter_ids = self.robot_ids | self.virtual_ids
+                            if len(filter_ids) > 0:
+                                f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
+                                is_robot = torch.isin(mask_raw, f_ids)
+                                f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
+                                dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2).squeeze() > 0.5)
+                                v_mask = (~dilated_robot).float()
+                            else:
+                                v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+                        else:
+                            v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+
                         prepped_views.append({
                             'rasterizer': GaussianRasterizer(raster_settings=c_settings),
                             'gt_rgb': gt_rgb,
-                            'gt_rgb_4d': gt_rgb.unsqueeze(0)
+                            'valid_mask': v_mask
                         })
 
                     for step_i in range(self.sgd_steps):
@@ -1133,8 +1168,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 rotations=rotations,
                                 cov3D_precomp=None
                             )
-                            ll1 = l1_loss(rendered, pv['gt_rgb'])
-                            ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
+                            v_mask = pv.get('valid_mask')
+                            ll1 = masked_l1_loss(rendered, pv['gt_rgb'], v_mask)
+                            ssim_val = masked_ssim(rendered, pv['gt_rgb'], v_mask)
                             view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
                             step_loss = step_loss + (view_loss / max(1, len(prepped_views)))
 
