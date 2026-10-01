@@ -703,6 +703,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         t_vdc_total = 0.0
         t_se3_total = 0.0
         total_pruned_in_frame = 0
+        total_evicted_in_frame = 0
         total_added_in_frame = 0
         tracked_poses = {}
         tracked_deltas = {}
@@ -869,6 +870,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         if len(self.scene_gaussians['morton']) > 0 and len(new_g['morton']) > 0:
                             stale_mask = torch.isin(self.scene_gaussians['morton'], new_g['morton']) & (self.scene_gaussians['morton'] >= 0)
                             if torch.any(stale_mask):
+                                total_evicted_in_frame += int(stale_mask.sum().item())
                                 keep_mask = ~stale_mask
                                 for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
                                     if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
@@ -1011,7 +1013,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
-            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms] | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
+            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms] | Pruned: {total_pruned_in_frame} | Evicted: {total_evicted_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
             if len(tracked_deltas) > 0:
                 for oid, d_p in tracked_deltas.items():
                     name_o = self.tracked_objects[oid]['name']
@@ -1042,7 +1044,19 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             active_on_obj = int((is_this_obj & (d_xy <= r_bbox)).sum().item())
                             orphans = is_this_obj & (d_xy > r_bbox)
                             n_orph = int(orphans.sum().item())
-                            print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | {n_orph} orphan stains ({'CLEAN' if n_orph == 0 else 'resolving'})")
+                            if n_orph > 0 and self.vg_pipeline is not None and self.vg_pipeline.tsdf_map is not None:
+                                orph_xyz = g_xyz[orphans]
+                                orph_m = self.scene_gaussians['morton'][orphans]
+                                orph_f, orph_w = self.vg_pipeline.tsdf_map.query_tsdf_and_weight(orph_xyz)
+                                z_min, z_max = float(orph_xyz[:, 2].min().item()), float(orph_xyz[:, 2].max().item())
+                                f_mean = float(orph_f.mean().item())
+                                w_mean_orph = float(orph_w.mean().item())
+                                in_surf = 0
+                                if all_active_surface_mortons is not None and len(all_active_surface_mortons) > 0:
+                                    in_surf = int(torch.isin(orph_m, all_active_surface_mortons).sum().item())
+                                print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | {n_orph} orphan stains (Z=[{z_min:.3f}, {z_max:.3f}], F_mean={f_mean:.2f}, W_mean={w_mean_orph:.1f}, {in_surf}/{n_orph} on camera surface)")
+                            else:
+                                print(f"  │    └─ Obj #{oid} ('{name_o}') Tracking State: {active_on_obj:,} on body | 0 orphan stains (CLEAN)")
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
