@@ -109,6 +109,10 @@ def parse_args():
                         help="Learning rate for Lie algebra Adam optimizer (default: 3e-3)")
     parser.add_argument("--physics_settle_steps", type=int, default=0,
                         help="Number of physics simulation steps per timestep to let PyBullet settle contacts/gravity (default: 0)")
+    parser.add_argument("--enable_sgd", action="store_true", default=False,
+                        help="Enable paper-compliant photometric SGD Adam optimization (paper Sec. III-B.3, Eq. 10)")
+    parser.add_argument("--sgd_steps", type=int, default=5,
+                        help="Number of photometric SGD optimization steps per frame if enabled (default: 5)")
     return parser.parse_args()
 
 
@@ -898,7 +902,7 @@ def main():
         # STEP 2: Online Mapping (VDC initialization & Morton pruning)
         # ---------------------------------------------------------
         t_vdc_start = time.time()
-        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc, eviction_morton_acc = [], [], [], [], [], []
+        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
         total_pruned = 0
         
         for obs in observations:
@@ -937,30 +941,6 @@ def main():
                 new_morton_acc.append(new_g['morton'])
                 new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=device)))
 
-            if 'eviction_mortons' in new_g and len(new_g['eviction_mortons']) > 0:
-                eviction_morton_acc.append(new_g['eviction_mortons'])
-
-        # Hybrid AVD Eviction (Paper Sec. III-B.1 & III-B.2):
-        # When AVD/GVD detects variation on already-occupied voxels, evict stale Gaussians
-        if t_idx > 0 and len(scene_gaussians['morton']) > 0:
-            mortons_to_evict = []
-            if len(new_morton_acc) > 0:
-                mortons_to_evict.append(torch.cat(new_morton_acc, dim=0))
-            if len(eviction_morton_acc) > 0:
-                mortons_to_evict.append(torch.cat(eviction_morton_acc, dim=0))
-            if len(mortons_to_evict) > 0:
-                all_evict = torch.cat(mortons_to_evict, dim=0).unique()
-                valid_evict = all_evict[all_evict >= 0]
-                if len(valid_evict) > 0:
-                    stale_mask = torch.isin(scene_gaussians['morton'], valid_evict) & (scene_gaussians['morton'] >= 0)
-                    if torch.any(stale_mask):
-                        keep_mask = ~stale_mask
-                        scene_gaussians['xyz'] = scene_gaussians['xyz'][keep_mask]
-                        scene_gaussians['rgb'] = scene_gaussians['rgb'][keep_mask]
-                        scene_gaussians['scale'] = scene_gaussians['scale'][keep_mask]
-                        scene_gaussians['morton'] = scene_gaussians['morton'][keep_mask]
-                        scene_gaussians['obj_id'] = scene_gaussians['obj_id'][keep_mask]
-
         # Concatenate newly initialized Gaussians with Voxel Deduplication
         num_added = 0
         if len(new_xyz_acc) > 0:
@@ -984,12 +964,22 @@ def main():
                 added_morton = added_morton[keep_idx]
                 added_obj_id = added_obj_id[keep_idx]
 
-            scene_gaussians['xyz'] = torch.cat([scene_gaussians['xyz'], added_xyz], dim=0)
-            scene_gaussians['rgb'] = torch.cat([scene_gaussians['rgb'], added_rgb], dim=0)
-            scene_gaussians['scale'] = torch.cat([scene_gaussians['scale'], added_scale], dim=0)
-            scene_gaussians['morton'] = torch.cat([scene_gaussians['morton'], added_morton], dim=0)
-            scene_gaussians['obj_id'] = torch.cat([scene_gaussians['obj_id'], added_obj_id], dim=0)
-            num_added = len(added_xyz)
+                # Filter out additions to voxels that are already occupied
+                if len(scene_gaussians['morton']) > 0:
+                    unoccupied = ~torch.isin(added_morton, scene_gaussians['morton'])
+                    added_xyz = added_xyz[unoccupied]
+                    added_rgb = added_rgb[unoccupied]
+                    added_scale = added_scale[unoccupied]
+                    added_morton = added_morton[unoccupied]
+                    added_obj_id = added_obj_id[unoccupied]
+
+            if len(added_xyz) > 0:
+                scene_gaussians['xyz'] = torch.cat([scene_gaussians['xyz'], added_xyz], dim=0)
+                scene_gaussians['rgb'] = torch.cat([scene_gaussians['rgb'], added_rgb], dim=0)
+                scene_gaussians['scale'] = torch.cat([scene_gaussians['scale'], added_scale], dim=0)
+                scene_gaussians['morton'] = torch.cat([scene_gaussians['morton'], added_morton], dim=0)
+                scene_gaussians['obj_id'] = torch.cat([scene_gaussians['obj_id'], added_obj_id], dim=0)
+                num_added = len(added_xyz)
 
         if device.startswith("cuda"):
             torch.cuda.synchronize()
@@ -1185,6 +1175,22 @@ def main():
                             z_table=z_table,
                             half_height=half_h
                         )
+
+                        # Clean up stale Gaussians belonging specifically to this object (obj_id == oid) outside its bounding hull
+                        if len(scene_gaussians['xyz']) > 0 and 'obj_id' in scene_gaussians:
+                            R_f = T_fine[:3, :3]
+                            t_f = T_fine[:3, 3]
+                            c0_t = torch.tensor(c0, dtype=torch.float32, device=device)
+                            pos_w = R_f @ c0_t + t_f
+                            dims_o = tracked_objects[oid]['dims']
+                            r_bbox = max(float(dims_o[0]), float(dims_o[1])) * 0.75 + 0.05
+                            d_xy = torch.norm(scene_gaussians['xyz'][:, :2] - pos_w[:2], dim=1)
+                            stale_obj = (scene_gaussians['obj_id'] == oid) & (d_xy > r_bbox)
+                            if torch.any(stale_obj):
+                                keep_mask = ~stale_obj
+                                for k in ['xyz', 'rgb', 'scale', 'morton', 'obj_id']:
+                                    if k in scene_gaussians and len(scene_gaussians[k]) == len(keep_mask):
+                                        scene_gaussians[k] = scene_gaussians[k][keep_mask]
 
             if device.startswith("cuda"):
                 torch.cuda.synchronize()

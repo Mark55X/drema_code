@@ -821,6 +821,12 @@ def parse_args():
     parser.add_argument("--ctrl_fps", type=float, default=None, help="Controller planning frequency in Hz (overrides config)")
     parser.add_argument("--voxel_size", type=float, default=None, help="TSDF voxel grid resolution in meters (overrides config)")
     parser.add_argument("--device", type=str, default=None, help="Computation device cuda/cpu (overrides config)")
+    parser.add_argument("--enable_sgd", dest="enable_sgd", action="store_true", default=None,
+                        help="Enable paper-compliant photometric SGD Adam optimization (paper Sec. III-B.3, Eq. 10)")
+    parser.add_argument("--no_sgd", dest="enable_sgd", action="store_false",
+                        help="Disable photometric SGD optimization (pure feedforward)")
+    parser.add_argument("--sgd_steps", type=int, default=None,
+                        help="Number of photometric SGD optimization steps per frame (default: 5 if enabled, 0 if disabled)")
 
     return parser.parse_args()
 
@@ -874,6 +880,10 @@ if __name__ == "__main__":
         cfg.set_nested("perception.voxel_size", args.voxel_size)
     if args.device is not None:
         cfg.set_nested("system.device", args.device)
+    if args.enable_sgd is not None:
+        cfg.set_nested("perception.sgd.enabled", args.enable_sgd)
+    if args.sgd_steps is not None:
+        cfg.set_nested("perception.sgd.steps", args.sgd_steps)
 
     # 3. Instantiate and run orchestrator system
     system = DremaDynamicSystem(config=cfg)

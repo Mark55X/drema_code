@@ -63,6 +63,15 @@ perception:
     scale_normal_min: 0.003          # Min thickness through surface normal (meters)
     opacity_init: 0.95               # Initial opacity for reconstructed surface primitives
 
+  # Photometric SGD Optimization (VG-Mapping Paper Sec. III-B.3, Eq. 10)
+  sgd:
+    enabled: false                   # When True, executes Adam optimization over photometric loss L1 + SSIM
+    steps: 5                         # Number of SGD steps per frame (default: 5, set to 0 for pure feedforward)
+    lr_color: 0.01                   # Learning rate for RGB/spherical harmonic color
+    lr_opacity: 0.05                 # Learning rate for Gaussian opacity
+    lambda_ssim: 0.2                 # Weight for SSIM loss (paper Eq. 10: lambda = 0.2)
+    prune_opacity_threshold: 0.05    # Opacity threshold below which Gaussians are pruned
+
   # RecurGS SE(3) Rigid Object Tracking (Calibrate for GPU balance with MuJoCo controller)
   tracking:
     se3_iterations: 15               # Lie algebra gradient optimization iterations per frame

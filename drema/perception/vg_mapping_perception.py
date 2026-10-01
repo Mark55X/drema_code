@@ -153,6 +153,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.log_interval_frames = int(diag_cfg.get("log_interval_frames", 10))
         self.enable_timing_breakdown = bool(diag_cfg.get("enable_timing_breakdown", True))
 
+        # Photometric SGD Optimization (VG-Mapping Paper Sec. III-B.3, Eq. 10)
+        sgd_cfg = config.get_nested("perception.sgd", {})
+        self.enable_sgd = bool(sgd_cfg.get("enabled", False))
+        self.sgd_steps = int(sgd_cfg.get("steps", 5 if self.enable_sgd else 0))
+        self.sgd_lr_color = float(sgd_cfg.get("lr_color", 0.01))
+        self.sgd_lr_opacity = float(sgd_cfg.get("lr_opacity", 0.05))
+        self.sgd_lambda_ssim = float(sgd_cfg.get("lambda_ssim", 0.2))
+        self.sgd_prune_opacity_threshold = float(sgd_cfg.get("prune_opacity_threshold", 0.05))
+
         # Caching configuration
         cache_cfg = config.get_nested("perception.cache", {})
         self.cache_enabled = bool(cache_cfg.get("enabled", False))
@@ -167,7 +176,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'normal': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+            'opacity': torch.empty((0, 1), dtype=torch.float32, device=self.device)
         }
 
         self.tracked_objects: Dict[int, Dict[str, Any]] = {}
@@ -664,7 +674,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             rotations = torch.zeros((N, 4), device=self.device, dtype=torch.float32)
             rotations[:, 0] = 1.0
 
-            opacities = torch.full((N, 1), self.opacity_init, device=self.device, dtype=torch.float32)
+            opacities = self.scene_gaussians.get('opacity', torch.full((N, 1), self.opacity_init, device=self.device, dtype=torch.float32)).contiguous()
 
             with torch.no_grad():
                 rendered_img, _ = rasterizer(
@@ -700,10 +710,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         t_prune_total = 0.0
         t_render_total = 0.0
         t_detect_total = 0.0
+        t_sgd_total = 0.0
         t_vdc_total = 0.0
         t_se3_total = 0.0
         total_pruned_in_frame = 0
-        total_evicted_in_frame = 0
         total_added_in_frame = 0
         tracked_poses = {}
         tracked_deltas = {}
@@ -779,7 +789,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         n_pruned = int(total_prune_mask.sum().item())
                         total_pruned_in_frame += n_pruned
                         keep_mask = ~total_prune_mask
-                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id', 'opacity']:
                             if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
                                 self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
                     t_prune_total += (time.perf_counter() - t_prune_start) * 1000.0
@@ -830,22 +840,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         target_object_ids=self.dynamic_object_ids
                     )
 
-                    # Eviction & Re-initialization (Paper Sec. III-B.1 & III-B.2):
-                    # 1. Evict stale Gaussians in changed AVD / GVD regions across all voxels in the region
-                    evict_mortons = new_g.get('morton', torch.empty((0,), dtype=torch.int64, device=self.device))
-                    if 'eviction_mortons' in new_g and len(new_g['eviction_mortons']) > 0:
-                        evict_mortons = torch.cat([evict_mortons, new_g['eviction_mortons']]).unique()
-                    evict_mortons = evict_mortons[evict_mortons >= 0]
-
-                    if len(self.scene_gaussians['morton']) > 0 and len(evict_mortons) > 0:
-                        stale_mask = torch.isin(self.scene_gaussians['morton'], evict_mortons) & (self.scene_gaussians['morton'] >= 0)
-                        if torch.any(stale_mask):
-                            total_evicted_in_frame += int(stale_mask.sum().item())
-                            keep_mask = ~stale_mask
-                            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
-                                if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
-                                    self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
-
                     # 2. Add new Gaussians with Morton deduplication & robot cylinder exclusion
                     if len(new_g['xyz']) > 0 and len(self.robot_base_pos) >= 3:
                         rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
@@ -878,15 +872,25 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(added_m):
                                     new_g[k] = new_g[k][keep_idx]
 
-                        # 2. Commit newly initialized surface Gaussians
+                        # 2. Filter out additions to voxels that are already densely occupied
+                        if len(self.scene_gaussians['morton']) > 0 and len(new_g['morton']) > 0:
+                            unoccupied = ~torch.isin(new_g['morton'], self.scene_gaussians['morton'])
+                            if not torch.all(unoccupied):
+                                for k in list(new_g.keys()):
+                                    if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(unoccupied):
+                                        new_g[k] = new_g[k][unoccupied]
+
+                        # 3. Commit newly initialized surface Gaussians
                         n_added = len(new_g['xyz'])
                         total_added_in_frame += n_added
 
-                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                        for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id', 'opacity']:
                             if k in new_g:
                                 val = new_g[k]
                             elif k == 'normal':
                                 val = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(new_g['xyz']), 1)
+                            elif k == 'opacity':
+                                val = torch.full((len(new_g['xyz']), 1), self.opacity_init, device=self.device, dtype=torch.float32)
                             else:
                                 val = torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=self.device)
                             self.scene_gaussians[k] = torch.cat([self.scene_gaussians[k], val], dim=0)
@@ -896,7 +900,128 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 except Exception as e:
                     print(f"[VG MAPPING PERCEPTION Warning] Error processing camera view '{cam_name}': {e}")
 
-            t_vdc_total = t_prune_total + t_render_total + t_detect_total
+            # Step 2.b: Paper-Compliant Photometric SGD Optimization (Paper Sec. III-B.3, Eq. 10)
+            t_sgd_total = 0.0
+            if self.enable_sgd and self.sgd_steps > 0 and len(self.scene_gaussians.get('xyz', [])) > 0:
+                t_sgd_start = time.perf_counter()
+                try:
+                    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+                    from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
+                    from ..vg_mapping.closed_loop_pipeline import getProjectionMatrix
+                    import math
+
+                    N_g = len(self.scene_gaussians['xyz'])
+                    if 'opacity' not in self.scene_gaussians or len(self.scene_gaussians['opacity']) != N_g:
+                        self.scene_gaussians['opacity'] = torch.full((N_g, 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
+                    op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
+                    opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
+                    rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
+
+                    sgd_opt = torch.optim.Adam([
+                        {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
+                        {'params': [rgb_param], 'lr': self.sgd_lr_color}
+                    ])
+
+                    means3D = self.scene_gaussians['xyz']
+                    screenspace_pts = torch.zeros_like(means3D)
+                    scales = self.scene_gaussians['scale']
+                    rotations = torch.zeros((N_g, 4), device=self.device, dtype=torch.float32)
+                    rotations[:, 0] = 1.0
+
+                    prepped_views = []
+                    for c_name, c_data in camera_views.items():
+                        c2w_t = torch.from_numpy(c_data['extrinsics'].copy()).to(self.device, dtype=torch.float32)
+                        k_t = torch.from_numpy(c_data['intrinsics'].copy()).to(self.device, dtype=torch.float32)
+                        raw_rgb = c_data['rgb']
+                        if isinstance(raw_rgb, np.ndarray):
+                            if raw_rgb.ndim == 3 and raw_rgb.shape[2] == 3:
+                                gt_rgb = torch.from_numpy(raw_rgb.copy()).permute(2, 0, 1).float().to(self.device)
+                            else:
+                                gt_rgb = torch.from_numpy(raw_rgb.copy()).float().to(self.device)
+                        else:
+                            gt_rgb = raw_rgb.clone().to(self.device, dtype=torch.float32)
+                            if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                                gt_rgb = gt_rgb.permute(2, 0, 1)
+
+                        if gt_rgb.max() > 1.0:
+                            gt_rgb = gt_rgb / 255.0
+                        c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
+
+                        c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
+                        c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
+                        c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
+                        c_tanfovx = math.tan(c_fovx * 0.5)
+                        c_tanfovy = math.tan(c_fovy * 0.5)
+
+                        c_cam_center = c2w_t[:3, 3]
+                        c_w2c = torch.inverse(c2w_t)
+                        c_view_transform = c_w2c.transpose(0, 1).contiguous()
+                        c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
+                        c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
+
+                        c_settings = GaussianRasterizationSettings(
+                            image_height=int(c_h),
+                            image_width=int(c_w),
+                            tanfovx=c_tanfovx,
+                            tanfovy=c_tanfovy,
+                            bg=torch.zeros(3, device=self.device, dtype=torch.float32),
+                            scale_modifier=1.0,
+                            viewmatrix=c_view_transform,
+                            projmatrix=c_full_proj,
+                            sh_degree=0,
+                            campos=c_cam_center,
+                            prefiltered=False,
+                            debug=False
+                        )
+                        prepped_views.append({
+                            'rasterizer': GaussianRasterizer(raster_settings=c_settings),
+                            'gt_rgb': gt_rgb,
+                            'gt_rgb_4d': gt_rgb.unsqueeze(0)
+                        })
+
+                    for step_i in range(self.sgd_steps):
+                        sgd_opt.zero_grad()
+                        step_loss = torch.tensor(0.0, device=self.device)
+                        curr_alpha = torch.sigmoid(opacity_logit)
+                        curr_colors = torch.clamp(rgb_param, 0.0, 1.0)
+
+                        for pv in prepped_views:
+                            rendered, _ = pv['rasterizer'](
+                                means3D=means3D,
+                                means2D=screenspace_pts,
+                                shs=None,
+                                colors_precomp=curr_colors,
+                                opacities=curr_alpha,
+                                scales=scales,
+                                rotations=rotations,
+                                cov3D_precomp=None
+                            )
+                            ll1 = l1_loss(rendered, pv['gt_rgb'])
+                            ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
+                            view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
+                            step_loss = step_loss + view_loss
+
+                        step_loss.backward()
+                        sgd_opt.step()
+
+                    with torch.no_grad():
+                        self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
+                        self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
+
+                        # Paper floater & low-opacity pruning (Sec. III-B.3)
+                        if self.sgd_prune_opacity_threshold > 0.0:
+                            keep_op = (self.scene_gaussians['opacity'].squeeze(-1) >= self.sgd_prune_opacity_threshold)
+                            if not torch.all(keep_op):
+                                for k in list(self.scene_gaussians.keys()):
+                                    if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
+                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
+
+                except Exception as e_sgd:
+                    print(f"[VG MAPPING PERCEPTION Warning] Error during photometric SGD optimization: {e_sgd}")
+                t_sgd_total = (time.perf_counter() - t_sgd_start) * 1000.0
+
+            t_vdc_total = t_prune_total + t_render_total + t_detect_total + t_sgd_total
 
         # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
         if len(self.tracked_objects) > 0 and len(self.scene_gaussians['xyz']) > 0:
@@ -992,6 +1117,25 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     # Pure VG-Mapping: Gaussians have surface normals assigned directly from TSDF
                     # gradients upon initialization; no artificial rototranslation of normals.
 
+                    # Dynamic Object Gaussian Management (DREMA RecurGS Tracking):
+                    # Clean up stale Gaussians belonging specifically to this object (obj_id == oid)
+                    # that fall outside the tracked bounding hull as the object moves.
+                    # The static table/background (obj_id != oid) is completely untouched.
+                    if len(self.scene_gaussians.get('xyz', [])) > 0:
+                        g_obj_id = self.scene_gaussians.get('obj_id', None)
+                        if g_obj_id is not None and torch.any(g_obj_id == oid):
+                            dims = self.tracked_objects[oid].get('dims', [0.1, 0.1, 0.1])
+                            r_bbox = max(float(dims[0]), float(dims[1])) * 0.75 + 0.05
+                            pos_tensor = torch.tensor(new_pos[:2], device=self.device, dtype=torch.float32)
+                            d_xy = torch.norm(self.scene_gaussians['xyz'][:, :2] - pos_tensor, dim=1)
+
+                            stale_obj_mask = (g_obj_id == oid) & (d_xy > r_bbox)
+                            if torch.any(stale_obj_mask):
+                                keep_mask = ~stale_obj_mask
+                                for k in list(self.scene_gaussians.keys()):
+                                    if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_mask):
+                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+
             t_se3_total = (time.perf_counter() - t_s3) * 1000.0
 
         total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
@@ -1015,7 +1159,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
-            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms] | Pruned: {total_pruned_in_frame} | Evicted: {total_evicted_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
+            sgd_log = f" | SGD ({self.sgd_steps} iters): {t_sgd_total:.1f}ms" if (self.enable_sgd and self.sgd_steps > 0) else ""
+            print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms{sgd_log}] | Pruned: {total_pruned_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
             if len(tracked_deltas) > 0:
                 for oid, d_p in tracked_deltas.items():
                     name_o = self.tracked_objects[oid]['name']
@@ -1034,7 +1179,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             obj_col = torch.tensor(col_raw[:3], device=self.device, dtype=torch.float32)
                             col_dist = torch.norm(g_rgb - obj_col, dim=1)
                             if g_obj_id is not None and torch.any(g_obj_id == oid):
-                                is_this_obj = (g_obj_id == oid) | (col_dist < 0.25)
+                                is_this_obj = (g_obj_id == oid)
                             else:
                                 is_this_obj = (col_dist < 0.25)
 
@@ -1231,9 +1376,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             # Load 3D Gaussians
             g_loaded = torch.load(g_path, map_location=self.device, weights_only=False)
-            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id', 'opacity']:
                 if k in g_loaded:
                     self.scene_gaussians[k] = g_loaded[k].to(self.device)
+            if 'opacity' not in self.scene_gaussians or len(self.scene_gaussians['opacity']) != len(self.scene_gaussians['xyz']):
+                self.scene_gaussians['opacity'] = torch.full((len(self.scene_gaussians['xyz']), 1), self.opacity_init, device=self.device, dtype=torch.float32)
 
             # Re-initialize TSDF Voxel Pipeline and restore F, W tensors (with weight clamping)
             self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
