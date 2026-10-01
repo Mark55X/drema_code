@@ -480,7 +480,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             try:
                 from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
                 from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
-                from ..vg_mapping.closed_loop_pipeline import getProjectionMatrix
+                from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
                 import math
 
                 op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
@@ -1035,7 +1035,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 try:
                     from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
                     from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
-                    from ..vg_mapping.closed_loop_pipeline import getProjectionMatrix
+                    from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
                     import math
 
                     N_g = len(self.scene_gaussians['xyz'])
