@@ -465,6 +465,128 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         print(f"   Raw Gaussians accumulated: {raw_gaussians_count:,}")
         print(f"   Unique 1cm voxel surface Gaussians retained: {retained_count:,}")
         print(f"   Pruned redundant primitives: {raw_gaussians_count - retained_count:,} ({reduction_pct:.1f}% reduction).")
+        self.scene_gaussians['opacity'] = torch.full((retained_count, 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
+        # Optional Paper-Compliant Photometric SGD on Initial Scan (Sec. III-B.3)
+        if self.enable_sgd and retained_count > 0 and len(scan_frames) > 0:
+            n_scan_iters = max(10, self.sgd_steps * 2)
+            print(f"\n[VG-Mapping Initial Scan] Executing Photometric SGD Optimization ({n_scan_iters} iterations across {len(scan_frames)} scan views)...")
+            t_sgd_scan_start = time.perf_counter()
+            try:
+                from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+                from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
+                from ..vg_mapping.closed_loop_pipeline import getProjectionMatrix
+                import math
+
+                op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
+                opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
+                rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
+
+                sgd_opt = torch.optim.Adam([
+                    {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
+                    {'params': [rgb_param], 'lr': self.sgd_lr_color}
+                ])
+
+                means3D = self.scene_gaussians['xyz']
+                screenspace_pts = torch.zeros_like(means3D)
+                scales = self.scene_gaussians['scale']
+                rotations = torch.zeros((retained_count, 4), device=self.device, dtype=torch.float32)
+                rotations[:, 0] = 1.0
+
+                prepped_scan_views = []
+                for f_data in scan_frames:
+                    c2w_t = torch.from_numpy(f_data['extrinsics'].copy()).to(self.device, dtype=torch.float32)
+                    k_t = torch.from_numpy(f_data['intrinsics'].copy()).to(self.device, dtype=torch.float32)
+                    raw_rgb = f_data['rgb']
+                    if isinstance(raw_rgb, np.ndarray):
+                        if raw_rgb.ndim == 3 and raw_rgb.shape[2] == 3:
+                            gt_rgb = torch.from_numpy(raw_rgb.copy()).permute(2, 0, 1).float().to(self.device)
+                        else:
+                            gt_rgb = torch.from_numpy(raw_rgb.copy()).float().to(self.device)
+                    else:
+                        gt_rgb = raw_rgb.clone().to(self.device, dtype=torch.float32)
+                        if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                            gt_rgb = gt_rgb.permute(2, 0, 1)
+
+                    if gt_rgb.max() > 1.0:
+                        gt_rgb = gt_rgb / 255.0
+                    c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
+
+                    c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
+                    c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
+                    c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
+                    c_tanfovx = math.tan(c_fovx * 0.5)
+                    c_tanfovy = math.tan(c_fovy * 0.5)
+
+                    c_cam_center = c2w_t[:3, 3]
+                    c_w2c = torch.inverse(c2w_t)
+                    c_view_transform = c_w2c.transpose(0, 1).contiguous()
+                    c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
+                    c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
+
+                    c_settings = GaussianRasterizationSettings(
+                        image_height=int(c_h),
+                        image_width=int(c_w),
+                        tanfovx=c_tanfovx,
+                        tanfovy=c_tanfovy,
+                        bg=torch.zeros(3, device=self.device, dtype=torch.float32),
+                        scale_modifier=1.0,
+                        viewmatrix=c_view_transform,
+                        projmatrix=c_full_proj,
+                        sh_degree=0,
+                        campos=c_cam_center,
+                        prefiltered=False,
+                        debug=False
+                    )
+                    prepped_scan_views.append({
+                        'rasterizer': GaussianRasterizer(raster_settings=c_settings),
+                        'gt_rgb': gt_rgb,
+                        'gt_rgb_4d': gt_rgb.unsqueeze(0)
+                    })
+
+                for it in range(n_scan_iters):
+                    sgd_opt.zero_grad()
+                    step_loss = torch.tensor(0.0, device=self.device)
+                    curr_alpha = torch.sigmoid(opacity_logit)
+                    curr_colors = torch.clamp(rgb_param, 0.0, 1.0)
+
+                    for pv in prepped_scan_views:
+                        rendered, _ = pv['rasterizer'](
+                            means3D=means3D,
+                            means2D=screenspace_pts,
+                            shs=None,
+                            colors_precomp=curr_colors,
+                            opacities=curr_alpha,
+                            scales=scales,
+                            rotations=rotations,
+                            cov3D_precomp=None
+                        )
+                        ll1 = l1_loss(rendered, pv['gt_rgb'])
+                        ssim_val = ssim(rendered.unsqueeze(0), pv['gt_rgb_4d'])
+                        view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
+                        step_loss = step_loss + view_loss
+
+                    step_loss.backward()
+                    sgd_opt.step()
+
+                with torch.no_grad():
+                    self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
+                    self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
+
+                    if self.sgd_prune_opacity_threshold > 0.0:
+                        keep_op = (self.scene_gaussians['opacity'].squeeze(-1) >= self.sgd_prune_opacity_threshold)
+                        if not torch.all(keep_op):
+                            n_before = len(self.scene_gaussians['xyz'])
+                            for k in list(self.scene_gaussians.keys()):
+                                if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
+                                    self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
+                            print(f"✓ [SGD Initial Pruning] Pruned {n_before - len(self.scene_gaussians['xyz'])} low-opacity primitives.")
+
+                t_sgd_scan = (time.perf_counter() - t_sgd_scan_start) * 1000.0
+                print(f"✓ [VG-Mapping Initial Scan] SGD Optimization completed in {t_sgd_scan:.1f}ms! Final primitives: {len(self.scene_gaussians['xyz']):,}")
+
+            except Exception as e_sgd:
+                print(f"[VG MAPPING PERCEPTION Warning] Error during initial scan SGD optimization: {e_sgd}")
 
         # 7. Extract Tabletop Obstacle Meshes via Marching Cubes
         z_cutoff = z_table + self.obstacle_min_clearance_z
