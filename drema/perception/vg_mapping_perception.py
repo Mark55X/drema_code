@@ -796,8 +796,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     else:
                         rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
-                    if torch.cuda.is_available() and self.device.type == 'cuda':
-                        torch.cuda.synchronize(self.device)
+                    if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+                        torch.cuda.synchronize()
                     t_render_total += (time.perf_counter() - t_render_start) * 1000.0
 
                     # Step 4: VDC variation detection & initialization on newly observed surfaces
