@@ -830,7 +830,23 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         target_object_ids=self.dynamic_object_ids
                     )
 
-                    # Add new Gaussians with Morton deduplication & robot cylinder exclusion
+                    # Eviction & Re-initialization (Paper Sec. III-B.1 & III-B.2):
+                    # 1. Evict stale Gaussians in changed AVD / GVD regions across all voxels in the region
+                    evict_mortons = new_g.get('morton', torch.empty((0,), dtype=torch.int64, device=self.device))
+                    if 'eviction_mortons' in new_g and len(new_g['eviction_mortons']) > 0:
+                        evict_mortons = torch.cat([evict_mortons, new_g['eviction_mortons']]).unique()
+                    evict_mortons = evict_mortons[evict_mortons >= 0]
+
+                    if len(self.scene_gaussians['morton']) > 0 and len(evict_mortons) > 0:
+                        stale_mask = torch.isin(self.scene_gaussians['morton'], evict_mortons) & (self.scene_gaussians['morton'] >= 0)
+                        if torch.any(stale_mask):
+                            total_evicted_in_frame += int(stale_mask.sum().item())
+                            keep_mask = ~stale_mask
+                            for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
+                                if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
+                                    self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
+
+                    # 2. Add new Gaussians with Morton deduplication & robot cylinder exclusion
                     if len(new_g['xyz']) > 0 and len(self.robot_base_pos) >= 3:
                         rx, ry, rz = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
                         p_xy = new_g['xyz'][:, :2]
@@ -862,21 +878,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 if isinstance(new_g[k], torch.Tensor) and len(new_g[k]) == len(added_m):
                                     new_g[k] = new_g[k][keep_idx]
 
-                        # 2. Hybrid AVD Eviction & Re-initialization (Paper Sec. III-B.1 & III-B.2):
-                        # When AVD detects an appearance mismatch (or GVD detects geometric update)
-                        # on a voxel that already holds prior Gaussians, those prior Gaussians are
-                        # outdated. We evict the stale Gaussians so the freshly observed surface
-                        # Gaussian takes over without duplicating voxels or leaving stale stains.
-                        if len(self.scene_gaussians['morton']) > 0 and len(new_g['morton']) > 0:
-                            stale_mask = torch.isin(self.scene_gaussians['morton'], new_g['morton']) & (self.scene_gaussians['morton'] >= 0)
-                            if torch.any(stale_mask):
-                                total_evicted_in_frame += int(stale_mask.sum().item())
-                                keep_mask = ~stale_mask
-                                for k in ['xyz', 'rgb', 'scale', 'normal', 'morton', 'obj_id']:
-                                    if k in self.scene_gaussians and len(self.scene_gaussians[k]) == len(keep_mask):
-                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_mask]
-
-                        # 3. Commit newly initialized surface Gaussians
+                        # 2. Commit newly initialized surface Gaussians
                         n_added = len(new_g['xyz'])
                         total_added_in_frame += n_added
 

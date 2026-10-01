@@ -898,7 +898,7 @@ def main():
         # STEP 2: Online Mapping (VDC initialization & Morton pruning)
         # ---------------------------------------------------------
         t_vdc_start = time.time()
-        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc = [], [], [], [], []
+        new_xyz_acc, new_rgb_acc, new_scale_acc, new_morton_acc, new_obj_id_acc, eviction_morton_acc = [], [], [], [], [], []
         total_pruned = 0
         
         for obs in observations:
@@ -937,6 +937,30 @@ def main():
                 new_morton_acc.append(new_g['morton'])
                 new_obj_id_acc.append(new_g.get('obj_id', torch.zeros(len(new_g['xyz']), dtype=torch.int32, device=device)))
 
+            if 'eviction_mortons' in new_g and len(new_g['eviction_mortons']) > 0:
+                eviction_morton_acc.append(new_g['eviction_mortons'])
+
+        # Hybrid AVD Eviction (Paper Sec. III-B.1 & III-B.2):
+        # When AVD/GVD detects variation on already-occupied voxels, evict stale Gaussians
+        if t_idx > 0 and len(scene_gaussians['morton']) > 0:
+            mortons_to_evict = []
+            if len(new_morton_acc) > 0:
+                mortons_to_evict.append(torch.cat(new_morton_acc, dim=0))
+            if len(eviction_morton_acc) > 0:
+                mortons_to_evict.append(torch.cat(eviction_morton_acc, dim=0))
+            if len(mortons_to_evict) > 0:
+                all_evict = torch.cat(mortons_to_evict, dim=0).unique()
+                valid_evict = all_evict[all_evict >= 0]
+                if len(valid_evict) > 0:
+                    stale_mask = torch.isin(scene_gaussians['morton'], valid_evict) & (scene_gaussians['morton'] >= 0)
+                    if torch.any(stale_mask):
+                        keep_mask = ~stale_mask
+                        scene_gaussians['xyz'] = scene_gaussians['xyz'][keep_mask]
+                        scene_gaussians['rgb'] = scene_gaussians['rgb'][keep_mask]
+                        scene_gaussians['scale'] = scene_gaussians['scale'][keep_mask]
+                        scene_gaussians['morton'] = scene_gaussians['morton'][keep_mask]
+                        scene_gaussians['obj_id'] = scene_gaussians['obj_id'][keep_mask]
+
         # Concatenate newly initialized Gaussians with Voxel Deduplication
         num_added = 0
         if len(new_xyz_acc) > 0:
@@ -959,19 +983,6 @@ def main():
                 added_scale = added_scale[keep_idx]
                 added_morton = added_morton[keep_idx]
                 added_obj_id = added_obj_id[keep_idx]
-
-                # Hybrid AVD Eviction (Paper Sec. III-B.1 & III-B.2):
-                # When AVD/GVD detects variation on already-occupied voxels, evict stale Gaussians
-                if t_idx > 0 and len(scene_gaussians['morton']) > 0 and len(added_morton) > 0:
-                    valid_added = added_morton[added_morton >= 0]
-                    stale_mask = torch.isin(scene_gaussians['morton'], valid_added) & (scene_gaussians['morton'] >= 0)
-                    if torch.any(stale_mask):
-                        keep_mask = ~stale_mask
-                        scene_gaussians['xyz'] = scene_gaussians['xyz'][keep_mask]
-                        scene_gaussians['rgb'] = scene_gaussians['rgb'][keep_mask]
-                        scene_gaussians['scale'] = scene_gaussians['scale'][keep_mask]
-                        scene_gaussians['morton'] = scene_gaussians['morton'][keep_mask]
-                        scene_gaussians['obj_id'] = scene_gaussians['obj_id'][keep_mask]
 
             scene_gaussians['xyz'] = torch.cat([scene_gaussians['xyz'], added_xyz], dim=0)
             scene_gaussians['rgb'] = torch.cat([scene_gaussians['rgb'], added_rgb], dim=0)
