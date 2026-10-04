@@ -10,6 +10,7 @@ Agnostic & Dynamic Scene Manager:
 
 import os
 import sys
+import time
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union, Any
 
@@ -60,7 +61,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         # Dynamic registry of objects spawned by perception (obj_id -> object metadata)
         self.tracked_objects: Dict[int, Dict] = {}
-
+        self.last_collision_timings: Dict[str, Any] = {}
 
         # Connect to PyBullet
         if self.visualize:
@@ -568,6 +569,14 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         coll_gvm = np.zeros((K, H), dtype=np.float32)
 
         if self.client_id < 0 or self.robot_id < 0 or len(self.tracked_objects) == 0:
+            self.last_collision_timings = {
+                'backend': 'PyBullet',
+                'pred_ms': 0.0,
+                'backend_ms': 0.0,
+                'bullet_ms': 0.0,
+                'gvm_ms': 0.0,
+                'pts_count': 0
+            }
             return coll_p, coll_gvm
 
         # Map body_id -> obj_id for dynamic obstacles
@@ -580,6 +589,14 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 body_to_obj_id[b_id] = obj_id
 
         if not obstacle_body_ids:
+            self.last_collision_timings = {
+                'backend': 'PyBullet',
+                'pred_ms': 0.0,
+                'backend_ms': 0.0,
+                'bullet_ms': 0.0,
+                'gvm_ms': 0.0,
+                'pts_count': 0
+            }
             return coll_p, coll_gvm
 
         robot_id = self.robot_id
