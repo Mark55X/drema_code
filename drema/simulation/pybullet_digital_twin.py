@@ -702,7 +702,9 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 coll_gvm[k, h] = step_coll_gvm
 
         self.last_collision_timings = {
+            'backend': 'PyBullet',
             'pred_ms': t_pred_ms,
+            'backend_ms': t_bullet_total * 1000.0,
             'bullet_ms': t_bullet_total * 1000.0,
             'gvm_ms': t_gvm_total * 1000.0,
             'pts_count': total_contact_pts

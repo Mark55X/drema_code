@@ -12,6 +12,7 @@ Agnostic & Dynamic Scene Manager running on MuJoCo:
 
 import os
 import sys
+import time
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union, Any
 
@@ -129,6 +130,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         # Tracked dynamic objects dictionary: obj_id -> metadata
         self.tracked_objects: Dict[int, Dict[str, Any]] = {}
+        self.last_collision_timings: Dict[str, Any] = {}
 
         # Kinematics analytical helper
         self.kin = FrankaKinematics(base_position=self.robot_base_pos)
@@ -879,6 +881,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         coll_gvm = np.zeros((K, H), dtype=np.float32)
 
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
+            self.last_collision_timings = {
+                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'pred_ms': 0.0,
+                'backend_ms': 0.0,
+                'gvm_ms': 0.0,
+                'pts_count': 0
+            }
             return coll_p, coll_gvm
 
         # Extract obstacle geoms (ignore targets) and map to obj_id
@@ -897,6 +906,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     pass
 
         if not obstacle_geoms:
+            self.last_collision_timings = {
+                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'pred_ms': 0.0,
+                'backend_ms': 0.0,
+                'gvm_ms': 0.0,
+                'pts_count': 0
+            }
             return coll_p, coll_gvm
 
         # Pre-cache robot arm geoms and link indices
@@ -912,6 +928,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 robot_geom_link_map.append((i, -1))
 
         if not robot_geom_link_map:
+            self.last_collision_timings = {
+                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'pred_ms': 0.0,
+                'backend_ms': 0.0,
+                'gvm_ms': 0.0,
+                'pts_count': 0
+            }
             return coll_p, coll_gvm
 
         if self._eval_data is None:
@@ -924,11 +947,17 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             eval_data.mocap_quat[:] = self.data.mocap_quat[:]
 
         # Forecast future trajectories for all tracked dynamic obstacles across horizon H
+        t_pred_start = time.perf_counter()
         predictions = (
             self.predictor.predict_all(horizon=H, dt=dt)
             if self.predictor is not None
             else {}
         )
+        t_pred_ms = (time.perf_counter() - t_pred_start) * 1000.0
+
+        t_mj_total = 0.0
+        t_gvm_total = 0.0
+        total_contact_pts = 0
 
         # Pre-cache mocap indices for tracked obstacles
         obj_mocap_map = {}
@@ -961,8 +990,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 qd_step = QD[k, h]
 
                 # Update Franka Panda joint positions in MuJoCo eval data
+                t_mj_s = time.perf_counter()
                 eval_data.qpos[:7] = q_step
                 mujoco.mj_kinematics(self.model, eval_data)
+                t_mj_total += (time.perf_counter() - t_mj_s)
 
                 step_coll_p = 0.0
                 step_coll_gvm = 0.0
@@ -980,10 +1011,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         if dist_centers > (rg_r + og_r + sigma_2):
                             continue
 
+                        t_mj_s = time.perf_counter()
                         try:
                             d = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2), fromto)
                         except Exception:
+                            t_mj_total += (time.perf_counter() - t_mj_s)
                             continue
+                        t_mj_total += (time.perf_counter() - t_mj_s)
 
                         if d > sigma_2:
                             continue
@@ -998,6 +1032,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
                         if phi <= 1e-4:
                             continue
+
+                        total_contact_pts += 1
+                        t_gvm_s = time.perf_counter()
 
                         step_coll_p += phi
 
@@ -1032,8 +1069,18 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         gvm_term = phi * (1.0 + vel_mag * modulation)
                         step_coll_gvm += gvm_term
 
+                        t_gvm_total += (time.perf_counter() - t_gvm_s)
+
                 coll_p[k, h] = step_coll_p
                 coll_gvm[k, h] = step_coll_gvm
+
+        self.last_collision_timings = {
+            'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+            'pred_ms': t_pred_ms,
+            'backend_ms': t_mj_total * 1000.0,
+            'gvm_ms': t_gvm_total * 1000.0,
+            'pts_count': total_contact_pts
+        }
 
         # Restore eval_data mocap poses to instantaneous state (t=0)
         if hasattr(eval_data, 'mocap_pos') and hasattr(self.data, 'mocap_pos'):
