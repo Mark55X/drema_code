@@ -123,7 +123,8 @@ class BaseDigitalTwin(ABC):
         sigma_2: float,
         kappa: float,
         rho: float,
-        kin_helper: Any
+        kin_helper: Any,
+        dt: float = 0.05
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for

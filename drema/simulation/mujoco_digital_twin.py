@@ -24,6 +24,7 @@ except ImportError:
 
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
 from drema.controller.franka_kinematics import FrankaKinematics
+from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 
 
 def _xyzw_to_wxyz(q: Union[Tuple[float, ...], List[float], np.ndarray]) -> np.ndarray:
@@ -69,7 +70,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         kd_rot: float = 1.5,
         sim_substeps: int = 1,
         time_step: float = 0.002,
-        enable_mjx: bool = False
+        enable_mjx: bool = False,
+        predictor: Optional[BaseObstaclePredictor] = None
     ):
         if not MUJOCO_AVAILABLE:
             raise ImportError(
@@ -82,6 +84,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.enable_mjx = bool(enable_mjx)
         self.mjx_model = None
         self._eval_data = None
+
+        # Modular generic trajectory predictor
+        self.predictor: Optional[BaseObstaclePredictor] = (
+            predictor if predictor is not None else ObstacleTrajectoryPredictor()
+        )
 
         # Tracking mode: 'constraint' (or 'mocap'), 'pd_force', 'teleport'
         raw_mode = tracking_mode.lower()
@@ -526,7 +533,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self,
         obj_id: int,
         position: Tuple[float, float, float],
-        orientation: Tuple[float, float, float, float]
+        orientation: Tuple[float, float, float, float],
+        timestamp: Optional[float] = None
     ) -> None:
         """Updates rigid body position and orientation estimated by SE(3) tracking."""
         if obj_id not in self.tracked_objects or self.data is None:
@@ -537,6 +545,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         self.tracked_objects[obj_id]["target_pos"] = pos_arr
         self.tracked_objects[obj_id]["target_quat"] = quat_wxyz
+
+        # Update generic trajectory predictor
+        if self.predictor is not None:
+            self.predictor.update_obstacle_pose(obj_id, position, orientation, timestamp=timestamp)
 
         if self.tracking_mode == "mocap":
             mocap_name = f"obs_{obj_id}_mocap"
@@ -854,11 +866,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         sigma_2: float,
         kappa: float,
         rho: float,
-        kin_helper: Any
+        kin_helper: Any,
+        dt: float = 0.05
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for
         a batch of candidate trajectories Q (K x H x 7) and QD (K x H x 7) using MuJoCo geomDistance / MJX.
+        Obstacle future states are dynamically forecasted across horizon H via self.predictor.
         """
         K, H, _ = Q.shape
         coll_p = np.zeros((K, H), dtype=np.float32)
@@ -867,8 +881,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
             return coll_p, coll_gvm
 
-        # Extract obstacle geoms (ignore targets)
+        # Extract obstacle geoms (ignore targets) and map to obj_id
         obstacle_geoms = []
+        geom_to_obj_id = {}
         for i in range(self.model.ngeom):
             g_name = self.model.geom(i).name
             if g_name.startswith("obs_") and g_name.endswith("_geom"):
@@ -876,9 +891,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     obj_id = int(g_name.split("_")[1])
                     if self.tracked_objects.get(obj_id, {}).get("is_target", False):
                         continue
+                    obstacle_geoms.append(i)
+                    geom_to_obj_id[i] = obj_id
                 except Exception:
                     pass
-                obstacle_geoms.append(i)
 
         if not obstacle_geoms:
             return coll_p, coll_gvm
@@ -907,6 +923,23 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             eval_data.mocap_pos[:] = self.data.mocap_pos[:]
             eval_data.mocap_quat[:] = self.data.mocap_quat[:]
 
+        # Forecast future trajectories for all tracked dynamic obstacles across horizon H
+        predictions = (
+            self.predictor.predict_all(horizon=H, dt=dt)
+            if self.predictor is not None
+            else {}
+        )
+
+        # Pre-cache mocap indices for tracked obstacles
+        obj_mocap_map = {}
+        for obj_id in predictions.keys():
+            m_name = f"obs_{obj_id}_mocap"
+            b_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, m_name)
+            if b_id >= 0:
+                m_idx = self.model.body_mocapid[b_id]
+                if m_idx >= 0:
+                    obj_mocap_map[obj_id] = m_idx
+
         # Subsample lookahead waypoints to sustain high control frequency
         step_stride = max(1, H // 5)
         eval_steps = list(range(0, H, step_stride))
@@ -916,6 +949,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         fromto = np.zeros(6, dtype=np.float64)
 
         for h in eval_steps:
+            # Advance all tracked dynamic obstacles to forecasted pose at step h
+            for obj_id, m_idx in obj_mocap_map.items():
+                if obj_id in predictions:
+                    pred = predictions[obj_id]
+                    eval_data.mocap_pos[m_idx] = pred.positions[h].astype(np.float64)
+                    eval_data.mocap_quat[m_idx] = _xyzw_to_wxyz(pred.orientations[h])
+
             for k in range(K):
                 q_step = Q[k, h]
                 qd_step = QD[k, h]
@@ -923,8 +963,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 # Update Franka Panda joint positions in MuJoCo eval data
                 eval_data.qpos[:7] = q_step
                 mujoco.mj_kinematics(self.model, eval_data)
-
-
 
                 step_coll_p = 0.0
                 step_coll_gvm = 0.0
@@ -950,7 +988,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         if d > sigma_2:
                             continue
 
-
                         # 1. SDF Potential Phi(d)
                         if d < sigma_1:
                             phi = 1.0
@@ -972,13 +1009,21 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         else:
                             normal_grad = np.zeros(3, dtype=np.float32)
 
-                        # 3. Cartesian Velocity of Closest Link
+                        # 3. Relative Cartesian Velocity between closest robot link and moving obstacle
                         vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
-                        vel_mag = np.linalg.norm(vel_cart)
+                        
+                        o_id = geom_to_obj_id.get(og)
+                        if o_id is not None and o_id in predictions:
+                            v_obs = predictions[o_id].velocities[h]
+                        else:
+                            v_obs = np.zeros(3, dtype=np.float32)
+
+                        v_rel = vel_cart - v_obs
+                        vel_mag = np.linalg.norm(v_rel)
 
                         # 4. Cosine Alignment theta
                         if vel_mag > 1e-4 and norm_mag > 1e-6:
-                            cos_theta = float(np.dot(normal_grad, vel_cart) / vel_mag)
+                            cos_theta = float(np.dot(normal_grad, v_rel) / vel_mag)
                         else:
                             cos_theta = 0.0
 
@@ -989,6 +1034,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
                 coll_p[k, h] = step_coll_p
                 coll_gvm[k, h] = step_coll_gvm
+
+        # Restore eval_data mocap poses to instantaneous state (t=0)
+        if hasattr(eval_data, 'mocap_pos') and hasattr(self.data, 'mocap_pos'):
+            eval_data.mocap_pos[:] = self.data.mocap_pos[:]
+            eval_data.mocap_quat[:] = self.data.mocap_quat[:]
 
         # Interpolate across un-evaluated lookahead steps
         for h in range(H):
@@ -1006,6 +1056,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     def reset(self) -> None:
         """Resets the simulation environment and cleans up dynamic bodies."""
         self.tracked_objects.clear()
+        if self.predictor is not None:
+            self.predictor.reset()
         self._rebuild_model()
         print("[MUJOCO DIGITAL TWIN] Environment reset.")
 

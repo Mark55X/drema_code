@@ -562,7 +562,8 @@ class MPPMPPIEngine:
                 sigma_2=self.sigma_2,
                 kappa=self.kappa,
                 rho=self.rho,
-                kin_helper=self.kin
+                kin_helper=self.kin,
+                dt=self.dt
             )
 
         return np.zeros((K, H), dtype=np.float32), np.zeros((K, H), dtype=np.float32)

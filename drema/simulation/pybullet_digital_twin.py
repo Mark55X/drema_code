@@ -17,6 +17,7 @@ from typing import Optional, Tuple, List, Dict, Union, Any
 import pybullet as p
 import pybullet_data
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
+from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 
 
 class PyBulletDigitalTwin(BaseDigitalTwin):
@@ -35,7 +36,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         kd_pos: float = 30.0,
         kp_rot: float = 15.0,
         kd_rot: float = 1.5,
-        sim_substeps: int = 1
+        sim_substeps: int = 1,
+        predictor: Optional[BaseObstaclePredictor] = None
     ):
         self.visualize = visualize
         self.table_z = table_z
@@ -46,6 +48,11 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         self.kp_rot = float(kp_rot)
         self.kd_rot = float(kd_rot)
         self.sim_substeps = max(1, int(sim_substeps))
+
+        # Modular generic trajectory predictor
+        self.predictor: Optional[BaseObstaclePredictor] = (
+            predictor if predictor is not None else ObstacleTrajectoryPredictor()
+        )
 
         self.client_id = -1
         self.robot_id = -1
@@ -335,7 +342,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         self,
         obj_id: int,
         position: Tuple[float, float, float],
-        orientation: Tuple[float, float, float, float]
+        orientation: Tuple[float, float, float, float],
+        timestamp: Optional[float] = None
     ):
         """
         Synchronizes the 3D position and orientation of an object tracked by RecurGS SE(3).
@@ -354,6 +362,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         obj_data['target_pos'] = pos
         obj_data['target_quat'] = orn
+
+        # Pass 6D pose to generic trajectory predictor
+        if self.predictor is not None:
+            self.predictor.update_obstacle_pose(obj_id, pos, orn, timestamp=timestamp)
 
         if self.tracking_mode == "constraint":
             mass = float(obj_data.get('mass', 1.0))
@@ -484,12 +496,19 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 orn = tuple(float(x) for x in obj_data.get('target_quat', (0, 0, 0, 1)))
 
             if pos is not None:
+                vel = (0.0, 0.0, 0.0)
+                if self.predictor is not None:
+                    st = self.predictor.get_estimated_state(obj_id)
+                    if st is not None:
+                        vel = tuple(float(x) for x in st['velocity'])
+
                 obstacles.append({
                     'id': obj_id,
                     'body_id': body_id,
                     'name': obj_data.get('name', f"obstacle_{obj_id}"),
                     'position': pos,
                     'orientation': orn if orn is not None else (0.0, 0.0, 0.0, 1.0),
+                    'velocity': vel,
                     'is_target': bool(obj_data.get('is_target', False))
                 })
         return obstacles
@@ -536,11 +555,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         sigma_2: float,
         kappa: float,
         rho: float,
-        kin_helper: Any
+        kin_helper: Any,
+        dt: float = 0.05
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for
         a batch of candidate trajectories Q (K x H x 7) and QD (K x H x 7) using PyBullet GJK/EPA.
+        Obstacle future states are dynamically forecasted across horizon H via self.predictor.
         """
         K, H, _ = Q.shape
         coll_p = np.zeros((K, H), dtype=np.float32)
@@ -549,14 +570,26 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         if self.client_id < 0 or self.robot_id < 0 or len(self.tracked_objects) == 0:
             return coll_p, coll_gvm
 
-        obstacle_body_ids = [
-            obj['body_id'] for obj in self.tracked_objects.values()
-            if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0
-        ]
+        # Map body_id -> obj_id for dynamic obstacles
+        body_to_obj_id: Dict[int, int] = {}
+        obstacle_body_ids: List[int] = []
+        for obj_id, obj in self.tracked_objects.items():
+            if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0:
+                b_id = obj['body_id']
+                obstacle_body_ids.append(b_id)
+                body_to_obj_id[b_id] = obj_id
+
         if not obstacle_body_ids:
             return coll_p, coll_gvm
 
         robot_id = self.robot_id
+
+        # Forecast future trajectories for all tracked dynamic obstacles across horizon H
+        predictions = (
+            self.predictor.predict_all(horizon=H, dt=dt)
+            if self.predictor is not None
+            else {}
+        )
 
         # Subsample lookahead waypoints to sustain high control frequency
         step_stride = max(1, H // 5)
@@ -573,6 +606,16 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 arm_joint_indices.append(j_idx)
 
         for h in eval_steps:
+            # Advance all tracked dynamic obstacles to their forecasted future pose at lookahead step h
+            for b_id, o_id in body_to_obj_id.items():
+                if o_id in predictions:
+                    pred = predictions[o_id]
+                    p.resetBasePositionAndOrientation(
+                        b_id,
+                        pred.positions[h].tolist(),
+                        pred.orientations[h].tolist()
+                    )
+
             for k in range(K):
                 q_step = Q[k, h]
                 qd_step = QD[k, h]
@@ -617,15 +660,24 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         if norm_mag > 1e-6:
                             normal_grad = normal_grad / norm_mag
 
-                        # 3. Cartesian Velocity of Closest Link
+                        # 3. Relative Cartesian Velocity between closest robot link and moving obstacle
                         link_a = pt[3]
                         fk_link_idx = -1 if (link_a < 0 or link_a >= 7) else (link_a + 1)
                         vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
-                        vel_mag = np.linalg.norm(vel_cart)
 
-                        # 4. Cosine Alignment theta
+                        o_id = body_to_obj_id.get(obs_id)
+                        if o_id is not None and o_id in predictions:
+                            v_obs = predictions[o_id].velocities[h]
+                        else:
+                            v_obs = np.zeros(3, dtype=np.float32)
+
+                        # True relative approach velocity (Zhou et al. IEEE T-RO 2025)
+                        v_rel = vel_cart - v_obs
+                        vel_mag = np.linalg.norm(v_rel)
+
+                        # 4. Cosine Alignment theta with relative velocity
                         if vel_mag > 1e-4:
-                            cos_theta = float(np.dot(normal_grad, vel_cart) / (norm_mag * vel_mag))
+                            cos_theta = float(np.dot(normal_grad, v_rel) / (norm_mag * vel_mag))
                         else:
                             cos_theta = 0.0
 
@@ -636,6 +688,15 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
                 coll_p[k, h] = step_coll_p
                 coll_gvm[k, h] = step_coll_gvm
+
+        # Restore all dynamic obstacles to their current instantaneous state (t=0)
+        for b_id, o_id in body_to_obj_id.items():
+            if 'target_pos' in self.tracked_objects[o_id]:
+                p.resetBasePositionAndOrientation(
+                    b_id,
+                    list(self.tracked_objects[o_id]['target_pos']),
+                    list(self.tracked_objects[o_id].get('target_quat', (0, 0, 0, 1)))
+                )
 
         # Interpolate across un-evaluated lookahead steps
         for h in range(H):
@@ -652,6 +713,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     def reset(self):
         """Resets the Digital Twin for a new episode."""
         self.clear_dynamic_objects()
+        if self.predictor is not None:
+            self.predictor.reset()
         if self.client_id >= 0 and self.table_id >= 0:
             try:
                 p.removeBody(self.table_id)
