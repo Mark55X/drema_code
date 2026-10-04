@@ -9,7 +9,8 @@ import os
 import sys
 import time
 import json
-from typing import Optional, Tuple, List, Dict, Any, Set
+from typing import Optional, Tuple, List, Dict, Any, Set, Union
+from scipy.spatial import cKDTree
 
 import numpy as np
 import torch
@@ -24,6 +25,54 @@ def to_numpy(data: Any) -> np.ndarray:
     if isinstance(data, torch.Tensor):
         return data.detach().cpu().numpy()
     return np.asarray(data)
+
+
+def transfer_gaussian_colors_to_mesh(
+    mesh_centered: trimesh.Trimesh,
+    world_vertices: np.ndarray,
+    gaussian_xyz: Union[torch.Tensor, np.ndarray],
+    gaussian_rgb: Union[torch.Tensor, np.ndarray],
+    k_nn: int = 3
+) -> List[float]:
+    """
+    [PHOTOMETRIC VERTEX COLOR TRANSFER]
+    Interpolates continuous photometric appearance from surface 3D Gaussians
+    onto discrete Marching Cubes mesh vertices using inverse-distance weighted k-NN.
+
+    Assigns vertex colors to `mesh_centered.visual.vertex_colors` (as RGBA uint8),
+    ensuring that when exported to .obj / .ply, the true surface appearance is preserved.
+
+    Returns:
+        mean_color: List[float] representing the mean surface RGB color [r, g, b] in [0, 1].
+    """
+    g_xyz_np = to_numpy(gaussian_xyz)
+    g_rgb_np = to_numpy(gaussian_rgb)
+
+    if len(g_xyz_np) == 0 or len(world_vertices) == 0:
+        default_color = np.array([0.15, 0.45, 0.85], dtype=np.float32)
+        rgba_uint8 = np.tile(np.append((default_color * 255.0).astype(np.uint8), 255), (len(world_vertices), 1))
+        mesh_centered.visual.vertex_colors = rgba_uint8
+        return default_color.tolist()
+
+    # Build spatial index on Gaussian 3D positions in world frame
+    tree = cKDTree(g_xyz_np)
+    k_eff = min(k_nn, len(g_xyz_np))
+    dists, indices = tree.query(world_vertices, k=k_eff)
+
+    if k_eff == 1:
+        vert_rgb = g_rgb_np[indices]
+    else:
+        # Inverse-distance weighting with epsilon to prevent division by zero
+        weights = 1.0 / np.maximum(dists, 1e-4)
+        weights /= weights.sum(axis=-1, keepdims=True)
+        vert_rgb = np.sum(weights[:, :, None] * g_rgb_np[indices], axis=1)
+
+    vert_rgb = np.clip(vert_rgb, 0.0, 1.0)
+    rgba_uint8 = (np.concatenate([vert_rgb, np.ones((len(vert_rgb), 1), dtype=np.float32)], axis=-1) * 255.0).astype(np.uint8)
+    mesh_centered.visual.vertex_colors = rgba_uint8
+
+    mean_color = np.mean(vert_rgb, axis=0).tolist()
+    return mean_color
 
 
 import mcubes
@@ -41,6 +90,7 @@ def extract_semantic_object_mesh_from_scan(
     depth_near: float = 0.1,
     depth_far: float = 3.0,
     max_weight: float = 15.0,
+    taubin_iterations: int = 3,
     device: str = "cuda"
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
@@ -106,11 +156,11 @@ def extract_semantic_object_mesh_from_scan(
         pts_sample.append(p_w)
 
     if total_discarded_depth_pixels > 0:
-        print(f"[VG-Mapping Object #{target_obj_id}] Filtered {total_discarded_depth_pixels}/{total_obj_pixels} pixels "
+        print(f"[VGMapping Perception Object #{target_obj_id}] Filtered {total_discarded_depth_pixels}/{total_obj_pixels} pixels "
               f"outside valid sensor depth range [{depth_near:.2f}, {depth_far:.2f}]m across scan frames.")
 
     if len(pts_sample) == 0:
-        print(f"[VG-Mapping Object #{target_obj_id} Notice] 0 valid 3D points accumulated from {len(scan_frames)} scan views. Mesh extraction skipped.")
+        print(f"[VGMapping Perception Object #{target_obj_id} Notice] 0 valid 3D points accumulated from {len(scan_frames)} scan views. Mesh extraction skipped.")
         return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
 
     all_pts = np.vstack(pts_sample)
@@ -159,6 +209,17 @@ def extract_semantic_object_mesh_from_scan(
         obj_tsdf.integrate_depth_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
 
     verts, faces = obj_tsdf.extract_mesh(level=0.0)
+    if len(verts) >= 20 and len(faces) >= 20:
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+        components = mesh.split(only_watertight=False)
+        if len(components) > 1:
+            mesh = max(components, key=lambda c: len(c.vertices))
+        if taubin_iterations > 0 and hasattr(trimesh, 'smoothing'):
+            try:
+                mesh = trimesh.smoothing.filter_taubin(mesh, iterations=taubin_iterations)
+            except Exception:
+                pass
+        verts, faces = np.asarray(mesh.vertices), np.asarray(mesh.faces)
     return verts, faces
 
 
@@ -432,57 +493,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             'morton': self.scene_gaussians.get('morton', torch.empty(0, dtype=torch.int64, device=self.device))
         }
 
-    def process_initial_scan(
+    def _detect_and_spawn_table(
         self,
         scan_frames: List[Dict[str, Any]],
-        semantic_labels: Dict[str, int],
-        robot_base_pos: np.ndarray,
-        digital_twin: Optional[Any] = None,
-        reachability_radius: Optional[float] = None
-    ) -> InitialScanResult:
-        """Processes initial 360 scene reconstruction or restores from pre-computed cache."""
-        self.semantic_labels = semantic_labels or {}
-        if len(robot_base_pos) >= 3:
-            self.robot_base_pos = np.array(robot_base_pos[:3], dtype=np.float32)
-        if reachability_radius is not None and reachability_radius > 0:
-            self.reachability_radius = float(reachability_radius)
-
-        # 1. Attempt Cache Restoration if enabled
-        if self.cache_enabled:
-            cached_res = self.load_cache(self.cache_dir, digital_twin=digital_twin)
-            if cached_res is not None:
-                return cached_res
-
-        # 2. Parse Semantic Labels
-        id_to_name = {}
-        self.robot_ids = set()
-        self.virtual_ids = set()
-        self.dynamic_object_ids = set()
-
-        for name, num in self.semantic_labels.items():
-            num = int(num)
-            id_to_name[num] = name
-            name_lower = name.lower()
-            if any(kw in name_lower for kw in self.robot_keywords):
-                self.robot_ids.add(num)
-            elif any(kw in name_lower for kw in self.virtual_keywords):
-                self.virtual_ids.add(num)
-
-            is_robot_or_bg = any(kw in name_lower for kw in (self.robot_keywords + self.background_keywords))
-            if not is_robot_or_bg:
-                self.dynamic_object_ids.add(num)
-
-        if len(self.semantic_labels) > 0:
-            print(f"✓ [DREMA Scan] Parsed {len(self.semantic_labels)} semantic labels from CoppeliaSim:")
-            print(f"   Robot Arm Link IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
-            if len(self.virtual_ids) > 0:
-                v_names = [f"'{id_to_name[v]}' (ID:{v})" for v in sorted(list(self.virtual_ids))]
-                print(f"   Virtual/Target IDs to filter ({len(self.virtual_ids)}): {', '.join(v_names)}")
-            if len(self.dynamic_object_ids) > 0:
-                d_names = [f"'{id_to_name[d]}' (ID:{d})" for d in sorted(list(self.dynamic_object_ids))]
-                print(f"   Scene Physical Object IDs ({len(self.dynamic_object_ids)}): {', '.join(d_names)}")
-
-        # 3. Detect Table Surface from Accumulated Point Clouds
+        digital_twin: Optional[Any] = None
+    ) -> Tuple[float, Tuple[float, float, float, float], Dict[str, float]]:
+        """
+        Detects the tabletop planar elevation and horizontal boundaries from accumulated scan point clouds,
+        configures the active workspace bounds, and spawns the solid table structure in the Digital Twin.
+        """
         all_pts_list = [f['point_cloud'] for f in scan_frames if 'point_cloud' in f and len(f['point_cloud']) > 0]
         if len(all_pts_list) == 0:
             raise RuntimeError("Initial scan collected 0 valid point clouds.")
@@ -540,15 +559,503 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             'z_table': z_table
         }
 
-        print(f"✓ [DREMA Scan] Table surface detected at Z={z_table:.3f}m, bounds: X[{tab_x_min:.3f}, {tab_x_max:.3f}], Y[{tab_y_min:.3f}, {tab_y_max:.3f}]")
-        print(f"✓ [DREMA Reachability] Robot Base: [{rb_x:.2f}, {rb_y:.2f}, {rb_z:.2f}], Reach Radius: {r_reach:.2f}m")
-        print(f"✓ [DREMA Active Workspace] X[{act_x_min:.3f}, {act_x_max:.3f}], Y[{act_y_min:.3f}, {act_y_max:.3f}], Z[{act_z_min:.3f}, {act_z_max:.3f}]")
+        print(f"[VGMapping Perception] Table surface detected at Z={z_table:.3f}m, bounds: X[{tab_x_min:.3f}, {tab_x_max:.3f}], Y[{tab_y_min:.3f}, {tab_y_max:.3f}]")
+        print(f"[VGMapping Perception] Robot Base: [{rb_x:.2f}, {rb_y:.2f}, {rb_z:.2f}], Reach Radius: {r_reach:.2f}m")
+        print(f"[VGMapping Perception] Active Workspace: X[{act_x_min:.3f}, {act_x_max:.3f}], Y[{act_y_min:.3f}, {act_y_max:.3f}], Z[{act_z_min:.3f}, {act_z_max:.3f}]")
 
-        # 4. Spawn Solid Table in Digital Twin
+        # Spawn solid table in digital twin
         if digital_twin is not None:
             digital_twin.spawn_scanned_table(table_z=z_table, bounds=self.table_bounds)
 
-        # 5. Dynamically Initialize TSDF Grid for Active Workspace
+        return z_table, self.table_bounds, self.active_workspace_bounds
+
+    def _optimize_photometric_sgd(self, scan_frames: List[Dict[str, Any]], retained_count: int) -> None:
+        """
+        Executes optional Adam photometric SGD optimization (Eq. 10) over representative scan frames.
+        """
+        if not self.enable_sgd or retained_count == 0 or len(scan_frames) == 0:
+            return
+
+        n_scan_iters = max(10, self.sgd_steps * 2)
+        n_sample = min(20, len(scan_frames))
+        step_idx = max(1, len(scan_frames) // n_sample)
+        selected_scan_frames = [scan_frames[i] for i in range(0, len(scan_frames), step_idx)][:n_sample]
+
+        print(f"\n[VGMapping Perception] Executing Photometric SGD Optimization ({n_scan_iters} iterations across {len(selected_scan_frames)} representative 360° views)...")
+        t_sgd_scan_start = time.perf_counter()
+        try:
+            from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+            from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim
+            from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
+            import math
+
+            op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
+            opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
+            rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
+
+            sgd_opt = torch.optim.Adam([
+                {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
+                {'params': [rgb_param], 'lr': self.sgd_lr_color}
+            ])
+
+            means3D = self.scene_gaussians['xyz']
+            screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
+            try:
+                screenspace_pts.retain_grad()
+            except Exception:
+                pass
+            scales = self.scene_gaussians['scale']
+            rotations = torch.zeros((retained_count, 4), device=self.device, dtype=torch.float32)
+            rotations[:, 0] = 1.0
+
+            prepped_scan_views = []
+            for f_data in selected_scan_frames:
+                c2w_t = torch.as_tensor(f_data['extrinsics'], dtype=torch.float32, device=self.device)
+                k_t = torch.as_tensor(f_data['intrinsics'], dtype=torch.float32, device=self.device)
+                gt_rgb = torch.as_tensor(f_data['rgb'], dtype=torch.float32, device=self.device)
+                if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                    gt_rgb = gt_rgb.permute(2, 0, 1)
+                if gt_rgb.max() > 1.0:
+                    gt_rgb = gt_rgb / 255.0
+                c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
+
+                c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
+                c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
+                c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
+                c_tanfovx = math.tan(c_fovx * 0.5)
+                c_tanfovy = math.tan(c_fovy * 0.5)
+
+                c_cam_center = c2w_t[:3, 3]
+                c_w2c = torch.inverse(c2w_t)
+                c_view_transform = c_w2c.transpose(0, 1).contiguous()
+                c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
+                c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
+
+                c_settings = GaussianRasterizationSettings(
+                    image_height=int(c_h),
+                    image_width=int(c_w),
+                    tanfovx=c_tanfovx,
+                    tanfovy=c_tanfovy,
+                    bg=torch.zeros(3, device=self.device, dtype=torch.float32),
+                    scale_modifier=1.0,
+                    viewmatrix=c_view_transform,
+                    projmatrix=c_full_proj,
+                    sh_degree=0,
+                    campos=c_cam_center,
+                    prefiltered=False,
+                    debug=False
+                )
+                prepped_scan_views.append((c_settings, gt_rgb))
+
+            for it in range(n_scan_iters):
+                sgd_opt.zero_grad()
+                total_loss = 0.0
+                curr_op = torch.sigmoid(opacity_logit)
+                curr_rgb = torch.clamp(rgb_param, 0.0, 1.0)
+
+                for c_settings, gt_rgb in prepped_scan_views:
+                    c_rasterizer = GaussianRasterizer(raster_settings=c_settings)
+                    rendered_im, radii = c_rasterizer(
+                        means3D=means3D,
+                        means2D=screenspace_pts,
+                        shs=None,
+                        colors_precomp=curr_rgb,
+                        opacities=curr_op,
+                        scales=scales,
+                        rotations=rotations,
+                        cov3D_precomp=None
+                    )
+                    loss_l1 = l1_loss(rendered_im, gt_rgb)
+                    loss_ssim = 1.0 - ssim(rendered_im, gt_rgb)
+                    loss = (1.0 - self.sgd_lambda_ssim) * loss_l1 + self.sgd_lambda_ssim * loss_ssim
+                    total_loss += loss
+
+                total_loss.backward()
+                sgd_opt.step()
+
+            with torch.no_grad():
+                self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
+                self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
+
+                if self.sgd_prune_opacity_threshold > 0:
+                    keep_op = (self.scene_gaussians['opacity'].squeeze(-1) > self.sgd_prune_opacity_threshold)
+                    n_before = len(self.scene_gaussians['xyz'])
+                    for k in list(self.scene_gaussians.keys()):
+                        if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
+                            self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
+                    print(f"[VGMapping Perception] Pruned {n_before - len(self.scene_gaussians['xyz'])} low-opacity primitives after SGD.")
+
+            t_sgd_scan = (time.perf_counter() - t_sgd_scan_start) * 1000.0
+            print(f"[VGMapping Perception] Initial SGD Optimization completed in {t_sgd_scan:.1f}ms! Final primitives: {len(self.scene_gaussians['xyz']):,}")
+        except Exception as e_sgd:
+            print(f"[VGMapping Perception Warning] Error during initial scan SGD optimization: {e_sgd}")
+
+    def _optimize_photometric_sgd_streaming(self, camera_views: Dict[str, Dict[str, Any]]) -> float:
+        """
+        [OPTIONAL ONLINE PHOTOMETRIC SGD]
+        Executes per-frame Adam photometric refinement (Paper Sec. III-B.3, Eq. 10).
+        Returns execution latency in milliseconds.
+        """
+        if not self.enable_sgd or self.sgd_steps <= 0 or len(self.scene_gaussians.get('xyz', [])) == 0:
+            return 0.0
+
+        t_sgd_start = time.perf_counter()
+        try:
+            import math
+            from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
+            from ..gaussian_splatting_utils.loss_utils import masked_l1_loss, masked_ssim
+            from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
+
+            N_g = len(self.scene_gaussians['xyz'])
+            if 'opacity' not in self.scene_gaussians or len(self.scene_gaussians['opacity']) != N_g:
+                self.scene_gaussians['opacity'] = torch.full((N_g, 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
+            op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
+            opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
+            rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
+
+            sgd_opt = torch.optim.Adam([
+                {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
+                {'params': [rgb_param], 'lr': self.sgd_lr_color}
+            ])
+
+            means3D = self.scene_gaussians['xyz']
+            screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
+            try:
+                screenspace_pts.retain_grad()
+            except Exception:
+                pass
+            scales = self.scene_gaussians['scale']
+            rotations = torch.zeros((N_g, 4), device=self.device, dtype=torch.float32)
+            rotations[:, 0] = 1.0
+
+            prepped_views = []
+            for c_name, c_data in camera_views.items():
+                c2w_t = torch.as_tensor(c_data['extrinsics'], dtype=torch.float32, device=self.device)
+                k_t = torch.as_tensor(c_data['intrinsics'], dtype=torch.float32, device=self.device)
+                gt_rgb = torch.as_tensor(c_data['rgb'], dtype=torch.float32, device=self.device)
+                if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                    gt_rgb = gt_rgb.permute(2, 0, 1)
+                if gt_rgb.max() > 1.0:
+                    gt_rgb = gt_rgb / 255.0
+                c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
+
+                c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
+                c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
+                c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
+                c_tanfovx = math.tan(c_fovx * 0.5)
+                c_tanfovy = math.tan(c_fovy * 0.5)
+
+                c_cam_center = c2w_t[:3, 3]
+                c_w2c = torch.inverse(c2w_t)
+                c_view_transform = c_w2c.transpose(0, 1).contiguous()
+                c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
+                c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
+
+                c_settings = GaussianRasterizationSettings(
+                    image_height=int(c_h),
+                    image_width=int(c_w),
+                    tanfovx=c_tanfovx,
+                    tanfovy=c_tanfovy,
+                    bg=torch.zeros(3, device=self.device, dtype=torch.float32),
+                    scale_modifier=1.0,
+                    viewmatrix=c_view_transform,
+                    projmatrix=c_full_proj,
+                    sh_degree=0,
+                    campos=c_cam_center,
+                    prefiltered=False,
+                    debug=False
+                )
+
+                mask_np = c_data.get('mask')
+                if mask_np is not None:
+                    mask_raw = torch.from_numpy(mask_np.copy()).to(self.device).squeeze()
+                    filter_ids = self.robot_ids | self.virtual_ids
+                    if len(filter_ids) > 0:
+                        f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
+                        is_robot = torch.isin(mask_raw, f_ids)
+                        f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
+                        dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2)[0, 0] > 0.5)
+                        v_mask = (~dilated_robot).float()
+                    else:
+                        v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+                else:
+                    v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
+
+                prepped_views.append({
+                    'rasterizer': GaussianRasterizer(raster_settings=c_settings),
+                    'gt_rgb': gt_rgb,
+                    'valid_mask': v_mask
+                })
+
+            for step_i in range(self.sgd_steps):
+                sgd_opt.zero_grad()
+                step_loss = torch.tensor(0.0, device=self.device)
+                curr_alpha = torch.sigmoid(opacity_logit)
+                curr_colors = torch.clamp(rgb_param, 0.0, 1.0)
+
+                for pv in prepped_views:
+                    rendered, _ = pv['rasterizer'](
+                        means3D=means3D,
+                        means2D=screenspace_pts,
+                        shs=None,
+                        colors_precomp=curr_colors,
+                        opacities=curr_alpha,
+                        scales=scales,
+                        rotations=rotations,
+                        cov3D_precomp=None
+                    )
+                    v_mask = pv.get('valid_mask')
+                    ll1 = masked_l1_loss(rendered, pv['gt_rgb'], v_mask)
+                    ssim_val = masked_ssim(rendered, pv['gt_rgb'], v_mask)
+                    view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
+                    step_loss = step_loss + (view_loss / max(1, len(prepped_views)))
+
+                step_loss.backward()
+                sgd_opt.step()
+
+            with torch.no_grad():
+                self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
+                self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
+
+                if self.sgd_prune_opacity_threshold > 0.0:
+                    keep_op = (self.scene_gaussians['opacity'].squeeze(-1) >= self.sgd_prune_opacity_threshold)
+                    if not torch.all(keep_op):
+                        for k in list(self.scene_gaussians.keys()):
+                            if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
+                                self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
+
+        except Exception as e_sgd:
+            print(f"[VGMapping Perception Warning] Error during photometric SGD optimization: {e_sgd}")
+
+        return (time.perf_counter() - t_sgd_start) * 1000.0
+
+    def _extract_unsupervised_tabletop_obstacles(
+        self,
+        digital_twin: Optional[Any],
+        tab_x_min: float,
+        tab_x_max: float,
+        tab_y_min: float,
+        tab_y_max: float,
+        z_table: float,
+        act_z_max: float
+    ) -> None:
+        """
+        [UNSUPERVISED GEOMETRIC FALLBACK]
+        Extracts solid meshes above the tabletop without semantic segmentation masks.
+        """
+        print("\n" + "!" * 78)
+        print("⚠️  [VGMapping Perception FALLBACK NOTICE] No physical objects extracted via semantic masks!")
+        print("   Activating unsupervised tabletop Marching Cubes fallback...")
+        print("   Objects will be isolated purely by geometric TSDF spatial clustering above table surface.")
+        print("!" * 78 + "\n")
+
+        z_cutoff = z_table + self.obstacle_min_clearance_z
+        table_clearance_xy = 2.0 * self.voxel_size
+        verts, faces = extract_obstacle_mesh_from_tsdf(
+            self.vg_pipeline.tsdf_map,
+            z_min_cutoff=z_cutoff,
+            z_max_cutoff=act_z_max,
+            x_bounds=(tab_x_min + table_clearance_xy, tab_x_max - table_clearance_xy),
+            y_bounds=(tab_y_min + table_clearance_xy, tab_y_max - table_clearance_xy),
+            level=0.0
+        )
+        if len(verts) == 0 or len(faces) == 0:
+            return
+
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
+        components = mesh.split(only_watertight=False)
+        valid_components = []
+        for comp in components:
+            ext = comp.bounds[1] - comp.bounds[0]
+            center_c = (comp.bounds[0] + comp.bounds[1]) / 2.0
+            in_table = (
+                (center_c[0] >= tab_x_min + table_clearance_xy) and (center_c[0] <= tab_x_max - table_clearance_xy) and
+                (center_c[1] >= tab_y_min + table_clearance_xy) and (center_c[1] <= tab_y_max - table_clearance_xy) and
+                (center_c[2] >= z_table + self.obstacle_min_clearance_z) and (center_c[2] <= act_z_max)
+            )
+            if in_table and np.max(ext) >= (2.0 * self.voxel_size) and len(comp.vertices) >= 20:
+                valid_components.append(comp)
+
+        if len(valid_components) == 0 and len(verts) >= 20:
+            valid_components = [mesh]
+
+        valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
+        for c_idx, comp in enumerate(valid_components):
+            comp_verts = comp.vertices
+            comp_faces = comp.faces
+            min_b, max_b = comp.bounds[0], comp.bounds[1]
+            centroid = list((min_b + max_b) / 2.0)
+            extents = list(max_b - min_b)
+            obj_name = f"obstacle_{c_idx}"
+            mesh_path = f"assets/scanned_meshes/{obj_name}_{c_idx}.obj"
+
+            g_xyz = self.scene_gaussians['xyz']
+            margin_xy = 2.0 * self.voxel_size
+            margin_z = 1.0 * self.voxel_size
+
+            # In unsupervised fallback mode (no semantic mask IDs available):
+            # 1. Broad-phase box filter strictly above tabletop to prevent capturing table surface Gaussians
+            min_z_safe = max(float(min_b[2]), z_table + 0.005)
+            in_candidate_box = (
+                (g_xyz[:, 0] >= min_b[0] - margin_xy) & (g_xyz[:, 0] <= max_b[0] + margin_xy) &
+                (g_xyz[:, 1] >= min_b[1] - margin_xy) & (g_xyz[:, 1] <= max_b[1] + margin_xy) &
+                (g_xyz[:, 2] >= min_z_safe) & (g_xyz[:, 2] <= max_b[2] + margin_z)
+            )
+            if not torch.any(in_candidate_box):
+                continue
+
+            # 2. Narrow-phase surface association via cKDTree:
+            # Retain only 3DGS primitives that lie close to the Marching Cubes surface mesh (<= 2 * voxel_size).
+            # This completely rejects unrelated empty space Gaussians and points from adjacent objects.
+            candidate_indices = torch.nonzero(in_candidate_box).reshape(-1)
+            candidate_xyz_np = to_numpy(g_xyz[candidate_indices])
+            if candidate_xyz_np.ndim == 1:
+                candidate_xyz_np = candidate_xyz_np[None, :]
+
+            comp_tree = cKDTree(comp_verts)
+            dists_to_mesh, _ = comp_tree.query(candidate_xyz_np, k=1)
+            on_surface = dists_to_mesh <= (2.0 * self.voxel_size)
+            if not np.any(on_surface):
+                continue
+
+            final_indices = candidate_indices[torch.as_tensor(on_surface, device=self.device)]
+            c_xyz = self.scene_gaussians['xyz'][final_indices].clone()
+            c_rgb = self.scene_gaussians['rgb'][final_indices].clone()
+            c_scale = self.scene_gaussians['scale'][final_indices].clone()
+            c_normal = self.scene_gaussians['normal'][final_indices].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
+            c_opacity = self.scene_gaussians['opacity'][final_indices].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
+            verts_centered = comp_verts - np.array(centroid)
+            comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=comp_faces)
+
+            # Solution A: Transfer continuous photometric colors from 3DGS onto discrete mesh vertices
+            mean_color = transfer_gaussian_colors_to_mesh(
+                mesh_centered=comp_centered,
+                world_vertices=comp_verts,
+                gaussian_xyz=c_xyz,
+                gaussian_rgb=c_rgb,
+                k_nn=3
+            )
+            comp_centered.export(mesh_path)
+
+            pb_body_id = -1
+            if digital_twin is not None:
+                pb_body_id = digital_twin.spawn_scanned_mesh_obstacle(
+                    mesh_path=mesh_path,
+                    initial_pos=centroid,
+                    initial_quat=(0, 0, 0, 1),
+                    name=f"{obj_name}_{c_idx}",
+                    is_target=False,
+                    mass=0.0,
+                    color=mean_color + [1.0],
+                    obj_id=c_idx
+                )
+
+            self.tracked_objects[c_idx] = {
+                'name': obj_name,
+                'mesh_path': mesh_path,
+                'initial_pos': centroid,
+                'initial_quat': (0.0, 0.0, 0.0, 1.0),
+                'last_pos': centroid,
+                'last_quat': (0.0, 0.0, 0.0, 1.0),
+                'last_T': torch.eye(4, device=self.device, dtype=torch.float32),
+                'dims': extents,
+                'color': mean_color,
+                'pybullet_id': pb_body_id,
+                'is_target': False,
+                'canonical_points': {
+                    'xyz': c_xyz.clone(),
+                    'rgb': c_rgb.clone(),
+                    'normal': c_normal.clone(),
+                    'scale': c_scale.clone()
+                },
+                'gaussians': {
+                    'xyz': c_xyz.clone(),
+                    'rgb': c_rgb.clone(),
+                    'normal': c_normal.clone(),
+                    'scale': c_scale.clone(),
+                    'opacity': c_opacity.clone()
+                }
+            }
+
+            self.discovered_obstacles.append(DiscoveredObstacle(
+                oid=c_idx,
+                name=obj_name,
+                mesh_path=mesh_path,
+                initial_pos=tuple(centroid),
+                initial_quat=(0.0, 0.0, 0.0, 1.0),
+                dims=tuple(extents),
+                rgb=mean_color,
+                is_target=False,
+                pybullet_body_id=pb_body_id
+            ))
+            print(f"[VGMapping Perception] Spawned fallback mesh obstacle ID {c_idx} ('{obj_name}', Body ID: {pb_body_id})")
+
+    def process_initial_scan(
+        self,
+        scan_frames: List[Dict[str, Any]],
+        semantic_labels: Dict[str, int],
+        robot_base_pos: np.ndarray,
+        digital_twin: Optional[Any] = None,
+        reachability_radius: Optional[float] = None
+    ) -> InitialScanResult:
+        """Processes initial 360 scene reconstruction or restores from pre-computed cache."""
+        self.semantic_labels = semantic_labels or {}
+        if len(robot_base_pos) >= 3:
+            self.robot_base_pos = np.array(robot_base_pos[:3], dtype=np.float32)
+        if reachability_radius is not None and reachability_radius > 0:
+            self.reachability_radius = float(reachability_radius)
+
+        # 1. Attempt Cache Restoration if enabled
+        if self.cache_enabled:
+            cached_res = self.load_cache(self.cache_dir, digital_twin=digital_twin)
+            if cached_res is not None:
+                return cached_res
+
+        # 2. Parse Semantic Labels
+        id_to_name = {}
+        self.robot_ids = set()
+        self.virtual_ids = set()
+        self.dynamic_object_ids = set()
+
+        for name, num in self.semantic_labels.items():
+            num = int(num)
+            id_to_name[num] = name
+            name_lower = name.lower()
+            if any(kw in name_lower for kw in self.robot_keywords):
+                self.robot_ids.add(num)
+            elif any(kw in name_lower for kw in self.virtual_keywords):
+                self.virtual_ids.add(num)
+
+            is_robot_or_bg = any(kw in name_lower for kw in (self.robot_keywords + self.background_keywords))
+            if not is_robot_or_bg:
+                self.dynamic_object_ids.add(num)
+
+        if len(self.semantic_labels) > 0:
+            print(f"[VGMapping Perception] Parsed {len(self.semantic_labels)} semantic labels from CoppeliaSim:")
+            print(f"   Robot Arm Link IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
+            if len(self.virtual_ids) > 0:
+                v_names = [f"'{id_to_name[v]}' (ID:{v})" for v in sorted(list(self.virtual_ids))]
+                print(f"   Virtual/Target IDs to filter ({len(self.virtual_ids)}): {', '.join(v_names)}")
+            if len(self.dynamic_object_ids) > 0:
+                d_names = [f"'{id_to_name[d]}' (ID:{d})" for d in sorted(list(self.dynamic_object_ids))]
+                print(f"   Scene Physical Object IDs ({len(self.dynamic_object_ids)}): {', '.join(d_names)}")
+
+        # 3. Detect Table Surface & Active Workspace Bounds
+        z_table, self.table_bounds, self.active_workspace_bounds = self._detect_and_spawn_table(
+            scan_frames=scan_frames,
+            digital_twin=digital_twin
+        )
+        act_x_min = self.active_workspace_bounds['x_min']
+        act_x_max = self.active_workspace_bounds['x_max']
+        act_y_min = self.active_workspace_bounds['y_min']
+        act_y_max = self.active_workspace_bounds['y_max']
+        act_z_min = self.active_workspace_bounds['z_min']
+        act_z_max = self.active_workspace_bounds['z_max']
+        tab_x_min, tab_x_max, tab_y_min, tab_y_max = self.table_bounds
+
+        # 4. Dynamically Initialize TSDF Grid for Active Workspace
         ext_x = act_x_max - act_x_min
         ext_y = act_y_max - act_y_min
         ext_z = act_z_max - act_z_min
@@ -564,7 +1071,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.grid_origin = (round(act_x_min, 4), round(act_y_min, 4), round(act_z_min, 4))
         self.grid_dim = (nx, ny, nz)
 
-        print(f"✓ [VG-Mapping TSDF] Dynamic Grid configured: origin={self.grid_origin}, dim={self.grid_dim} ({nx*self.voxel_size:.2f}m x {ny*self.voxel_size:.2f}m x {nz*self.voxel_size:.2f}m)")
+        print(f"[VGMapping Perception] TSDF Dynamic Grid configured: origin={self.grid_origin}, dim={self.grid_dim} ({nx*self.voxel_size:.2f}m x {ny*self.voxel_size:.2f}m x {nz*self.voxel_size:.2f}m)")
         self.vg_pipeline = DREMAClosedLoopVGMappingPipeline(
             pybullet_client=None,
             voxel_size=self.voxel_size,
@@ -581,7 +1088,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         # 6. Ingest All Scan Frames into VG-Mapping (TSDF + 3DGS)
         num_views = len(scan_frames)
-        print(f"\n[VG-Mapping] Starting ingestion of {num_views} scan views into TSDF Voxel Grid & 3DGS...")
+        print(f"\n[VGMapping Perception] Starting ingestion of {num_views} scan views into TSDF Voxel Grid & 3DGS...")
 
         workspace_bounds_t = (
             torch.tensor([act_x_min, act_y_min, act_z_min], dtype=torch.float32, device=self.device),
@@ -602,10 +1109,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             depth_tsdf, mask_t = self._apply_semantic_robot_mask(depth_t=depth_t, mask_np=mask_np)
 
-            # Step 1: TSDF integration (robot masked to 0)
+            # Step 1: TSDF integration
             self.vg_pipeline.step_1_ingest_frame(rgb=rgb_t, depth=depth_tsdf, intrinsic=k_t, camera_pose=pose_t)
 
-            # Step 2: VDC Gaussian mapping (depth_tsdf passed to avoid phantom robot primitives)
+            # Step 2: VDC Gaussian mapping
             rendered_rgb = rgb_t.clone()
             rendered_depth = depth_tsdf.clone()
 
@@ -641,7 +1148,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             raw_gaussians_count += n_new_g
             t_view_ms = (time.time() - t_start_view) * 1000.0
             cam_name = frame_data.get('name', f'view_{f_idx}')
-            print(f"   [Scan Ingest {f_idx+1:02d}/{num_views:02d}] View '{cam_name}': +{n_new_g:,} new Gaussians | Total Raw: {raw_gaussians_count:,} | {t_view_ms:.1f}ms")
+            print(f"   [VGMapping Perception Scan Ingest {f_idx+1:02d}/{num_views:02d}] View '{cam_name}': +{n_new_g:,} new Gaussians | Total Raw: {raw_gaussians_count:,} | {t_view_ms:.1f}ms")
 
             if n_new_g > 0:
                 new_xyz_acc.append(new_g['xyz'])
@@ -679,153 +1186,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         retained_count = len(self.scene_gaussians['xyz'])
         reduction_pct = ((raw_gaussians_count - retained_count) / max(1, raw_gaussians_count)) * 100.0
-        print(f"\n✓ [VG-Mapping] TSDF volumetric integration complete ({num_views} views).")
-        print(f"✓ [VG-Mapping Deduplication] Morton surface pruning:")
+        print(f"\n[VGMapping Perception] TSDF volumetric integration complete ({num_views} views).")
+        print(f"[VGMapping Perception] Morton surface pruning:")
         print(f"   Raw Gaussians accumulated: {raw_gaussians_count:,}")
         print(f"   Unique 1cm voxel surface Gaussians retained: {retained_count:,}")
         print(f"   Pruned redundant primitives: {raw_gaussians_count - retained_count:,} ({reduction_pct:.1f}% reduction).")
         self.scene_gaussians['opacity'] = torch.full((retained_count, 1), self.opacity_init, device=self.device, dtype=torch.float32)
 
-        # Optional Paper-Compliant Photometric SGD on Initial Scan (Sec. III-B.3)
-        if self.enable_sgd and retained_count > 0 and len(scan_frames) > 0:
-            n_scan_iters = max(10, self.sgd_steps * 2)
-            # Sample up to 20 evenly distributed 360 views around the orbit for fast and stable SGD
-            n_sample = min(20, len(scan_frames))
-            step_idx = max(1, len(scan_frames) // n_sample)
-            selected_scan_frames = [scan_frames[i] for i in range(0, len(scan_frames), step_idx)][:n_sample]
-
-            print(f"\n[VG-Mapping Initial Scan] Executing Photometric SGD Optimization ({n_scan_iters} iterations across {len(selected_scan_frames)} representative 360° views)...")
-            t_sgd_scan_start = time.perf_counter()
-            try:
-                from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-                from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim, masked_l1_loss, masked_ssim
-                from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
-                import math
-
-                op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
-                opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
-                rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
-
-                sgd_opt = torch.optim.Adam([
-                    {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
-                    {'params': [rgb_param], 'lr': self.sgd_lr_color}
-                ])
-
-                means3D = self.scene_gaussians['xyz']
-                screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
-                try:
-                    screenspace_pts.retain_grad()
-                except Exception:
-                    pass
-                scales = self.scene_gaussians['scale']
-                rotations = torch.zeros((retained_count, 4), device=self.device, dtype=torch.float32)
-                rotations[:, 0] = 1.0
-
-                prepped_scan_views = []
-                for f_data in selected_scan_frames:
-                    c2w_t = torch.as_tensor(f_data['extrinsics'], dtype=torch.float32, device=self.device)
-                    k_t = torch.as_tensor(f_data['intrinsics'], dtype=torch.float32, device=self.device)
-                    gt_rgb = torch.as_tensor(f_data['rgb'], dtype=torch.float32, device=self.device)
-                    if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
-                        gt_rgb = gt_rgb.permute(2, 0, 1)
-                    if gt_rgb.max() > 1.0:
-                        gt_rgb = gt_rgb / 255.0
-                    c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
-
-                    c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
-                    c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
-                    c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
-                    c_tanfovx = math.tan(c_fovx * 0.5)
-                    c_tanfovy = math.tan(c_fovy * 0.5)
-
-                    c_cam_center = c2w_t[:3, 3]
-                    c_w2c = torch.inverse(c2w_t)
-                    c_view_transform = c_w2c.transpose(0, 1).contiguous()
-                    c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
-                    c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
-
-                    c_settings = GaussianRasterizationSettings(
-                        image_height=int(c_h),
-                        image_width=int(c_w),
-                        tanfovx=c_tanfovx,
-                        tanfovy=c_tanfovy,
-                        bg=torch.zeros(3, device=self.device, dtype=torch.float32),
-                        scale_modifier=1.0,
-                        viewmatrix=c_view_transform,
-                        projmatrix=c_full_proj,
-                        sh_degree=0,
-                        campos=c_cam_center,
-                        prefiltered=False,
-                        debug=False
-                    )
-
-                    # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
-                    mask_np = f_data.get('mask')
-                    if mask_np is not None:
-                        mask_raw = torch.from_numpy(mask_np.copy()).to(self.device).squeeze()
-                        filter_ids = self.robot_ids | self.virtual_ids
-                        if len(filter_ids) > 0:
-                            f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
-                            is_robot = torch.isin(mask_raw, f_ids)
-                            f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
-                            dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2)[0, 0] > 0.5)
-                            v_mask = (~dilated_robot).float()
-                        else:
-                            v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
-                    else:
-                        v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
-
-                    prepped_scan_views.append({
-                        'rasterizer': GaussianRasterizer(raster_settings=c_settings),
-                        'gt_rgb': gt_rgb,
-                        'valid_mask': v_mask
-                    })
-
-                n_views = max(1, len(prepped_scan_views))
-                for it in range(n_scan_iters):
-                    sgd_opt.zero_grad()
-                    step_loss = torch.tensor(0.0, device=self.device)
-                    curr_alpha = torch.sigmoid(opacity_logit)
-                    curr_colors = torch.clamp(rgb_param, 0.0, 1.0)
-
-                    for pv in prepped_scan_views:
-                        rendered, _ = pv['rasterizer'](
-                            means3D=means3D,
-                            means2D=screenspace_pts,
-                            shs=None,
-                            colors_precomp=curr_colors,
-                            opacities=curr_alpha,
-                            scales=scales,
-                            rotations=rotations,
-                            cov3D_precomp=None
-                        )
-                        v_mask = pv.get('valid_mask')
-                        ll1 = masked_l1_loss(rendered, pv['gt_rgb'], v_mask)
-                        ssim_val = masked_ssim(rendered, pv['gt_rgb'], v_mask)
-                        view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
-                        step_loss = step_loss + (view_loss / n_views)
-
-                    step_loss.backward()
-                    sgd_opt.step()
-
-                with torch.no_grad():
-                    self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
-                    self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
-
-                    if self.sgd_prune_opacity_threshold > 0.0:
-                        keep_op = (self.scene_gaussians['opacity'].squeeze(-1) >= self.sgd_prune_opacity_threshold)
-                        if not torch.all(keep_op):
-                            n_before = len(self.scene_gaussians['xyz'])
-                            for k in list(self.scene_gaussians.keys()):
-                                if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
-                                    self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
-                            print(f"✓ [SGD Initial Pruning] Pruned {n_before - len(self.scene_gaussians['xyz'])} low-opacity primitives.")
-
-                t_sgd_scan = (time.perf_counter() - t_sgd_scan_start) * 1000.0
-                print(f"✓ [VG-Mapping Initial Scan] SGD Optimization completed in {t_sgd_scan:.1f}ms! Final primitives: {len(self.scene_gaussians['xyz']):,}")
-
-            except Exception as e_sgd:
-                print(f"[VG MAPPING PERCEPTION Warning] Error during initial scan SGD optimization: {e_sgd}")
+        # 6. Optional Photometric SGD Optimization
+        self._optimize_photometric_sgd(scan_frames=scan_frames, retained_count=retained_count)
 
         # 7. Extract Tabletop Obstacle Meshes (DREMA Semantic Architecture + Marching Cubes)
         self.discovered_obstacles.clear()
@@ -834,7 +1203,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         extracted_any_semantic = False
         if len(self.dynamic_object_ids) > 0:
-            print(f"\n[DREMA Semantic Reconstruction] Isolating {len(self.dynamic_object_ids)} dynamic object(s) via semantic depth masking...")
+            print(f"\n[VGMapping Perception] Isolating {len(self.dynamic_object_ids)} dynamic object(s) via semantic depth masking...")
             for obj_id in sorted(list(self.dynamic_object_ids)):
                 obj_name = id_to_name.get(obj_id, f"obstacle_{obj_id}")
                 t_obj_start = time.perf_counter()
@@ -879,49 +1248,44 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         except Exception:
                             pass
 
+                    # --- Math Rationale: Mesh Centering & Physics Simulation Offset Elimination ---
+                    # Marching Cubes generates vertices in absolute world frame coordinates (e.g. centered near [0.4, 0.2, 0.8]m).
+                    # Physics simulators (PyBullet & MuJoCo) load collision shapes at their local origin (0, 0, 0)
+                    # and subsequently place them in the world via `basePosition = centroid`.
+                    # If the exported .obj retained absolute coordinates, the physics engine would translate already-offset
+                    # vertices, resulting in a DOUBLE OFFSET error (e.g. spawning at [0.8, 0.4, 1.6]m).
+                    # Centering: subtracting `centroid` makes the geometric origin of the exported mesh (0, 0, 0).
                     min_b, max_b = mesh.bounds[0], mesh.bounds[1]
                     centroid = list((min_b + max_b) / 2.0)
                     extents = list(max_b - min_b)
-
                     mesh_path = f"assets/scanned_meshes/{obj_name}_{obj_id}.obj"
+
+                    # Surface Gaussians: isolate object primitives based strictly on semantic ID
+                    g_obj_id = self.scene_gaussians.get('obj_id')
+                    g_xyz = self.scene_gaussians['xyz']
+                    if g_obj_id is None or not torch.any(g_obj_id == obj_id):
+                        print(f"   -> [VGMapping Perception Warning] No Gaussians found with semantic ID {obj_id} for '{obj_name}'. Skipping object.")
+                        continue
+
+                    obj_g_mask = (g_obj_id == obj_id)
+                    c_xyz = self.scene_gaussians['xyz'][obj_g_mask].clone()
+                    c_rgb = self.scene_gaussians['rgb'][obj_g_mask].clone()
+                    c_scale = self.scene_gaussians['scale'][obj_g_mask].clone()
+                    c_normal = self.scene_gaussians['normal'][obj_g_mask].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
+                    c_opacity = self.scene_gaussians['opacity'][obj_g_mask].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
+
                     verts_centered = mesh.vertices - np.array(centroid)
                     comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=mesh.faces)
-                    comp_centered.export(mesh_path)
 
-                    # Surface Gaussians: isolate object primitives based on semantic ID and bounding hull
-                    g_obj_id = self.scene_gaussians.get('obj_id')
-                    margin_xy = 1.5 * self.voxel_size
-                    margin_z = 0.5 * self.voxel_size
-                    g_xyz = self.scene_gaussians['xyz']
-                    box_mask = (
-                        (g_xyz[:, 0] >= min_b[0] - margin_xy) & (g_xyz[:, 0] <= max_b[0] + margin_xy) &
-                        (g_xyz[:, 1] >= min_b[1] - margin_xy) & (g_xyz[:, 1] <= max_b[1] + margin_xy) &
-                        (g_xyz[:, 2] >= min_b[2] - margin_z) & (g_xyz[:, 2] <= max_b[2] + margin_xy)
+                    # Solution A: Transfer continuous photometric colors from 3DGS onto discrete mesh vertices
+                    mean_color = transfer_gaussian_colors_to_mesh(
+                        mesh_centered=comp_centered,
+                        world_vertices=mesh.vertices,
+                        gaussian_xyz=c_xyz,
+                        gaussian_rgb=c_rgb,
+                        k_nn=3
                     )
-
-                    if g_obj_id is not None and torch.any(g_obj_id == obj_id):
-                        obj_g_mask = (g_obj_id == obj_id)
-                    else:
-                        obj_g_mask = box_mask
-
-                    if torch.any(obj_g_mask):
-                        c_xyz = self.scene_gaussians['xyz'][obj_g_mask].clone()
-                        c_rgb = self.scene_gaussians['rgb'][obj_g_mask].clone()
-                        c_scale = self.scene_gaussians['scale'][obj_g_mask].clone()
-                        c_normal = self.scene_gaussians['normal'][obj_g_mask].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
-                        c_opacity = self.scene_gaussians['opacity'][obj_g_mask].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
-                        mean_color = c_rgb.mean(dim=0).cpu().numpy().tolist()
-                    else:
-                        v_t = torch.tensor(mesh.vertices, dtype=torch.float32, device=self.device)
-                        mean_color = [0.15, 0.45, 0.85]
-                        c_xyz = v_t
-                        c_rgb = torch.tensor(mean_color, dtype=torch.float32, device=self.device).repeat(len(v_t), 1)
-                        c_scale = torch.full((len(v_t), 3), self.voxel_size * 0.5, dtype=torch.float32, device=self.device)
-                        if hasattr(mesh, 'vertex_normals') and len(mesh.vertex_normals) == len(v_t):
-                            c_normal = torch.tensor(mesh.vertex_normals, dtype=torch.float32, device=self.device)
-                        else:
-                            c_normal = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(v_t), 1)
-                        c_opacity = torch.full((len(v_t), 1), self.opacity_init, dtype=torch.float32, device=self.device)
+                    comp_centered.export(mesh_path)
 
                     pb_body_id = -1
                     if digital_twin is not None:
@@ -936,6 +1300,19 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             obj_id=obj_id
                         )
 
+                    # --- RecurGS Dynamic Tracked Object Dictionary Schema ---
+                    # Defines the state of each physical obstacle for SE(3) tracking and Digital Twin synchronization:
+                    # - 'name': Human-readable string identifier for diagnostics.
+                    # - 'mesh_path': Path to centered .obj mesh used for PyBullet/MuJoCo collision hulls.
+                    # - 'initial_pos' / 'initial_quat': Canonical 3D position and orientation quaternion at timestep t=0.
+                    # - 'last_pos' / 'last_quat': Latest estimated world pose from RecurGS Lie algebra solver.
+                    # - 'last_T': 4x4 homogeneous transformation matrix in SE(3) Lie Group.
+                    # - 'dims': Extents [dx, dy, dz] of the 3D bounding box.
+                    # - 'color': Mean surface RGB color [r, g, b] used by simulator visual bodies.
+                    # - 'pybullet_id': Body ID handle inside the physics engine for mocap kinematic sync.
+                    # - 'is_target': Boolean flag distinguishing manipulable goal from collision obstacles.
+                    # - 'canonical_points': Object point cloud at t=0 in canonical frame (source model for SE(3) alignment).
+                    # - 'gaussians': Object-centric 3D Gaussians (xyz, rgb, scale, normal, opacity) rigidly moving with the body.
                     self.tracked_objects[obj_id] = {
                         'name': obj_name,
                         'mesh_path': mesh_path,
@@ -984,7 +1361,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                     extracted_any_semantic = True
                     t_obj_ms = (time.perf_counter() - t_obj_start) * 1000.0
-                    print(f"✓ Digital Twin: Spawned mesh object ID {obj_id} ('{obj_name}', PyBullet Body ID: {pb_body_id}) in {t_obj_ms:.1f}ms")
+                    print(f"[VGMapping Perception] Spawned mesh object ID {obj_id} ('{obj_name}', PyBullet Body ID: {pb_body_id}) in {t_obj_ms:.1f}ms")
                     print(f"   -> Object #{obj_id} ('{obj_name}'):")
                     print(f"      Center: [{centroid[0]:.3f}, {centroid[1]:.3f}, {centroid[2]:.3f}] m | Extents: [{extents[0]:.3f}, {extents[1]:.3f}, {extents[2]:.3f}] m")
                     print(f"      Associated Gaussians: {len(c_xyz):,} | Real RGB Color: [{mean_color[0]:.2f}, {mean_color[1]:.2f}, {mean_color[2]:.2f}]")
@@ -992,133 +1369,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         # Fallback to unsupervised tabletop Marching Cubes if no semantic objects were found/extracted
         if not extracted_any_semantic:
-            print("\n" + "!" * 78)
-            print("⚠️  [DREMA FALLBACK NOTICE] No physical objects extracted via semantic masks!")
-            print("   Activating unsupervised tabletop Marching Cubes fallback...")
-            print("   Objects will be isolated purely by geometric TSDF spatial clustering above table surface.")
-            print("!" * 78 + "\n")
-            z_cutoff = z_table + self.obstacle_min_clearance_z
-            table_clearance_xy = 2.0 * self.voxel_size
-            verts, faces = extract_obstacle_mesh_from_tsdf(
-                self.vg_pipeline.tsdf_map,
-                z_min_cutoff=z_cutoff,
-                z_max_cutoff=act_z_max,
-                x_bounds=(tab_x_min + table_clearance_xy, tab_x_max - table_clearance_xy),
-                y_bounds=(tab_y_min + table_clearance_xy, tab_y_max - table_clearance_xy),
-                level=0.0
+            self._extract_unsupervised_tabletop_obstacles(
+                digital_twin=digital_twin,
+                tab_x_min=tab_x_min,
+                tab_x_max=tab_x_max,
+                tab_y_min=tab_y_min,
+                tab_y_max=tab_y_max,
+                z_table=z_table,
+                act_z_max=act_z_max
             )
-            if len(verts) > 0 and len(faces) > 0:
-                mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-                components = mesh.split(only_watertight=False)
-                valid_components = []
-                for comp in components:
-                    ext = comp.bounds[1] - comp.bounds[0]
-                    center_c = (comp.bounds[0] + comp.bounds[1]) / 2.0
-                    in_table = (
-                        (center_c[0] >= tab_x_min + table_clearance_xy) and (center_c[0] <= tab_x_max - table_clearance_xy) and
-                        (center_c[1] >= tab_y_min + table_clearance_xy) and (center_c[1] <= tab_y_max - table_clearance_xy) and
-                        (center_c[2] >= z_table + self.obstacle_min_clearance_z) and (center_c[2] <= act_z_max)
-                    )
-                    if in_table and np.max(ext) >= (2.0 * self.voxel_size) and len(comp.vertices) >= 20:
-                        valid_components.append(comp)
-
-                if len(valid_components) == 0 and len(verts) >= 20:
-                    valid_components = [mesh]
-
-                valid_components.sort(key=lambda c: len(c.vertices), reverse=True)
-                for c_idx, comp in enumerate(valid_components):
-                    comp_verts = comp.vertices
-                    comp_faces = comp.faces
-                    min_b, max_b = comp.bounds[0], comp.bounds[1]
-                    centroid = list((min_b + max_b) / 2.0)
-                    extents = list(max_b - min_b)
-                    obj_name = f"obstacle_{c_idx}"
-                    mesh_path = f"assets/scanned_meshes/{obj_name}_{c_idx}.obj"
-                    verts_centered = comp_verts - np.array(centroid)
-                    comp_centered = trimesh.Trimesh(vertices=verts_centered, faces=comp_faces)
-                    comp_centered.export(mesh_path)
-
-                    g_xyz = self.scene_gaussians['xyz']
-                    margin_xy = 2.0 * self.voxel_size
-                    margin_z = 1.0 * self.voxel_size
-                    in_box = (
-                        (g_xyz[:, 0] >= min_b[0] - margin_xy) & (g_xyz[:, 0] <= max_b[0] + margin_xy) &
-                        (g_xyz[:, 1] >= min_b[1] - margin_xy) & (g_xyz[:, 1] <= max_b[1] + margin_xy) &
-                        (g_xyz[:, 2] >= min_b[2] - margin_z) & (g_xyz[:, 2] <= max_b[2] + margin_xy)
-                    )
-                    if torch.any(in_box):
-                        c_xyz = self.scene_gaussians['xyz'][in_box].clone()
-                        c_rgb = self.scene_gaussians['rgb'][in_box].clone()
-                        c_scale = self.scene_gaussians['scale'][in_box].clone()
-                        c_normal = self.scene_gaussians['normal'][in_box].clone() if 'normal' in self.scene_gaussians and len(self.scene_gaussians['normal']) == len(g_xyz) else torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(c_xyz), 1)
-                        c_opacity = self.scene_gaussians['opacity'][in_box].clone() if 'opacity' in self.scene_gaussians and len(self.scene_gaussians['opacity']) == len(g_xyz) else torch.full((len(c_xyz), 1), self.opacity_init, device=self.device, dtype=torch.float32)
-                        mean_color = c_rgb.mean(dim=0).cpu().numpy().tolist()
-                    else:
-                        v_t = torch.tensor(comp_verts, dtype=torch.float32, device=self.device)
-                        mean_color = [0.15, 0.45, 0.85]
-                        c_xyz = v_t
-                        c_rgb = torch.tensor(mean_color, dtype=torch.float32, device=self.device).repeat(len(comp_verts), 1)
-                        c_scale = torch.full((len(v_t), 3), self.voxel_size * 0.5, dtype=torch.float32, device=self.device)
-                        c_normal = torch.tensor([[0.0, 0.0, 1.0]], device=self.device).repeat(len(v_t), 1)
-                        c_opacity = torch.full((len(v_t), 1), self.opacity_init, dtype=torch.float32, device=self.device)
-
-                    pb_body_id = -1
-                    if digital_twin is not None:
-                        pb_body_id = digital_twin.spawn_scanned_mesh_obstacle(
-                            mesh_path=mesh_path,
-                            initial_pos=centroid,
-                            initial_quat=(0, 0, 0, 1),
-                            name=f"{obj_name}_{c_idx}",
-                            is_target=False,
-                            mass=0.0,
-                            color=mean_color + [1.0],
-                            obj_id=c_idx
-                        )
-
-                    self.tracked_objects[c_idx] = {
-                        'name': obj_name,
-                        'mesh_path': mesh_path,
-                        'initial_pos': centroid,
-                        'initial_quat': (0.0, 0.0, 0.0, 1.0),
-                        'last_pos': centroid,
-                        'last_quat': (0.0, 0.0, 0.0, 1.0),
-                        'last_T': torch.eye(4, device=self.device, dtype=torch.float32),
-                        'dims': extents,
-                        'color': mean_color,
-                        'pybullet_id': pb_body_id,
-                        'is_target': False,
-                        'canonical_points': {
-                            'xyz': c_xyz.clone(),
-                            'rgb': c_rgb.clone(),
-                            'normal': c_normal.clone(),
-                            'scale': c_scale.clone()
-                        },
-                        'gaussians': {
-                            'xyz': c_xyz.clone(),
-                            'rgb': c_rgb.clone(),
-                            'normal': c_normal.clone(),
-                            'scale': c_scale.clone(),
-                            'opacity': c_opacity.clone()
-                        }
-                    }
-
-                    # Object-Centric separation: Remove dynamic object primitives from static scene_gaussians
-                    if torch.any(in_box):
-                        static_keep = ~in_box
-                        for k in list(self.scene_gaussians.keys()):
-                            if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(static_keep):
-                                self.scene_gaussians[k] = self.scene_gaussians[k][static_keep]
-                    self.discovered_obstacles.append(DiscoveredObstacle(
-                        oid=c_idx,
-                        name=obj_name,
-                        mesh_path=mesh_path,
-                        initial_pos=tuple(centroid),
-                        initial_quat=(0.0, 0.0, 0.0, 1.0),
-                        dims=tuple(extents),
-                        rgb=mean_color,
-                        is_target=False,
-                        pybullet_body_id=pb_body_id
-                    ))
 
         # 8. Save to cache if enabled
         if self.cache_save_on_scan:
@@ -1224,12 +1483,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     cov3D_precomp=None
                 )
             if not getattr(self, '_render_logged', False):
-                print(f"✓ [VG MAPPING PERCEPTION] Closed-Loop 3DGS Forward Rasterizer active (rasterizing {N:,} Gaussians at {width}x{height} via diff-gaussian-rasterization)")
+                print(f"[VGMapping Perception] Closed-Loop 3DGS Forward Rasterizer active (rasterizing {N:,} Gaussians at {width}x{height} via diff-gaussian-rasterization)")
                 self._render_logged = True
             return torch.clamp(rendered_img, 0.0, 1.0)
         except Exception as e:
             if not getattr(self, '_render_warned', False):
-                print(f"[VG MAPPING PERCEPTION Warning] 3DGS forward rasterization failed: {e}")
+                print(f"[VGMapping Perception Warning] 3DGS forward rasterization failed: {e}")
                 self._render_warned = True
             return None
 
@@ -1451,146 +1710,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     t_detect_total += (time.perf_counter() - t_det_start) * 1000.0
 
                 except Exception as e:
-                    print(f"[VG MAPPING PERCEPTION Warning] Error processing camera view '{cam_name}': {e}")
+                    print(f"[VGMapping Perception Warning] Error processing camera view '{cam_name}': {e}")
 
             # Step 2.b: Paper-Compliant Photometric SGD Optimization (Paper Sec. III-B.3, Eq. 10)
-            t_sgd_total = 0.0
-            if self.enable_sgd and self.sgd_steps > 0 and len(self.scene_gaussians.get('xyz', [])) > 0:
-                t_sgd_start = time.perf_counter()
-                try:
-                    from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-                    from ..gaussian_splatting_utils.loss_utils import l1_loss, ssim, masked_l1_loss, masked_ssim
-                    from ..gaussian_splatting_utils.graphics_utils import getProjectionMatrix
-                    import math
-
-                    N_g = len(self.scene_gaussians['xyz'])
-                    if 'opacity' not in self.scene_gaussians or len(self.scene_gaussians['opacity']) != N_g:
-                        self.scene_gaussians['opacity'] = torch.full((N_g, 1), self.opacity_init, device=self.device, dtype=torch.float32)
-
-                    op_clamped = torch.clamp(self.scene_gaussians['opacity'], 1e-4, 1.0 - 1e-4)
-                    opacity_logit = torch.logit(op_clamped).detach().requires_grad_(True)
-                    rgb_param = self.scene_gaussians['rgb'].clone().detach().requires_grad_(True)
-
-                    sgd_opt = torch.optim.Adam([
-                        {'params': [opacity_logit], 'lr': self.sgd_lr_opacity},
-                        {'params': [rgb_param], 'lr': self.sgd_lr_color}
-                    ])
-
-                    means3D = self.scene_gaussians['xyz']
-                    screenspace_pts = torch.zeros_like(means3D, dtype=means3D.dtype, requires_grad=True, device=self.device) + 0
-                    try:
-                        screenspace_pts.retain_grad()
-                    except Exception:
-                        pass
-                    scales = self.scene_gaussians['scale']
-                    rotations = torch.zeros((N_g, 4), device=self.device, dtype=torch.float32)
-                    rotations[:, 0] = 1.0
-
-                    prepped_views = []
-                    for c_name, c_data in camera_views.items():
-                        c2w_t = torch.as_tensor(c_data['extrinsics'], dtype=torch.float32, device=self.device)
-                        k_t = torch.as_tensor(c_data['intrinsics'], dtype=torch.float32, device=self.device)
-                        gt_rgb = torch.as_tensor(c_data['rgb'], dtype=torch.float32, device=self.device)
-                        if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
-                            gt_rgb = gt_rgb.permute(2, 0, 1)
-                        if gt_rgb.max() > 1.0:
-                            gt_rgb = gt_rgb / 255.0
-                        c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
-
-                        c_fx, c_fy = float(k_t[0, 0]), float(k_t[1, 1])
-                        c_fovx = 2.0 * math.atan(c_w / (2.0 * c_fx))
-                        c_fovy = 2.0 * math.atan(c_h / (2.0 * c_fy))
-                        c_tanfovx = math.tan(c_fovx * 0.5)
-                        c_tanfovy = math.tan(c_fovy * 0.5)
-
-                        c_cam_center = c2w_t[:3, 3]
-                        c_w2c = torch.inverse(c2w_t)
-                        c_view_transform = c_w2c.transpose(0, 1).contiguous()
-                        c_projmatrix = getProjectionMatrix(znear=0.01, zfar=20.0, fovX=c_fovx, fovY=c_fovy).transpose(0, 1).to(self.device)
-                        c_full_proj = (c_view_transform.unsqueeze(0).bmm(c_projmatrix.unsqueeze(0))).squeeze(0).contiguous()
-
-                        c_settings = GaussianRasterizationSettings(
-                            image_height=int(c_h),
-                            image_width=int(c_w),
-                            tanfovx=c_tanfovx,
-                            tanfovy=c_tanfovy,
-                            bg=torch.zeros(3, device=self.device, dtype=torch.float32),
-                            scale_modifier=1.0,
-                            viewmatrix=c_view_transform,
-                            projmatrix=c_full_proj,
-                            sh_degree=0,
-                            campos=c_cam_center,
-                            prefiltered=False,
-                            debug=False
-                        )
-
-                        # Extract valid scene mask excluding robot links (with 3px dilation for antialiasing)
-                        mask_np = c_data.get('mask')
-                        if mask_np is not None:
-                            mask_raw = torch.from_numpy(mask_np.copy()).to(self.device).squeeze()
-                            filter_ids = self.robot_ids | self.virtual_ids
-                            if len(filter_ids) > 0:
-                                f_ids = torch.tensor(list(filter_ids), device=self.device, dtype=mask_raw.dtype)
-                                is_robot = torch.isin(mask_raw, f_ids)
-                                f_float = is_robot.float().unsqueeze(0).unsqueeze(0)
-                                dilated_robot = (torch.nn.functional.max_pool2d(f_float, kernel_size=5, stride=1, padding=2)[0, 0] > 0.5)
-                                v_mask = (~dilated_robot).float()
-                            else:
-                                v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
-                        else:
-                            v_mask = torch.ones((c_h, c_w), device=self.device, dtype=torch.float32)
-
-                        prepped_views.append({
-                            'rasterizer': GaussianRasterizer(raster_settings=c_settings),
-                            'gt_rgb': gt_rgb,
-                            'valid_mask': v_mask
-                        })
-
-                    for step_i in range(self.sgd_steps):
-                        sgd_opt.zero_grad()
-                        step_loss = torch.tensor(0.0, device=self.device)
-                        curr_alpha = torch.sigmoid(opacity_logit)
-                        curr_colors = torch.clamp(rgb_param, 0.0, 1.0)
-
-                        for pv in prepped_views:
-                            rendered, _ = pv['rasterizer'](
-                                means3D=means3D,
-                                means2D=screenspace_pts,
-                                shs=None,
-                                colors_precomp=curr_colors,
-                                opacities=curr_alpha,
-                                scales=scales,
-                                rotations=rotations,
-                                cov3D_precomp=None
-                            )
-                            v_mask = pv.get('valid_mask')
-                            ll1 = masked_l1_loss(rendered, pv['gt_rgb'], v_mask)
-                            ssim_val = masked_ssim(rendered, pv['gt_rgb'], v_mask)
-                            view_loss = (1.0 - self.sgd_lambda_ssim) * ll1 + self.sgd_lambda_ssim * (1.0 - ssim_val)
-                            step_loss = step_loss + (view_loss / max(1, len(prepped_views)))
-
-                        step_loss.backward()
-                        sgd_opt.step()
-
-                    with torch.no_grad():
-                        self.scene_gaussians['opacity'] = torch.sigmoid(opacity_logit).detach()
-                        self.scene_gaussians['rgb'] = torch.clamp(rgb_param, 0.0, 1.0).detach()
-
-                        # Paper floater & low-opacity pruning (Sec. III-B.3)
-                        if self.sgd_prune_opacity_threshold > 0.0:
-                            keep_op = (self.scene_gaussians['opacity'].squeeze(-1) >= self.sgd_prune_opacity_threshold)
-                            if not torch.all(keep_op):
-                                for k in list(self.scene_gaussians.keys()):
-                                    if isinstance(self.scene_gaussians[k], torch.Tensor) and len(self.scene_gaussians[k]) == len(keep_op):
-                                        self.scene_gaussians[k] = self.scene_gaussians[k][keep_op]
-
-                except Exception as e_sgd:
-                    print(f"[VG MAPPING PERCEPTION Warning] Error during photometric SGD optimization: {e_sgd}")
-                t_sgd_total = (time.perf_counter() - t_sgd_start) * 1000.0
-
+            t_sgd_total = self._optimize_photometric_sgd_streaming(camera_views=camera_views)
             t_vdc_total = t_prune_total + t_render_total + t_detect_total + t_sgd_total
 
-        # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
         # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
         if len(self.tracked_objects) > 0:
             t_s3 = time.perf_counter()
@@ -1801,7 +1926,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             num_cams = len(camera_views)
             active_g = len(self.get_all_active_gaussians().get('xyz', []))
 
-            print(f"\n[VG MAPPING PERCEPTION #{timestep:04d}]")
+            print(f"\n[VGMapping Perception #{timestep:04d}]")
             print(f"  ├─ Step 1 (TSDF Ingest): {t_tsdf_total:.1f}ms ({num_cams} views)")
             sgd_log = f" | SGD ({self.sgd_steps} iters): {t_sgd_total:.1f}ms" if (self.enable_sgd and self.sgd_steps > 0) else ""
             print(f"  ├─ Step 2 (VDC Mapping): {t_vdc_total:.1f}ms [Prune: {t_prune_total:.1f}ms | 3DGS Render: {t_render_total:.1f}ms | Init: {t_detect_total:.1f}ms{sgd_log}] | Pruned: {total_pruned_in_frame} | Evicted: {total_evicted_in_frame} | Added: {total_added_in_frame} | Active 3DGS: {active_g:,}")
@@ -1954,10 +2079,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 json.dump(meta, f, indent=2)
 
             t_elapsed = time.time() - t_start
-            print(f"✓ [Perception Cache] Successfully saved initial scene state to '{cache_dir}' in {t_elapsed:.2f}s!")
+            print(f"[VGMapping Perception Cache] Successfully saved initial scene state to '{cache_dir}' in {t_elapsed:.2f}s!")
             return True
         except Exception as e:
-            print(f"[Perception Cache Warning] Failed to save scene cache: {e}")
+            print(f"[VGMapping Perception Cache Warning] Failed to save scene cache: {e}")
             return False
 
     def load_cache(
@@ -1972,13 +2097,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         t_obj_path = os.path.join(cache_dir, "tracked_objects.pt")
 
         if not (os.path.exists(meta_path) and os.path.exists(g_path) and os.path.exists(tsdf_path)):
-            print(f"[Perception Cache] Cache files not found in '{cache_dir}'. Proceeding with full 360° scan.")
+            print(f"[VGMapping Perception Cache] Cache files not found in '{cache_dir}'. Proceeding with full 360° scan.")
             return None
 
         try:
             t_start = time.time()
             print(f"\n=======================================================")
-            print(f"⚡ [Perception Cache] Restoring initial scene state from '{cache_dir}'...")
+            print(f"[VGMapping Perception Cache] Restoring initial scene state from '{cache_dir}'...")
 
             with open(meta_path, "r") as f:
                 meta = json.load(f)
@@ -2083,7 +2208,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             t_elapsed = time.time() - t_start
             retained_count = len(self.scene_gaussians['xyz'])
-            print(f"✓ [Perception Cache] Restored {retained_count:,} Gaussians, TSDF grid {self.grid_dim}, and {len(self.discovered_obstacles)} obstacles in {t_elapsed:.3f}s!")
+            print(f"[VGMapping Perception Cache] Restored {retained_count:,} Gaussians, TSDF grid {self.grid_dim}, and {len(self.discovered_obstacles)} obstacles in {t_elapsed:.3f}s!")
             print(f"=======================================================\n")
 
             return InitialScanResult(
@@ -2100,7 +2225,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             )
 
         except Exception as e:
-            print(f"[Perception Cache Error] Failed to restore cache from '{cache_dir}': {e}. Falling back to live scan.")
+            print(f"[VGMapping Perception Cache Error] Failed to restore cache from '{cache_dir}': {e}. Falling back to live scan.")
             return None
 
     def get_viser_surface_voxels(self) -> Optional[Dict[str, np.ndarray]]:
