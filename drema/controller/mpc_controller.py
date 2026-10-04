@@ -176,10 +176,13 @@ class MPCController:
         w_sensi = weights.get('sensitive', 0.5)
         calc_t = diag.get('calc_time_ms', 0.0)
         tgt_str = f"[{active_target_pos[0]:.2f}, {active_target_pos[1]:.2f}, {active_target_pos[2]:.2f}]"
+        lim_warns = diag.get('joint_limit_warnings', [])
+        lim_str = f" | lim_warn: {','.join(lim_warns)}" if lim_warns else ""
+        ik_str = "" if diag.get('q_des_available', True) else " | IK: FAIL"
 
         status_msg = (
             f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f} | "
-            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms"
+            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{lim_str}{ik_str}"
         )
 
         return drema_comm_pb2.ControlAction(

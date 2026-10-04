@@ -238,6 +238,17 @@ class MPPMPPIEngine:
                     q_des_t = q_dls
                     self.last_ik_solution = q_des_t.copy()
 
+        # Diagnostics: Check joint limits and IK status (instantaneous <0.001ms)
+        near_min = q_curr < (self.kin.Q_MIN + 0.05)
+        near_max = q_curr > (self.kin.Q_MAX - 0.05)
+        joint_limit_warnings = []
+        if np.any(near_min) or np.any(near_max):
+            for j_i in range(7):
+                if near_min[j_i]:
+                    joint_limit_warnings.append(f"J{j_i+1}min")
+                elif near_max[j_i]:
+                    joint_limit_warnings.append(f"J{j_i+1}max")
+
         # ---------------------------------------------------------------------
         # Step 2: Sampling Phase - Construct Hybrid Sampling Matrix U_t (Eq. 13)
         # U_t = [ U^{(1), eps}, U^{(2), eps}, ..., U^{(N), eps}, U^{mixed, eps}, U_p ]
@@ -501,7 +512,8 @@ class MPPMPPIEngine:
             'best_greedy_idx': int(topk_indices['greedy'][0]),
             'best_sensitive_idx': int(topk_indices['sensitive'][0]),
             'total_candidates': total_K,
-            'q_des_available': (q_des_t is not None)
+            'q_des_available': (q_des_t is not None),
+            'joint_limit_warnings': joint_limit_warnings
         }
 
         return qd_optimal, diagnostics

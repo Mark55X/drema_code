@@ -561,9 +561,13 @@ class CoppeliaSimulationClient:
                     self.active_actions_count += 1
                     if self.active_actions_count <= 3 or (self.log_interval_actions > 0 and self.active_actions_count % self.log_interval_actions == 0):
                         v_max = max(abs(v) for v in action.joint_velocities) if action.joint_velocities else 0.0
+                        d_tgt_str = ""
+                        if target_available and len(target_pose) >= 3 and len(ee_pose) >= 3:
+                            d_tgt = float(np.linalg.norm(np.array(ee_pose[:3]) - np.array(target_pose[:3])))
+                            d_tgt_str = f" | d_tgt: {d_tgt:.3f}m"
                         print(
                             f"[COPPELIA ENVIRONMENT] Step #{self.step_counter:04d} (Act #{self.active_actions_count:04d}) | "
-                            f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s | Status: '{action.status_message}'"
+                            f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s{d_tgt_str} | Status: '{action.status_message}'"
                         )
                 else:
                     # Hold position: zero target velocities

@@ -225,6 +225,9 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         col = tuple(color) if color is not None else DEFAULT_OBSTACLE_COLOR
 
         try:
+            if mass <= 0.0 and self.tracking_mode == "constraint":
+                print(f"[PYBULLET DIGITAL TWIN ERROR] Obstacle '{name}' (ID: {target_obj_id}) spawned with mass={mass} <= 0! In PyBullet, static bodies cannot be moved by constraints.")
+
             col_id = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_path)
             vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_path, rgbaColor=list(col))
             body_id = p.createMultiBody(
@@ -352,6 +355,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         obj_data['target_quat'] = orn
 
         if self.tracking_mode == "constraint":
+            mass = float(obj_data.get('mass', 1.0))
+            if mass <= 0.0:
+                print(f"[PYBULLET DIGITAL TWIN ERROR] Cannot sync pose for obstacle ID {obj_id} with mass={mass} <= 0 using constraints! Body will NOT move in PyBullet.")
+                return
             cid = obj_data.get('constraint_id', -1)
             if cid >= 0:
                 p.changeConstraint(

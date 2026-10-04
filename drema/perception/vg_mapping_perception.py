@@ -964,7 +964,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     initial_quat=(0, 0, 0, 1),
                     name=f"{obj_name}_{c_idx}",
                     is_target=False,
-                    mass=0.0,
+                    mass=1.0,
                     color=mean_color + [1.0],
                     obj_id=c_idx
                 )
@@ -1312,7 +1312,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             initial_quat=(0, 0, 0, 1),
                             name=f"{obj_name}_{obj_id}",
                             is_target=False,
-                            mass=0.0,
+                            mass=1.0,
                             color=mean_color + [1.0],
                             obj_id=obj_id
                         )
@@ -2149,7 +2149,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             initial_quat=obs.initial_quat,
                             name=obs.name,
                             is_target=obs.is_target,
-                            mass=0.0,
+                            mass=1.0,
                             color=obs.rgb + [1.0],
                             obj_id=obs.oid
                         )
