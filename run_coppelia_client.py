@@ -526,13 +526,22 @@ class CoppeliaSimulationClient:
 
                 target_pose = []
                 target_available = False
-                if hasattr(self.task, '_task') and hasattr(self.task._task, 'target'):
+                task_inst = getattr(self.task, '_task', self.task)
+                if hasattr(task_inst, 'get_target_ee_pose'):
                     try:
-                        target_obj = self.task._task.target
-                        if hasattr(target_obj, 'get_pose'):
-                            target_pose = target_obj.get_pose().tolist()
-                        elif hasattr(target_obj, 'get_position'):
-                            target_pose = list(target_obj.get_position()) + [0.0, 0.0, 0.0, 1.0]
+                        target_pose = list(task_inst.get_target_ee_pose())
+                        target_available = True
+                    except Exception:
+                        target_available = False
+                elif hasattr(task_inst, 'target'):
+                    try:
+                        target_obj = task_inst.target
+                        pos = list(target_obj.get_position())
+                        if hasattr(task_inst, 'target_ee_orientation'):
+                            target_pose = pos + list(task_inst.target_ee_orientation)
+                        else:
+                            # Position-only goal if no EE orientation specified by task
+                            target_pose = pos
                         target_available = True
                     except Exception:
                         target_available = False

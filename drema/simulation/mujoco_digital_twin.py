@@ -768,7 +768,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         target_quat: Optional[Tuple[float, float, float, float]] = None
     ) -> Optional[np.ndarray]:
         """Calculates inverse kinematics solution for Franka Panda end-effector using MuJoCo Jacobian."""
-        if self.model is None or self.data is None:
+        if self.model is None or self.data is None or self.model.nq < 7:
             return None
 
         if self._eval_data is None:
@@ -776,10 +776,19 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         eval_data = self._eval_data
         if np.all(np.abs(self.data.qpos[:7]) < 1e-2):
-            eval_data.qpos[:7] = np.array([0.0, -0.4, 0.0, -2.0, 0.0, 1.6, 0.7], dtype=np.float64)
+            eval_data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785], dtype=np.float64)
         else:
             eval_data.qpos[:7] = self.data.qpos[:7]
 
+        # Parse target orientation if provided (supports 3x3 matrix or 4-element quaternion)
+        rot_mat = None
+        if target_quat is not None:
+            tq = np.asarray(target_quat)
+            if tq.shape == (3, 3):
+                rot_mat = tq.astype(np.float64)
+            elif len(tq.flatten()) == 4:
+                from scipy.spatial.transform import Rotation
+                rot_mat = Rotation.from_quat(tq.flatten()).as_matrix().astype(np.float64)
 
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "tcp")
         body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "ee")
@@ -788,24 +797,46 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         target_p = np.array(target_pos, dtype=np.float64)
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+        jacr = np.zeros((3, self.model.nv), dtype=np.float64) if rot_mat is not None else None
 
         q_min = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973], dtype=np.float64)
         q_max = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973], dtype=np.float64)
 
-        for _ in range(35):
+        for _ in range(40):
             mujoco.mj_fwdPosition(self.model, eval_data)
             curr_pos = eval_data.site_xpos[site_id] if site_id >= 0 else eval_data.xpos[body_id]
-            err = target_p - curr_pos
-            if np.linalg.norm(err) < 2e-3:
-                return eval_data.qpos[:7].astype(np.float32)
+            pos_err = target_p - curr_pos
 
-            if site_id >= 0:
-                mujoco.mj_jacSite(self.model, eval_data, jacp, None, site_id)
+            if rot_mat is not None:
+                curr_mat = eval_data.site_xmat[site_id].reshape(3, 3) if site_id >= 0 else eval_data.xmat[body_id].reshape(3, 3)
+                rot_err = 0.5 * (
+                    np.cross(curr_mat[:, 0], rot_mat[:, 0]) +
+                    np.cross(curr_mat[:, 1], rot_mat[:, 1]) +
+                    np.cross(curr_mat[:, 2], rot_mat[:, 2])
+                )
+                if np.linalg.norm(pos_err) < 2e-3 and np.linalg.norm(rot_err) < 0.05:
+                    return eval_data.qpos[:7].astype(np.float32)
+
+                if site_id >= 0:
+                    mujoco.mj_jacSite(self.model, eval_data, jacp, jacr, site_id)
+                else:
+                    mujoco.mj_jacBody(self.model, eval_data, jacp, jacr, body_id)
+
+                J = np.vstack([jacp[:, :7], jacr[:, :7]])
+                err = np.concatenate([pos_err, 0.2 * rot_err])
+                step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err)
             else:
-                mujoco.mj_jacBody(self.model, eval_data, jacp, None, body_id)
+                if np.linalg.norm(pos_err) < 2e-3:
+                    return eval_data.qpos[:7].astype(np.float32)
 
-            J = jacp[:, :7]
-            step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(3), err)
+                if site_id >= 0:
+                    mujoco.mj_jacSite(self.model, eval_data, jacp, None, site_id)
+                else:
+                    mujoco.mj_jacBody(self.model, eval_data, jacp, None, body_id)
+
+                J = jacp[:, :7]
+                step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(3), pos_err)
+
             eval_data.qpos[:7] = np.clip(eval_data.qpos[:7] + 0.6 * step, q_min, q_max)
 
         mujoco.mj_fwdPosition(self.model, eval_data)
@@ -813,8 +844,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if np.linalg.norm(target_p - curr_pos) < 0.05:
             return eval_data.qpos[:7].astype(np.float32)
 
-        q_sol, success = self.kin.solve_dls_ik(self.data.qpos[:7], target_pos, target_quat)
-        return q_sol if success else None
+        return None
 
     def compute_trajectory_collision_costs(
         self,

@@ -517,9 +517,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 elif len(tq.flatten()) == 4:
                     kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 
+            ee_idx = 11 if p.getNumJoints(self.robot_id) > 11 else 7
             pb_ik = p.calculateInverseKinematics(
                 self.robot_id,
-                7,  # Franka end-effector link index
+                ee_idx,
                 ik_target,
                 **kwargs
             )
