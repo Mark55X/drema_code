@@ -684,6 +684,14 @@ class DremaDynamicSystem:
 
         if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
             print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
+            diag = getattr(self.mpc_controller, 'last_diagnostics', {})
+            t_info = diag.get('timings', {})
+            if t_info:
+                cdet = t_info.get('coll_details', {})
+                cdet_str = ""
+                if cdet:
+                    cdet_str = f" [PyBullet: {cdet.get('bullet_ms', 0.0):.1f}ms, GVM: {cdet.get('gvm_ms', 0.0):.1f}ms, Pts: {cdet.get('pts_count', 0)}]"
+                print(f"  └─ [MPC TIMINGS] Coll: {t_info.get('coll_ms', 0.0):.1f}ms{cdet_str} | Rollouts: {t_info.get('samples_ms', 0.0):.1f}ms | IK: {t_info.get('ik_ms', 0.0):.1f}ms | Opt: {t_info.get('opt_ms', 0.0):.1f}ms")
 
         return action
 

@@ -212,6 +212,7 @@ class MPPMPPIEngine:
         # ---------------------------------------------------------------------
         # Step 1: Inverse Kinematics Guidance Target (q_des,t, Eq. 26)
         # ---------------------------------------------------------------------
+        t_ik_start = time.perf_counter()
         q_des_t = None
         if target_pos is not None:
             # Primary IK query: Digital Twin backend IK (PyBullet, MuJoCo, etc.)
@@ -227,6 +228,8 @@ class MPPMPPIEngine:
                 if success:
                     q_des_t = q_dls
                     self.last_ik_solution = q_des_t.copy()
+
+        t_ik_ms = (time.perf_counter() - t_ik_start) * 1000.0
 
 
         # Diagnostics: Check joint limits and IK status (instantaneous <0.001ms)
@@ -244,6 +247,7 @@ class MPPMPPIEngine:
         # Step 2: Sampling Phase - Construct Hybrid Sampling Matrix U_t (Eq. 13)
         # U_t = [ U^{(1), eps}, U^{(2), eps}, ..., U^{(N), eps}, U^{mixed, eps}, U_p ]
         # ---------------------------------------------------------------------
+        t_sample_start = time.perf_counter()
         sample_batches = []
 
         # 2a. Intramodal stochastic samples for each planner (Eq. 19)
@@ -315,9 +319,12 @@ class MPPMPPIEngine:
             q_prev = q_h
             qd_prev = qd_h
 
+        t_samples_ms = (time.perf_counter() - t_sample_start) * 1000.0
+
         # ---------------------------------------------------------------------
         # Step 4: Subcost Computations (Eq. 17, 26, 27, 28)
         # ---------------------------------------------------------------------
+        t_cost_start = time.perf_counter()
         # 4a. Goal distance cost: dist(x_{i,h})
         goal_costs = np.zeros((total_K, self.H), dtype=np.float32)
         sparse_rewards = np.zeros((total_K, self.H), dtype=np.float32)
@@ -349,12 +356,16 @@ class MPPMPPIEngine:
         c_acc = np.sum(U_t ** 2, axis=-1)
         safety_costs = c_limits + 0.01 * c_acc
 
+        t_coll_start = time.perf_counter()
         # 4c. Environmental Collision Costs: Coll_p and GVM-SDF Coll_{ppv_theta} (Eq. 10, 11, 21, 25)
         coll_p_costs, coll_gvm_costs = self._evaluate_collision_costs(
             Q=Q,
             QD=QD,
             digital_twin=digital_twin
         )
+        t_coll_ms = (time.perf_counter() - t_coll_start) * 1000.0
+
+        t_opt_start = time.perf_counter()
 
         # ---------------------------------------------------------------------
         # Step 5: Multi-Planner Total Cost Calculation (Eq. 18, 29)
@@ -498,6 +509,18 @@ class MPPMPPIEngine:
             self.planner_distributions[name]['sigma'][-1] = self.planner_distributions[name]['sigma'][-2]
 
         calc_time_ms = (time.time() - t0) * 1000.0
+        t_opt_ms = (time.perf_counter() - t_opt_start) * 1000.0
+
+        coll_diag = getattr(digital_twin, 'last_collision_timings', {}) if digital_twin is not None else {}
+
+        timings_breakdown = {
+            'total_ms': calc_time_ms,
+            'ik_ms': t_ik_ms,
+            'samples_ms': t_samples_ms,
+            'coll_ms': t_coll_ms,
+            'opt_ms': t_opt_ms,
+            'coll_details': coll_diag
+        }
 
         # Diagnostics: dominant planner, winning candidate and primitive weight ratio
         dom_planner = 'sensitive' if self.mixing_weights.get('sensitive', 0.0) > self.mixing_weights.get('greedy', 0.0) else 'greedy'
@@ -524,6 +547,7 @@ class MPPMPPIEngine:
 
         diagnostics = {
             'calc_time_ms': calc_time_ms,
+            'timings': timings_breakdown,
             'weights': self.mixing_weights.copy(),
             'judge_values': V_n.copy(),
             'best_greedy_idx': int(topk_indices['greedy'][0]),

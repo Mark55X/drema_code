@@ -585,11 +585,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         robot_id = self.robot_id
 
         # Forecast future trajectories for all tracked dynamic obstacles across horizon H
+        t_pred_start = time.perf_counter()
         predictions = (
             self.predictor.predict_all(horizon=H, dt=dt)
             if self.predictor is not None
             else {}
         )
+        t_pred_ms = (time.perf_counter() - t_pred_start) * 1000.0
 
         # Subsample lookahead waypoints to sustain high control frequency
         step_stride = max(1, H // 5)
@@ -604,6 +606,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             info = p.getJointInfo(robot_id, j_idx)
             if info[2] != p.JOINT_FIXED and len(arm_joint_indices) < 7:
                 arm_joint_indices.append(j_idx)
+
+        t_bullet_total = 0.0
+        t_gvm_total = 0.0
+        total_contact_pts = 0
 
         for h in eval_steps:
             # Advance all tracked dynamic obstacles to their forecasted future pose at lookahead step h
@@ -620,11 +626,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 q_step = Q[k, h]
                 qd_step = QD[k, h]
 
+                t_b_start = time.perf_counter()
                 # Update Franka Panda joint positions in PyBullet
                 for arm_j, j_idx in enumerate(arm_joint_indices):
                     p.resetJointState(robot_id, j_idx, float(q_step[arm_j]))
-
-                p.performCollisionDetection()
 
                 step_coll_p = 0.0
                 step_coll_gvm = 0.0
@@ -635,8 +640,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         bodyB=obs_id,
                         distance=float(sigma_2)
                     )
+                    t_bullet_total += (time.perf_counter() - t_b_start)
+
                     if not closest_pts:
                         continue
+
+                    total_contact_pts += len(closest_pts)
+                    t_gvm_start = time.perf_counter()
 
                     for pt in closest_pts:
                         d = pt[8]
@@ -686,8 +696,17 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         gvm_term = phi * (1.0 + vel_mag * modulation)
                         step_coll_gvm += gvm_term
 
+                    t_gvm_total += (time.perf_counter() - t_gvm_start)
+
                 coll_p[k, h] = step_coll_p
                 coll_gvm[k, h] = step_coll_gvm
+
+        self.last_collision_timings = {
+            'pred_ms': t_pred_ms,
+            'bullet_ms': t_bullet_total * 1000.0,
+            'gvm_ms': t_gvm_total * 1000.0,
+            'pts_count': total_contact_pts
+        }
 
         # Restore all dynamic obstacles to their current instantaneous state (t=0)
         for b_id, o_id in body_to_obj_id.items():

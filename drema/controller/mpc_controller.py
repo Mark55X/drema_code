@@ -185,10 +185,18 @@ class MPCController:
         prim_w = diag.get('primitive_weight_sum', 0.0)
         mode_str = f" | top: {top_cand} ({top_w*100:.0f}%, prims: {prim_w*100:.0f}%)" if top_cand else ""
 
+        timings = diag.get('timings', {})
+        t_coll = timings.get('coll_ms', 0.0)
+        t_samp = timings.get('samples_ms', 0.0)
+        t_opt = timings.get('opt_ms', 0.0)
+        time_breakdown_str = f" [Coll: {t_coll:.0f}ms, Roll: {t_samp:.0f}ms, Opt: {t_opt:.0f}ms]"
+
         status_msg = (
             f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f}{mode_str} | "
-            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{lim_str}{ik_str}"
+            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{time_breakdown_str}{lim_str}{ik_str}"
         )
+
+        self.last_diagnostics = diag
 
         return drema_comm_pb2.ControlAction(
             timestamp=time.time(),
