@@ -75,6 +75,24 @@ def transfer_gaussian_colors_to_mesh(
     return mean_color
 
 
+def subsample_point_cloud(
+    cloud: Dict[str, torch.Tensor],
+    max_points: int
+) -> Dict[str, torch.Tensor]:
+    """
+    Subsamples a point cloud dictionary containing PyTorch tensors (e.g. 'xyz', 'rgb')
+    to at most `max_points` via uniform random permutation without replacement.
+    """
+    xyz = cloud.get('xyz')
+    if xyz is None:
+        return cloud
+    n = len(xyz)
+    if n > max_points > 0:
+        idx = torch.randperm(n, device=xyz.device)[:max_points]
+        return {k: v[idx] if isinstance(v, torch.Tensor) and len(v) == n else v for k, v in cloud.items()}
+    return cloud
+
+
 import mcubes
 from vgmapping_drema.tsdf import TSDFVoxelMap
 from .base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult, DiscoveredObstacle
@@ -1723,52 +1741,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             objects_target = {}
             initial_T_coarse_dict = {}
 
-            ws = self.active_workspace_bounds
             z_tab = self.z_table
-            clearance_z = self.obstacle_min_clearance_z
-
-            # Candidate 3D points above tabletop from current camera views (for unmasked fallback)
-            cand_pts_list, cand_rgb_list = [], []
-            for c_name, c_data in camera_views.items():
-                c_d = c_data.get('depth')
-                if c_d is None:
-                    continue
-                d_np = to_numpy(c_d)
-                if d_np.ndim == 3:
-                    d_np = d_np.squeeze(0)
-                valid_d = (d_np > self.depth_near) & (d_np < self.depth_far)
-                if not np.any(valid_d):
-                    continue
-                v_i, u_i = np.nonzero(valid_d)
-                d_v = d_np[valid_d]
-                K = c_data['intrinsics']
-                fx, fy = float(K[0, 0]), float(K[1, 1])
-                cx, cy = float(K[0, 2]), float(K[1, 2])
-                xc = (u_i.astype(float) - cx) * d_v / fx
-                yc = (v_i.astype(float) - cy) * d_v / fy
-                p_c = np.stack([xc, yc, d_v], axis=-1)
-                c2w = c_data['extrinsics']
-                p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
-                in_roi = (
-                    (p_w[:, 2] > (z_tab + clearance_z)) & (p_w[:, 2] <= ws['z_max']) &
-                    (p_w[:, 0] >= ws['x_min']) & (p_w[:, 0] <= ws['x_max']) &
-                    (p_w[:, 1] >= ws['y_min']) & (p_w[:, 1] <= ws['y_max'])
-                )
-                if np.any(in_roi):
-                    c_rgb_raw = c_data.get('rgb')
-                    if c_rgb_raw is not None:
-                        rgb_np = to_numpy(c_rgb_raw)
-                        if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
-                            rgb_np = np.transpose(rgb_np, (1, 2, 0))
-                        if rgb_np.max() > 1.0:
-                            rgb_np = rgb_np / 255.0
-                        cand_rgb_list.append(torch.as_tensor(rgb_np[v_i[in_roi], u_i[in_roi]], dtype=torch.float32, device=self.device))
-                    else:
-                        cand_rgb_list.append(torch.full((int(np.sum(in_roi)), 3), 0.5, device=self.device, dtype=torch.float32))
-                    cand_pts_list.append(torch.as_tensor(p_w[in_roi], dtype=torch.float32, device=self.device))
-
-            cand_xyz = torch.cat(cand_pts_list, dim=0) if len(cand_pts_list) > 0 else torch.empty((0, 3), device=self.device)
-            cand_rgb = torch.cat(cand_rgb_list, dim=0) if len(cand_rgb_list) > 0 else torch.empty((0, 3), device=self.device)
 
             for oid, obj_info in self.tracked_objects.items():
                 src_xyz = obj_info['canonical_points']['xyz']
@@ -1823,40 +1796,19 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         obs_rgb_list.append(torch.full((len(p_w), 3), 0.5, device=self.device, dtype=torch.float32))
                     obs_xyz_list.append(torch.as_tensor(p_w, dtype=torch.float32, device=self.device))
 
-                if len(obs_xyz_list) > 0:
-                    tgt_xyz = torch.cat(obs_xyz_list, dim=0)
-                    tgt_rgb = torch.cat(obs_rgb_list, dim=0)
-                else:
-                    # Fallback to proximity search around last known position in candidate points above table
-                    if len(cand_xyz) < 4:
-                        continue
-                    last_p = np.array(obj_info['last_pos'])
-                    dist_p = torch.norm(cand_xyz - torch.tensor(last_p, device=self.device, dtype=torch.float32), dim=1)
-                    near_mask = dist_p < self.proximity_radius
-                    if torch.any(near_mask) and near_mask.sum() >= 4:
-                        tgt_xyz = cand_xyz[near_mask]
-                        tgt_rgb = cand_rgb[near_mask]
-                    else:
-                        tgt_xyz = cand_xyz
-                        tgt_rgb = cand_rgb
+                if len(obs_xyz_list) == 0:
+                    # No visual observations for this object in the current camera frames (e.g. occluded or off-view).
+                    # Retain last known pose without corrupting motion estimation.
+                    continue
 
+                tgt_xyz = torch.cat(obs_xyz_list, dim=0)
+                tgt_rgb = torch.cat(obs_rgb_list, dim=0)
                 if len(tgt_xyz) < 4:
                     continue
 
-                # Configurable subsample
-                N_src = len(src_xyz)
-                if N_src > self.se3_subsample:
-                    sub_s = torch.randperm(N_src, device=self.device)[:self.se3_subsample]
-                    objects_source[oid] = {'xyz': src_xyz[sub_s], 'rgb': src_rgb[sub_s]}
-                else:
-                    objects_source[oid] = {'xyz': src_xyz, 'rgb': src_rgb}
-
-                N_tgt = len(tgt_xyz)
-                if N_tgt > self.se3_subsample:
-                    sub_t = torch.randperm(N_tgt, device=self.device)[:self.se3_subsample]
-                    objects_target[oid] = {'xyz': tgt_xyz[sub_t], 'rgb': tgt_rgb[sub_t]}
-                else:
-                    objects_target[oid] = {'xyz': tgt_xyz, 'rgb': tgt_rgb}
+                # Budget-constrained subsampling for real-time SE(3) tracking
+                objects_source[oid] = subsample_point_cloud({'xyz': src_xyz, 'rgb': src_rgb}, max_points=self.se3_subsample)
+                objects_target[oid] = subsample_point_cloud({'xyz': tgt_xyz, 'rgb': tgt_rgb}, max_points=self.se3_subsample)
 
                 initial_T_coarse_dict[oid] = obj_info.get('last_T', torch.eye(4, device=self.device))
 
