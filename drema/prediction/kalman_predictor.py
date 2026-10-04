@@ -113,8 +113,8 @@ class SingleObjectKinematicFilter:
         if dt < 1e-4:
             return False
 
-        # If time gap is massive (> 1.5s), tracking was paused or reset: re-anchor state
-        if dt > 1.5:
+        # If time gap is massive (> 15.0s), tracking was paused or reset: re-anchor state
+        if dt > 15.0:
             self.x[0:3] = np.array(measured_pos, dtype=np.float32)
             self.x[3:6] = 0.0
             self.x[6:9] = 0.0

@@ -171,7 +171,8 @@ class DremaGrpcClient:
         semantic_labels: Optional[Dict[str, int]] = None,
         robot_base_pos: Optional[List[float]] = None,
         reachability_radius: float = 0.95,
-        joint_positions: Optional[List[float]] = None
+        joint_positions: Optional[List[float]] = None,
+        timestamp: Optional[float] = None
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes a multi-camera observation into the streaming queue.
@@ -190,9 +191,10 @@ class DremaGrpcClient:
             )
             frames.append(f)
 
+        obs_timestamp = float(timestamp) if timestamp is not None else time.time()
         obs = drema_comm_pb2.FrameObservation(
             timestep=timestep,
-            timestamp=time.time(),
+            timestamp=obs_timestamp,
             cameras=frames,
             is_initial_scan=is_initial_scan,
             is_scan_finished=is_scan_finished,
