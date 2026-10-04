@@ -19,10 +19,12 @@ try:
 except Exception:
     pass
 
-# Ensure parent master-thesis directory is in sys.path for vgmapping_drema
-thesis_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
-if thesis_root not in sys.path:
-    sys.path.insert(0, thesis_root)
+def to_numpy(data: Any) -> np.ndarray:
+    """Converts a PyTorch tensor, numpy array, or list to a NumPy ndarray without branching."""
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    return np.asarray(data)
+
 
 import mcubes
 from vgmapping_drema.tsdf import TSDFVoxelMap
@@ -44,42 +46,43 @@ def extract_semantic_object_mesh_from_scan(
     """
     Extracts a pristine, complete 3D surface mesh for a specific semantic object ID
     from the initial scan frames following the original DREMA architecture:
-    - Isolates depth observations to only pixels where mask == target_obj_id (depth[mask != id] = 0).
+    - Isolates depth observations to only pixels where mask == target_obj_id
     - Eliminates the supporting tabletop and background entirely from this object's reconstruction.
     - Constructs a focused, high-resolution TSDF grid around the object bounds.
-    - Extracts solid surface via Marching Cubes without any artificial vertical z_cutoff,
-      preserving the complete bottom contact surface of the object intact.
+    - Extracts solid surface via Marching Cubes
     """
     valid_frames = []
     pts_sample = []
+    total_discarded_depth_pixels = 0
+    total_obj_pixels = 0
 
     for f in scan_frames:
         mask = f.get('mask')
         if mask is None:
             continue
-        if isinstance(mask, torch.Tensor):
-            mask_np = mask.cpu().numpy()
-        else:
-            mask_np = np.asarray(mask)
+        mask_np = to_numpy(mask)
         if mask_np.ndim == 3:
             mask_np = mask_np.squeeze(0)
 
         obj_pixels = (mask_np == target_obj_id)
-        if not np.any(obj_pixels):
+        n_obj_px = int(np.count_nonzero(obj_pixels))
+        if n_obj_px == 0:
             continue
+        total_obj_pixels += n_obj_px
 
         depth = f.get('depth')
         if depth is None:
             continue
-        if isinstance(depth, torch.Tensor):
-            depth_np = depth.cpu().numpy()
-        else:
-            depth_np = np.asarray(depth)
+        depth_np = to_numpy(depth)
         if depth_np.ndim == 3:
             depth_np = depth_np.squeeze(0)
 
         d_vals = depth_np[obj_pixels]
         valid_d = (d_vals > depth_near) & (d_vals < depth_far)
+        n_valid = int(np.count_nonzero(valid_d))
+        n_discarded = n_obj_px - n_valid
+        total_discarded_depth_pixels += n_discarded
+
         if not np.any(valid_d):
             continue
 
@@ -102,7 +105,12 @@ def extract_semantic_object_mesh_from_scan(
         p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
         pts_sample.append(p_w)
 
+    if total_discarded_depth_pixels > 0:
+        print(f"[VG-Mapping Object #{target_obj_id}] Filtered {total_discarded_depth_pixels}/{total_obj_pixels} pixels "
+              f"outside valid sensor depth range [{depth_near:.2f}, {depth_far:.2f}]m across scan frames.")
+
     if len(pts_sample) == 0:
+        print(f"[VG-Mapping Object #{target_obj_id} Notice] 0 valid 3D points accumulated from {len(scan_frames)} scan views. Mesh extraction skipped.")
         return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
 
     all_pts = np.vstack(pts_sample)
@@ -115,7 +123,7 @@ def extract_semantic_object_mesh_from_scan(
     dim_y = int(np.ceil((p_max[1] - p_min[1]) / voxel_size))
     dim_z = int(np.ceil((p_max[2] - p_min[2]) / voxel_size))
 
-    # Pad to multiple of 8 for CUDA block memory alignment
+    # Pad to multiple of 8 for GPU block memory alignment and clamp to avoid OOM
     dim_x = max(16, min(256, ((dim_x + 7) // 8) * 8))
     dim_y = max(16, min(256, ((dim_y + 7) // 8) * 8))
     dim_z = max(16, min(256, ((dim_z + 7) // 8) * 8))
@@ -135,20 +143,18 @@ def extract_semantic_object_mesh_from_scan(
     )
 
     for f, obj_pixels in valid_frames:
-        depth_raw = f['depth']
-        if isinstance(depth_raw, torch.Tensor):
-            d_t = depth_raw.to(device).clone().float()
-        else:
-            d_t = torch.from_numpy(depth_raw).to(device).float()
+        d_t = torch.as_tensor(f['depth'], dtype=torch.float32, device=device).clone()
         if d_t.dim() == 2:
             d_t = d_t.unsqueeze(0)
+        elif d_t.dim() == 3 and d_t.shape[0] != 1:
+            d_t = d_t.squeeze(0).unsqueeze(0)
 
         # In pure DREMA fashion, zero out all pixels outside this object
-        mask_t = torch.from_numpy(obj_pixels).to(device)
+        mask_t = torch.as_tensor(obj_pixels, dtype=torch.bool, device=device)
         d_t[:, ~mask_t] = 0.0
 
-        k_t = torch.from_numpy(f['intrinsics']).to(device).float() if isinstance(f['intrinsics'], np.ndarray) else f['intrinsics'].to(device).float()
-        pose_t = torch.from_numpy(f['extrinsics']).to(device).float() if isinstance(f['extrinsics'], np.ndarray) else f['extrinsics'].to(device).float()
+        k_t = torch.as_tensor(f['intrinsics'], dtype=torch.float32, device=device)
+        pose_t = torch.as_tensor(f['extrinsics'], dtype=torch.float32, device=device)
 
         obj_tsdf.integrate_depth_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
 
@@ -165,8 +171,12 @@ def extract_obstacle_mesh_from_tsdf(
     level: float = 0.0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
+    [UNSUPERVISED GEOMETRIC FALLBACK]
     Extracts solid surface mesh above tabletop cutoff (z_min_cutoff) and within table bounds using Marching Cubes,
     isolating tabletop obstacles from the tabletop support plane without arbitrary robot distance thresholds.
+    NOTE: This is a fallback mechanism used ONLY when semantic segmentation masks are missing or fail
+    to isolate discrete objects. In standard DREMA execution, semantic isolation is handled by
+    extract_semantic_object_mesh_from_scan.
     """
     F_np = tsdf_map.F.cpu().numpy().copy()
     W_np = tsdf_map.W.cpu().numpy().copy()
@@ -212,24 +222,23 @@ def extract_obstacle_mesh_from_tsdf(
     return np.empty((0, 3)), np.empty((0, 3), dtype=np.int32)
 
 
-# Semantic Label Keyword Constants
-ROBOT_KEYWORD_LABELS = (
-    "panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"
-)
-BACKGROUND_KEYWORD_LABELS = (
-    "workspace", "table", "floor", "wall", "ceiling", "pillar",
-    "sensor", "success", "camera", "head", "waypoint", "detector",
-    "target", "goal", "marker", "dummy"
-)
-VIRTUAL_KEYWORD_LABELS = (
-    "target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"
-)
-
-
 class VGMappingPerceptionModule(BasePerceptionModule):
     """
     Modular Perception Backend implementing VG-Mapping (TSDF + 3DGS) and RecurGS tracking.
     """
+
+    # Class-level semantic keyword defaults (overridden by perception.workspace in YAML configuration)
+    DEFAULT_ROBOT_KEYWORDS: Tuple[str, ...] = (
+        "panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"
+    )
+    DEFAULT_BACKGROUND_KEYWORDS: Tuple[str, ...] = (
+        "workspace", "table", "floor", "wall", "ceiling", "pillar",
+        "sensor", "success", "camera", "head", "waypoint", "detector",
+        "target", "goal", "marker", "dummy"
+    )
+    DEFAULT_VIRTUAL_KEYWORDS: Tuple[str, ...] = (
+        "target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"
+    )
 
     def __init__(self, config: Optional[ConfigDict] = None):
         if config is None:
@@ -254,6 +263,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.workspace_margin = float(ws_cfg.get("workspace_margin", 0.05))
         self.table_thickness = float(ws_cfg.get("table_thickness", 0.05))
         self.table_bounds_fallback = tuple(ws_cfg.get("table_bounds_fallback", [-0.50, 1.10, -0.55, 0.55]))
+        self.robot_keywords = tuple(ws_cfg.get("robot_keywords", self.DEFAULT_ROBOT_KEYWORDS))
+        self.background_keywords = tuple(ws_cfg.get("background_keywords", self.DEFAULT_BACKGROUND_KEYWORDS))
+        self.virtual_keywords = tuple(ws_cfg.get("virtual_keywords", self.DEFAULT_VIRTUAL_KEYWORDS))
 
         # Gaussians configuration
         gs_cfg = config.get_nested("perception.gaussians", {})
@@ -451,12 +463,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             num = int(num)
             id_to_name[num] = name
             name_lower = name.lower()
-            if any(kw in name_lower for kw in ROBOT_KEYWORD_LABELS):
+            if any(kw in name_lower for kw in self.robot_keywords):
                 self.robot_ids.add(num)
-            elif any(kw in name_lower for kw in VIRTUAL_KEYWORD_LABELS):
+            elif any(kw in name_lower for kw in self.virtual_keywords):
                 self.virtual_ids.add(num)
 
-            is_robot_or_bg = any(kw in name_lower for kw in (ROBOT_KEYWORD_LABELS + BACKGROUND_KEYWORD_LABELS))
+            is_robot_or_bg = any(kw in name_lower for kw in (self.robot_keywords + self.background_keywords))
             if not is_robot_or_bg:
                 self.dynamic_object_ids.add(num)
 
@@ -711,19 +723,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                 prepped_scan_views = []
                 for f_data in selected_scan_frames:
-                    c2w_t = torch.from_numpy(f_data['extrinsics'].copy()).to(self.device, dtype=torch.float32)
-                    k_t = torch.from_numpy(f_data['intrinsics'].copy()).to(self.device, dtype=torch.float32)
-                    raw_rgb = f_data['rgb']
-                    if isinstance(raw_rgb, np.ndarray):
-                        if raw_rgb.ndim == 3 and raw_rgb.shape[2] == 3:
-                            gt_rgb = torch.from_numpy(raw_rgb.copy()).permute(2, 0, 1).float().to(self.device)
-                        else:
-                            gt_rgb = torch.from_numpy(raw_rgb.copy()).float().to(self.device)
-                    else:
-                        gt_rgb = raw_rgb.clone().to(self.device, dtype=torch.float32)
-                        if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
-                            gt_rgb = gt_rgb.permute(2, 0, 1)
-
+                    c2w_t = torch.as_tensor(f_data['extrinsics'], dtype=torch.float32, device=self.device)
+                    k_t = torch.as_tensor(f_data['intrinsics'], dtype=torch.float32, device=self.device)
+                    gt_rgb = torch.as_tensor(f_data['rgb'], dtype=torch.float32, device=self.device)
+                    if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                        gt_rgb = gt_rgb.permute(2, 0, 1)
                     if gt_rgb.max() > 1.0:
                         gt_rgb = gt_rgb / 255.0
                     c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
@@ -849,6 +853,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                 if len(verts) < 20 or len(faces) < 20:
                     # Fallback to coarser resolution if point cloud density is sparse
+                    print(f"   -> [Mesh Extraction Object #{obj_id}] Fine resolution produced < 20 elements ({len(verts)} verts, {len(faces)} faces). Retrying with coarser voxel grid ({self.object_mesh_voxel_size * 2.0 * 1000.0:.1f}mm)...")
                     verts, faces = extract_semantic_object_mesh_from_scan(
                         scan_frames=scan_frames,
                         target_obj_id=obj_id,
@@ -987,7 +992,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         # Fallback to unsupervised tabletop Marching Cubes if no semantic objects were found/extracted
         if not extracted_any_semantic:
-            print("[VG-Mapping Marching Cubes] No semantic objects extracted. Falling back to unsupervised tabletop Marching Cubes...")
+            print("\n" + "!" * 78)
+            print("⚠️  [DREMA FALLBACK NOTICE] No physical objects extracted via semantic masks!")
+            print("   Activating unsupervised tabletop Marching Cubes fallback...")
+            print("   Objects will be isolated purely by geometric TSDF spatial clustering above table surface.")
+            print("!" * 78 + "\n")
             z_cutoff = z_table + self.obstacle_min_clearance_z
             table_clearance_xy = 2.0 * self.voxel_size
             verts, faces = extract_obstacle_mesh_from_tsdf(
@@ -1479,19 +1488,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                     prepped_views = []
                     for c_name, c_data in camera_views.items():
-                        c2w_t = torch.from_numpy(c_data['extrinsics'].copy()).to(self.device, dtype=torch.float32)
-                        k_t = torch.from_numpy(c_data['intrinsics'].copy()).to(self.device, dtype=torch.float32)
-                        raw_rgb = c_data['rgb']
-                        if isinstance(raw_rgb, np.ndarray):
-                            if raw_rgb.ndim == 3 and raw_rgb.shape[2] == 3:
-                                gt_rgb = torch.from_numpy(raw_rgb.copy()).permute(2, 0, 1).float().to(self.device)
-                            else:
-                                gt_rgb = torch.from_numpy(raw_rgb.copy()).float().to(self.device)
-                        else:
-                            gt_rgb = raw_rgb.clone().to(self.device, dtype=torch.float32)
-                            if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
-                                gt_rgb = gt_rgb.permute(2, 0, 1)
-
+                        c2w_t = torch.as_tensor(c_data['extrinsics'], dtype=torch.float32, device=self.device)
+                        k_t = torch.as_tensor(c_data['intrinsics'], dtype=torch.float32, device=self.device)
+                        gt_rgb = torch.as_tensor(c_data['rgb'], dtype=torch.float32, device=self.device)
+                        if gt_rgb.ndim == 3 and gt_rgb.shape[2] == 3:
+                            gt_rgb = gt_rgb.permute(2, 0, 1)
                         if gt_rgb.max() > 1.0:
                             gt_rgb = gt_rgb / 255.0
                         c_h, c_w = int(gt_rgb.shape[1]), int(gt_rgb.shape[2])
@@ -1607,7 +1608,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 c_d = c_data.get('depth')
                 if c_d is None:
                     continue
-                d_np = c_d.cpu().numpy() if isinstance(c_d, torch.Tensor) else np.asarray(c_d)
+                d_np = to_numpy(c_d)
                 if d_np.ndim == 3:
                     d_np = d_np.squeeze(0)
                 valid_d = (d_np > self.depth_near) & (d_np < self.depth_far)
@@ -1631,15 +1632,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 if np.any(in_roi):
                     c_rgb_raw = c_data.get('rgb')
                     if c_rgb_raw is not None:
-                        rgb_np = c_rgb_raw.cpu().numpy() if isinstance(c_rgb_raw, torch.Tensor) else np.asarray(c_rgb_raw)
+                        rgb_np = to_numpy(c_rgb_raw)
                         if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
                             rgb_np = np.transpose(rgb_np, (1, 2, 0))
                         if rgb_np.max() > 1.0:
                             rgb_np = rgb_np / 255.0
-                        cand_rgb_list.append(torch.from_numpy(rgb_np[v_i[in_roi], u_i[in_roi]]).to(self.device).float())
+                        cand_rgb_list.append(torch.as_tensor(rgb_np[v_i[in_roi], u_i[in_roi]], dtype=torch.float32, device=self.device))
                     else:
                         cand_rgb_list.append(torch.full((int(np.sum(in_roi)), 3), 0.5, device=self.device, dtype=torch.float32))
-                    cand_pts_list.append(torch.from_numpy(p_w[in_roi]).to(self.device).float())
+                    cand_pts_list.append(torch.as_tensor(p_w[in_roi], dtype=torch.float32, device=self.device))
 
             cand_xyz = torch.cat(cand_pts_list, dim=0) if len(cand_pts_list) > 0 else torch.empty((0, 3), device=self.device)
             cand_rgb = torch.cat(cand_rgb_list, dim=0) if len(cand_rgb_list) > 0 else torch.empty((0, 3), device=self.device)
@@ -1656,7 +1657,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     c_mask = c_data.get('mask')
                     if c_mask is None:
                         continue
-                    mask_np = c_mask.cpu().numpy() if isinstance(c_mask, torch.Tensor) else np.asarray(c_mask)
+                    mask_np = to_numpy(c_mask)
                     if mask_np.ndim == 3:
                         mask_np = mask_np.squeeze(0)
                     obj_px = (mask_np == oid)
@@ -1666,7 +1667,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     c_d = c_data.get('depth')
                     if c_d is None:
                         continue
-                    d_np = c_d.cpu().numpy() if isinstance(c_d, torch.Tensor) else np.asarray(c_d)
+                    d_np = to_numpy(c_d)
                     if d_np.ndim == 3:
                         d_np = d_np.squeeze(0)
                     d_vals = d_np[obj_px]
@@ -1687,15 +1688,15 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                     c_rgb_raw = c_data.get('rgb')
                     if c_rgb_raw is not None:
-                        rgb_np = c_rgb_raw.cpu().numpy() if isinstance(c_rgb_raw, torch.Tensor) else np.asarray(c_rgb_raw)
+                        rgb_np = to_numpy(c_rgb_raw)
                         if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
                             rgb_np = np.transpose(rgb_np, (1, 2, 0))
                         if rgb_np.max() > 1.0:
                             rgb_np = rgb_np / 255.0
-                        obs_rgb_list.append(torch.from_numpy(rgb_np[v_idx, u_idx]).to(self.device).float())
+                        obs_rgb_list.append(torch.as_tensor(rgb_np[v_idx, u_idx], dtype=torch.float32, device=self.device))
                     else:
                         obs_rgb_list.append(torch.full((len(p_w), 3), 0.5, device=self.device, dtype=torch.float32))
-                    obs_xyz_list.append(torch.from_numpy(p_w).to(self.device).float())
+                    obs_xyz_list.append(torch.as_tensor(p_w, dtype=torch.float32, device=self.device))
 
                 if len(obs_xyz_list) > 0:
                     tgt_xyz = torch.cat(obs_xyz_list, dim=0)

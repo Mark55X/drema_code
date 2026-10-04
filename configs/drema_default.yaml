@@ -48,6 +48,14 @@ perception:
     workspace_margin: 0.05           # Lateral safety expansion margin for workspace TSDF bounds in meters
     table_thickness: 0.05            # Estimated vertical thickness below tabletop surface in meters
     table_bounds_fallback: [-0.50, 1.10, -0.55, 0.55] # Fallback horizontal table bounds [xmin, xmax, ymin, ymax]
+    # Semantic keyword filters for CoppeliaSim object classification
+    robot_keywords: ["panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"]
+    background_keywords: [
+      "workspace", "table", "floor", "wall", "ceiling", "pillar",
+      "sensor", "success", "camera", "head", "waypoint", "detector",
+      "target", "goal", "marker", "dummy"
+    ]
+    virtual_keywords: ["target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"]
 
   # Online Raycast Pruning & VDC Mapping
   mapping:
