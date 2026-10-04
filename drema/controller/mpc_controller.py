@@ -180,9 +180,13 @@ class MPCController:
         lim_warns = diag.get('joint_limit_warnings', [])
         lim_str = f" | lim_warn: {','.join(lim_warns)}" if lim_warns else ""
         ik_str = "" if diag.get('q_des_available', True) else " | IK: FAIL"
+        top_cand = diag.get('top_candidate', '')
+        top_w = diag.get('top_weight', 0.0)
+        prim_w = diag.get('primitive_weight_sum', 0.0)
+        mode_str = f" | top: {top_cand} ({top_w*100:.0f}%, prims: {prim_w*100:.0f}%)" if top_cand else ""
 
         status_msg = (
-            f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f} | "
+            f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f}{mode_str} | "
             f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{lim_str}{ik_str}"
         )
 

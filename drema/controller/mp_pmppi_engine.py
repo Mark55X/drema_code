@@ -499,12 +499,39 @@ class MPPMPPIEngine:
 
         calc_time_ms = (time.time() - t0) * 1000.0
 
+        # Diagnostics: dominant planner, winning candidate and primitive weight ratio
+        dom_planner = 'sensitive' if self.mixing_weights.get('sensitive', 0.0) > self.mixing_weights.get('greedy', 0.0) else 'greedy'
+        dom_topk = topk_indices[dom_planner]
+        dom_w = w_soft[dom_planner]
+
+        best_cand_idx = int(dom_topk[0])
+        best_cand_weight = float(dom_w[0])
+
+        num_stoch = 3 * self.M
+        prim_weight_sum = float(np.sum([dom_w[j] for j, idx in enumerate(dom_topk) if idx >= num_stoch]))
+
+        prim_names = getattr(self.primitive_lib, 'last_primitive_names', [])
+        if best_cand_idx < self.M:
+            cand_desc = "stoch_grd"
+        elif best_cand_idx < 2 * self.M:
+            cand_desc = "stoch_sns"
+        elif best_cand_idx < 3 * self.M:
+            cand_desc = "stoch_mix"
+        else:
+            p_i = best_cand_idx - num_stoch
+            p_name = prim_names[p_i] if 0 <= p_i < len(prim_names) else f"#{p_i}"
+            cand_desc = f"prim:{p_name}"
+
         diagnostics = {
             'calc_time_ms': calc_time_ms,
             'weights': self.mixing_weights.copy(),
             'judge_values': V_n.copy(),
             'best_greedy_idx': int(topk_indices['greedy'][0]),
             'best_sensitive_idx': int(topk_indices['sensitive'][0]),
+            'top_candidate': cand_desc,
+            'top_weight': best_cand_weight,
+            'primitive_weight_sum': prim_weight_sum,
+            'dominant_planner': dom_planner,
             'total_candidates': total_K,
             'q_des_available': (q_des_t is not None),
             'joint_limit_warnings': joint_limit_warnings

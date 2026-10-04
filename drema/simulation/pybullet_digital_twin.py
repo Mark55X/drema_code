@@ -509,7 +509,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 "residualThreshold": 1e-3
             }
             if target_quat is not None:
-                kwargs["targetOrientation"] = [float(x) for x in target_quat]
+                tq = np.asarray(target_quat)
+                if tq.shape == (3, 3):
+                    from scipy.spatial.transform import Rotation
+                    quat = Rotation.from_matrix(tq).as_quat()
+                    kwargs["targetOrientation"] = [float(x) for x in quat]
+                elif len(tq.flatten()) == 4:
+                    kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 
             pb_ik = p.calculateInverseKinematics(
                 self.robot_id,

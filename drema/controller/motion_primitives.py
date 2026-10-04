@@ -35,6 +35,7 @@ class MotionPrimitiveLibrary:
         self.H = horizon
         self.dt = dt
         self.max_acc = max_joint_acc
+        self.last_primitive_names: List[str] = []
 
     def generate_primitives(
         self,
@@ -56,6 +57,7 @@ class MotionPrimitiveLibrary:
         :return: Array of shape [N_p, H, 7] containing joint acceleration control sequences.
         """
         primitives: List[np.ndarray] = []
+        primitive_names: List[str] = []
 
         ee_pos, ee_rot = self.kin.forward_kinematics_ee(q_current)
         z_ee = ee_rot[:, 2]  # Gripper approach vector (local Z)
@@ -73,11 +75,13 @@ class MotionPrimitiveLibrary:
                 v_cart_des = unit_dir * min(0.15, dist_to_goal / (self.H * self.dt))
                 u_approach = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_des)
                 primitives.append(u_approach)
+                primitive_names.append("appr_slow")
 
                 # Accelerated approach variant (higher speed)
                 v_cart_fast = unit_dir * min(0.30, dist_to_goal / (self.H * self.dt * 0.5))
                 u_fast = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_fast)
                 primitives.append(u_fast)
+                primitive_names.append("appr_fast")
 
         # ---------------------------------------------------------------------
         # 2. Vertical Insertion & Retraction (Bottleneck & Peg-in-Hole)
@@ -85,10 +89,12 @@ class MotionPrimitiveLibrary:
         # Primitive: Vertical descent (-Z_world or +Z_ee)
         v_descend = np.array([0.0, 0.0, -0.08], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_descend))
+        primitive_names.append("descend_z")
 
         # Primitive: Vertical retract (+Z_world) to safely disengage
         v_lift = np.array([0.0, 0.0, 0.10], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_lift))
+        primitive_names.append("lift_z")
 
         # ---------------------------------------------------------------------
         # 3. Lateral, Upward & Reactive Obstacle Evasion Primitives (Bypass Obstacles)
@@ -96,13 +102,16 @@ class MotionPrimitiveLibrary:
         # Sidestep Left (+Y world)
         v_left = np.array([0.0, 0.12, 0.0], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_left))
+        primitive_names.append("side_left")
 
         # Sidestep Right (-Y world)
         v_right = np.array([0.0, -0.12, 0.0], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_right))
+        primitive_names.append("side_right")
 
         # Parabolic Upward Sweep (Arc: +Z upward while advancing forward)
         primitives.append(self._create_parabolic_arc(q_current, qd_current, forward_speed=0.08, arc_height=0.12))
+        primitive_names.append("upward_arc")
 
         # Reactive Obstacle Evasion Primitive:
         # Generates a repulsive velocity vector directed away from closest dynamic obstacle
@@ -114,9 +123,11 @@ class MotionPrimitiveLibrary:
                 if 0.01 < dist_obs < 0.40:
                     v_evade = (vec_away / dist_obs) * 0.15 # 15 cm/s evasive retreat
                     primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_evade))
+                    primitive_names.append("evade_obs")
                     # Also an upward bypass arc over the obstacle
                     v_over = (vec_away / dist_obs) * 0.08 + np.array([0.0, 0.0, 0.12], dtype=np.float32)
                     primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_over))
+                    primitive_names.append("evade_over")
                     break
 
         # ---------------------------------------------------------------------
@@ -124,11 +135,15 @@ class MotionPrimitiveLibrary:
         # ---------------------------------------------------------------------
         w_screw = z_ee * 0.5  # 0.5 rad/s pure rotation around tool axis
         primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3), w_angular=w_screw))
+        primitive_names.append("screw_tool")
 
         # ---------------------------------------------------------------------
         # 5. Deceleration / Brake Primitive (Safe Stop / Hold)
         # ---------------------------------------------------------------------
         primitives.append(self._create_braking_primitive(qd_current))
+        primitive_names.append("brake_hold")
+
+        self.last_primitive_names = primitive_names
 
         # Stack into numpy array: [N_p, H, 7]
         U_p = np.array(primitives, dtype=np.float32)
