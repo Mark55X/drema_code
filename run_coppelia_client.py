@@ -502,15 +502,16 @@ class CoppeliaSimulationClient:
                 is_cam_step = (self.step_counter % self.cam_decimation == 0)
                 if is_cam_step and self.server_connected and self.initial_scan_done:
                     cam_data = self.capture_camera_data()
-                    blocking_send = (self.sync_mode == "stepped")
-                    self.client.push_frame_observation(
-                        timestep=self.step_counter,
-                        camera_dict=cam_data,
-                        blocking=blocking_send,
-                        robot_base_pos=robot_base_pos,
-                        reachability_radius=self.reachability_radius,
-                        joint_positions=q
-                    )
+                    if cam_data:
+                        blocking_send = (self.sync_mode == "stepped")
+                        self.client.push_frame_observation(
+                            timestep=self.step_counter,
+                            camera_dict=cam_data,
+                            blocking=blocking_send,
+                            robot_base_pos=robot_base_pos,
+                            reachability_radius=self.reachability_radius,
+                            joint_positions=q
+                        )
 
                 # 2. Read Robot State & Scene Target (if defined in task)
                 try:

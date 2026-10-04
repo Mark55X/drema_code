@@ -561,6 +561,11 @@ class DremaDynamicSystem:
                     'mask': mask
                 }
 
+            # If observation contains no camera frames, sleep target period and avoid busy-waiting loop
+            if len(camera_views) == 0:
+                time.sleep(target_period)
+                continue
+
             # Delegate to modular perception backend
             res: StreamingUpdateResult = self.perception.update_streaming_frame(
                 timestep=timestep,
