@@ -135,3 +135,4 @@ controller:
   max_joint_acc: 0.50                # Joint acceleration saturation limit (rad/s^2)
   num_samples_per_planner: 24        # Stochastic samples per MPPI strategy
   top_k: 12                          # Top candidates evaluated by the Judge
+  log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)

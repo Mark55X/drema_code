@@ -82,6 +82,7 @@ class DremaDynamicSystem:
         reachability_radius: Optional[float] = None,
         voxel_size: Optional[float] = None,
         device: Optional[str] = None,
+        log_interval_actions: Optional[int] = None,
         **kwargs
     ):
         if config is None:
@@ -105,6 +106,8 @@ class DremaDynamicSystem:
             config.set_nested("perception.voxel_size", voxel_size)
         if device is not None:
             config.set_nested("system.device", device)
+        if log_interval_actions is not None:
+            config.set_nested("controller.log_interval_actions", log_interval_actions)
 
         self.config = config
         self.port = int(config.get_nested("system.grpc_port", 50051))
@@ -194,6 +197,7 @@ class DremaDynamicSystem:
 
         # 2. Initialize Controller with Digital Twin reference
         ctrl_cfg = config.get_nested("controller", {})
+        self.log_interval_actions = int(ctrl_cfg.get("log_interval_actions", 10))
         self.mpc_controller = MPCController(
             digital_twin=self.digital_twin,
             num_joints=7,
@@ -204,7 +208,7 @@ class DremaDynamicSystem:
             top_k=int(ctrl_cfg.get("top_k", 12)),
             max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 0.50))
         )
-        print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized.")
+        print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 
         # 3. Initialize Modular Perception Backend
         perc_mod_name = str(config.get_nested("perception.module", "vg_mapping_recurgs")).lower()
@@ -654,8 +658,8 @@ class DremaDynamicSystem:
             target_goal=target_goal
         )
 
-        if self.total_actions_served % 100 == 0:
-            print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d}] Timestep {robot_state.timestep:04d} -> MPC: {action.status_message}")
+        if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
+            print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
 
         return action
 
@@ -799,6 +803,8 @@ def parse_args():
                         help="Disable photometric SGD optimization (pure feedforward)")
     parser.add_argument("--sgd_steps", type=int, default=None,
                         help="Number of photometric SGD optimization steps per frame (default: 5 if enabled, 0 if disabled)")
+    parser.add_argument("--log_interval_actions", type=int, default=None,
+                        help="Telemetry print interval for served control actions (overrides config)")
 
     return parser.parse_args()
 
@@ -856,6 +862,8 @@ if __name__ == "__main__":
         cfg.set_nested("perception.sgd.enabled", args.enable_sgd)
     if args.sgd_steps is not None:
         cfg.set_nested("perception.sgd.steps", args.sgd_steps)
+    if args.log_interval_actions is not None:
+        cfg.set_nested("controller.log_interval_actions", args.log_interval_actions)
 
     # 3. Instantiate and run orchestrator system
     system = DremaDynamicSystem(config=cfg)

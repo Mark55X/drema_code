@@ -58,7 +58,8 @@ class CoppeliaSimulationClient:
         ping_timeout: float = 1.5,
         ping_max_retries: int = 3,
         force_scan: bool = False,
-        cam_resolution: Tuple[int, int] = (256, 256)
+        cam_resolution: Tuple[int, int] = (256, 256),
+        log_interval_actions: int = 10
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -75,6 +76,7 @@ class CoppeliaSimulationClient:
         self.ping_max_retries = int(ping_max_retries)
         self.force_scan = bool(force_scan)
         self.cam_resolution = tuple(cam_resolution)
+        self.log_interval_actions = max(0, int(log_interval_actions))
 
         self.cam_period = 1.0 / max(1.0, cam_fps)
         self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
@@ -84,6 +86,7 @@ class CoppeliaSimulationClient:
         self.task_active = False
         self.running = True
         self.step_counter = 0
+        self.active_actions_count = 0
         self._reset_requested = False
         self.server_connected = False
         self.initial_scan_done = False
@@ -360,23 +363,25 @@ class CoppeliaSimulationClient:
 
                 if cmd in ['start', 'run']:
                     self.task_active = True
-                    print(f"\n[CLI] >>> TASK STARTED! Robot closed-loop control engaged (f_ctrl={self.ctrl_fps}Hz).\n")
+                    print(f"\n[COPPELIA ENVIRONMENT] >>> TASK STARTED! Robot closed-loop control engaged (f_ctrl={self.ctrl_fps}Hz).\n")
+                    if not self.server_connected:
+                        print("[COPPELIA ENVIRONMENT] [Notice] Waiting for DREMA suite connection before actuating robot...\n")
                 elif cmd in ['scan', 's']:
-                    print("\n[CLI] >>> Initiating initial scene scan...")
+                    print("\n[COPPELIA ENVIRONMENT] >>> Initiating initial scene scan...")
                     self.perform_initial_scan(num_steps=self.scan_steps)
                 elif cmd in ['stop', 'pause', 'halt']:
                     self.task_active = False
-                    print("\n[CLI] >>> TASK PAUSED! Robot holding position (streaming continues).\n")
+                    print("\n[COPPELIA ENVIRONMENT] >>> TASK PAUSED! Robot holding position (streaming continues).\n")
                 elif cmd in ['reset', 'r']:
                     self.task_active = False
                     self._reset_requested = True
-                    print("\n[CLI] >>> Reset requested. Will reset cleanly on next simulation tick.\n")
+                    print("\n[COPPELIA ENVIRONMENT] >>> Reset requested. Will reset cleanly on next simulation tick.\n")
                 elif cmd in ['quit', 'exit', 'q']:
-                    print("\n[CLI] >>> Quitting simulation...")
+                    print("\n[COPPELIA ENVIRONMENT] >>> Quitting simulation...")
                     self.running = False
                     break
                 else:
-                    print(f"[CLI] Unknown command '{cmd}'. Type 'start', 'stop', 'reset', or 'quit'.")
+                    print(f"[COPPELIA ENVIRONMENT] Unknown command '{cmd}'. Type 'start', 'stop', 'reset', or 'quit'.")
             except Exception:
                 break
 
@@ -455,6 +460,7 @@ class CoppeliaSimulationClient:
                     self._reset_requested = False
                     self.task_active = False
                     self.step_counter = 0
+                    self.active_actions_count = 0
                     self.initial_scan_done = False
                     if self.server_connected:
                         try:
@@ -462,10 +468,10 @@ class CoppeliaSimulationClient:
                         except Exception:
                             pass
                     descriptions, self.current_obs = self.task.reset()
-                    print("\n[CLI] >>> EPISODE RESET COMPLETE! Re-scanning initial scene...\n")
+                    print("\n[COPPELIA ENVIRONMENT] >>> EPISODE RESET COMPLETE! Re-scanning initial scene...\n")
                     if self.server_connected:
                         self.perform_initial_scan(num_steps=self.scan_steps)
-                    print("\n[CLI] >>> Ready. Press 'start' to resume dynamic task.\n")
+                    print("\n[COPPELIA ENVIRONMENT] >>> Ready. Press 'start' to resume dynamic task.\n")
                     continue
 
                 # Periodic non-blocking connection check to DREMA suite
@@ -551,6 +557,14 @@ class CoppeliaSimulationClient:
                         arm.set_joint_target_velocities(action.joint_velocities)
                     else:
                         arm.set_joint_target_velocities([0.0] * len(q))
+
+                    self.active_actions_count += 1
+                    if self.active_actions_count <= 3 or (self.log_interval_actions > 0 and self.active_actions_count % self.log_interval_actions == 0):
+                        v_max = max(abs(v) for v in action.joint_velocities) if action.joint_velocities else 0.0
+                        print(
+                            f"[COPPELIA ENVIRONMENT] Step #{self.step_counter:04d} (Act #{self.active_actions_count:04d}) | "
+                            f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s | Status: '{action.status_message}'"
+                        )
                 else:
                     # Hold position: zero target velocities
                     arm.set_joint_target_velocities([0.0] * len(q))
@@ -611,6 +625,8 @@ def parse_args():
     parser.add_argument("--force_scan", action="store_true", default=False, help="Force orbital scan even if DREMA server has cached scene ready")
     parser.add_argument("--cam_resolution", type=int, nargs=2, default=[256, 256], metavar=("WIDTH", "HEIGHT"),
                         help="Streaming camera resolution [width, height] (default: 256 256)")
+    parser.add_argument("--log_interval_actions", type=int, default=10,
+                        help="Print control action telemetry every N steps (default: 10)")
     return parser.parse_args()
 
 
@@ -631,6 +647,7 @@ if __name__ == "__main__":
         ping_timeout=args.ping_timeout,
         ping_max_retries=args.ping_retries,
         force_scan=args.force_scan,
-        cam_resolution=args.cam_resolution
+        cam_resolution=args.cam_resolution,
+        log_interval_actions=args.log_interval_actions
     )
     client.run()
