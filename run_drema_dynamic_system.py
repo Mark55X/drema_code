@@ -567,11 +567,13 @@ class DremaDynamicSystem:
                 continue
 
             # Delegate to modular perception backend
+            obs_ts = float(obs.timestamp) if hasattr(obs, 'timestamp') and obs.timestamp > 0 else None
             res: StreamingUpdateResult = self.perception.update_streaming_frame(
                 timestep=timestep,
                 camera_views=camera_views,
                 robot_state={'base_pos': self.robot_base_pos, 'joints': self.robot_joint_positions},
-                digital_twin=self.digital_twin
+                digital_twin=self.digital_twin,
+                timestamp=obs_ts
             )
 
             # Update Viser mesh poses
@@ -589,6 +591,20 @@ class DremaDynamicSystem:
 
             if self.total_frames_processed % 10 == 0:
                 print(f"[DREMA DYNAMIC SYSTEM] [Dynamic Inference #{timestep:04d}] Active Gaussians: {res.active_gaussians_count:,} | Loop Latency: {res.latency_ms:.1f}ms | Tracked Objects: {len(res.tracked_object_poses)}")
+                if hasattr(self.digital_twin, 'predictor') and self.digital_twin.predictor is not None:
+                    preds = self.digital_twin.predictor.predict_all(horizon=15, dt=0.05)
+                    for oid in res.tracked_object_poses.keys():
+                        st = self.digital_twin.predictor.get_estimated_state(oid)
+                        if st is not None:
+                            name_o = self.perception.tracked_objects.get(oid, {}).get('name', f"Obj #{oid}")
+                            vel = st['velocity']
+                            speed = float(np.linalg.norm(vel))
+                            pos = st['position']
+                            pred_str = ""
+                            if oid in preds and len(preds[oid].positions) > 0:
+                                p_fut = preds[oid].positions[-1]
+                                pred_str = f" -> Pred(+0.75s): [{p_fut[0]:.3f}, {p_fut[1]:.3f}, {p_fut[2]:.3f}]"
+                            print(f"  └─ [PREDICTOR] {name_o} (ID {oid}): Pos: [{pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f}] | Vel: [{vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f}]m/s (|v|={speed:.3f}m/s){pred_str}")
 
             self.frame_queue.task_done()
 

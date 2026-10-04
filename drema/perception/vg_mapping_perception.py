@@ -1514,7 +1514,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         timestep: int,
         camera_views: Dict[str, Dict[str, Any]],
         robot_state: Optional[Dict[str, Any]] = None,
-        digital_twin: Optional[Any] = None
+        digital_twin: Optional[Any] = None,
+        timestamp: Optional[float] = None
     ) -> StreamingUpdateResult:
         """Processes incoming multi-camera streaming frames and updates dynamic 3DGS & tracking."""
         t0 = time.perf_counter()
@@ -1842,7 +1843,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     tracked_deltas[oid] = delta_p
 
                     if digital_twin is not None:
-                        digital_twin.sync_object_pose(oid, new_pos, quat)
+                        digital_twin.sync_object_pose(oid, new_pos, quat, timestamp=timestamp)
 
                     self.tracked_objects[oid]['last_pos'] = new_pos
                     self.tracked_objects[oid]['last_quat'] = quat
@@ -1890,7 +1891,18 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     # Object-Centric tracking verification
                     active_on_obj = len(self.tracked_objects[oid].get('gaussians', {}).get('xyz', []))
                     stray_in_static = int((self.scene_gaussians['obj_id'] == oid).sum().item()) if 'obj_id' in self.scene_gaussians else 0
-                    print(f"  │    └─ Obj #{oid} ('{name_o}') Object-Centric Model: {active_on_obj:,} Gaussians on body (Rigid SE(3)) | {stray_in_static} stray in static background (CLEAN)")
+                    print(f"  │    ├─ Obj #{oid} ('{name_o}') Object-Centric Model: {active_on_obj:,} Gaussians on body (Rigid SE(3)) | {stray_in_static} stray in static background (CLEAN)")
+                    if digital_twin is not None and hasattr(digital_twin, 'predictor') and digital_twin.predictor is not None:
+                        st = digital_twin.predictor.get_estimated_state(oid)
+                        if st is not None:
+                            vel = st['velocity']
+                            speed = float(np.linalg.norm(vel))
+                            preds = digital_twin.predictor.predict_obstacle_trajectory(oid, horizon=15, dt=0.05)
+                            pred_str = ""
+                            if preds is not None and len(preds.positions) > 0:
+                                p_fut = preds.positions[-1]
+                                pred_str = f" -> Forecast(+0.75s): [{p_fut[0]:.3f}, {p_fut[1]:.3f}, {p_fut[2]:.3f}]"
+                            print(f"  │    └─ [Kalman Predictor]: v=[{vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f}]m/s (|v|={speed:.3f}m/s){pred_str}")
             else:
                 print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
