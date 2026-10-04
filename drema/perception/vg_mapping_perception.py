@@ -359,7 +359,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.se3_subsample = int(tr_cfg.get("subsample", 256))
         self.se3_lr = float(tr_cfg.get("learning_rate", 0.003))
         self.se3_tol = float(tr_cfg.get("tolerance", 0.0001))
-        self.proximity_radius = float(tr_cfg.get("proximity_search_radius", 0.25))
 
         # Mapping & Raycast Pruning configuration
         map_cfg = config.get_nested("perception.mapping", {})
@@ -2180,33 +2179,6 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             print(f"[VGMapping Perception Cache Error] Failed to restore cache from '{cache_dir}': {e}. Falling back to live scan.")
             return None
 
-    def get_viser_surface_voxels(self) -> Optional[Dict[str, np.ndarray]]:
-        """Extracts discrete TSDF surface voxels for Viser visualization."""
-        if self.vg_pipeline is None or self.vg_pipeline.tsdf_map is None:
-            return None
-        try:
-            with torch.no_grad():
-                tsdf_map = self.vg_pipeline.tsdf_map
-                surf_mask = (tsdf_map.W > 0.5) & (tsdf_map.F.abs() < (2.0 * self.voxel_size))
-                if surf_mask.any():
-                    surf_pts = tsdf_map.voxel_centers[surf_mask].detach().cpu().numpy()
-                    surf_colors = np.zeros_like(surf_pts)
-                    surf_colors[:, 0] = 0.05
-                    surf_colors[:, 1] = 0.85
-                    surf_colors[:, 2] = 0.95
-                    if len(surf_pts) > 40000:
-                        sub_idx = np.random.choice(len(surf_pts), 40000, replace=False)
-                        surf_pts = surf_pts[sub_idx]
-                        surf_colors = surf_colors[sub_idx]
-                    return {
-                        'points': surf_pts,
-                        'colors': surf_colors,
-                        'point_size': self.voxel_size * 0.7
-                    }
-        except Exception:
-            pass
-        return None
-
     def reset(self) -> None:
         """Resets dynamic perception state for a new episode."""
         self.scene_gaussians = {
@@ -2215,7 +2187,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             'scale': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'normal': torch.empty((0, 3), dtype=torch.float32, device=self.device),
             'morton': torch.empty((0,), dtype=torch.int64, device=self.device),
-            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device)
+            'obj_id': torch.empty((0,), dtype=torch.int32, device=self.device),
+            'opacity': torch.empty((0, 1), dtype=torch.float32, device=self.device)
         }
         self.tracked_objects.clear()
         self.discovered_obstacles.clear()

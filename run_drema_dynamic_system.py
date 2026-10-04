@@ -363,38 +363,12 @@ class DremaDynamicSystem:
             if 'gaussians' in self.viser_handles and self.viser_handles['gaussians'] is not None:
                 self.viser_handles['gaussians'].visible = self.cb_gaussians.value
 
-        self.cb_voxels = self.viser_server.gui.add_checkbox("Show TSDF Surface Voxels", initial_value=True)
-        @self.cb_voxels.on_update
-        def _(_):
-            if 'surface_voxels' in self.viser_handles and self.viser_handles['surface_voxels'] is not None:
-                self.viser_handles['surface_voxels'].visible = self.cb_voxels.value
-
         self.cb_meshes = self.viser_server.gui.add_checkbox("Show Obstacle Meshes", initial_value=True)
         @self.cb_meshes.on_update
         def _(_):
             for k, handle in self.viser_handles.items():
                 if k.startswith("mesh_") and handle is not None:
                     handle.visible = self.cb_meshes.value
-
-    def _update_viser_surface_voxels(self):
-        """Extracts and displays discrete TSDF surface voxels in Viser 3D Web Visualizer."""
-        if self.viser_server is None:
-            return
-        vox_data = self.perception.get_viser_surface_voxels()
-        if vox_data is not None:
-            try:
-                handle = self.viser_server.scene.add_point_cloud(
-                    name="/voxel_grid/surface_voxels",
-                    points=vox_data['points'],
-                    colors=vox_data['colors'],
-                    point_size=vox_data['point_size'],
-                    point_shape="square"
-                )
-                if hasattr(self, 'cb_voxels') and self.cb_voxels is not None:
-                    handle.visible = self.cb_voxels.value
-                self.viser_handles['surface_voxels'] = handle
-            except Exception:
-                pass
 
     def on_reset_episode(self, reset_req: drema_comm_pb2.ResetRequest) -> bool:
         """gRPC callback triggered when an episode resets."""
@@ -426,7 +400,6 @@ class DremaDynamicSystem:
 
             # Initialize Viser Voxel Grid
             self._init_viser_voxel_grid(grid_origin=res.grid_origin, grid_dim=res.grid_dim)
-            self._update_viser_surface_voxels()
 
             # Add discovered obstacle meshes to Viser
             for obs in res.discovered_obstacles:
@@ -598,10 +571,9 @@ class DremaDynamicSystem:
 
             self.total_frames_processed += 1
 
-            # Periodically refresh Viser 3D Gaussians and TSDF surface voxels
+            # Periodically refresh Viser 3D Gaussians
             if self.total_frames_processed % viser_decimation == 0:
                 self._update_viser_gaussians()
-                self._update_viser_surface_voxels()
 
             if self.total_frames_processed % 10 == 0:
                 print(f"[DREMA DYNAMIC SYSTEM] [Dynamic Inference #{timestep:04d}] Active Gaussians: {res.active_gaussians_count:,} | Loop Latency: {res.latency_ms:.1f}ms | Tracked Objects: {len(res.tracked_object_poses)}")
