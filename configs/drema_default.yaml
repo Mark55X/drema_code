@@ -52,9 +52,9 @@ perception:
   # Online Raycast Pruning & VDC Mapping
   mapping:
     closed_loop_avd: true            # Enable closed-loop 3DGS rendering + AVD variation detection (paper Section III-B)
-    raycast_stride: 1                # Pixel stride for raycast pruning (1 = full res dense, 2 = 2x subsampled)
+    raycast_stride: 2                # Pixel stride for raycast pruning (2 = 2x subsampled, ~4x faster pruning)
     raycast_steps: null              # Raycast depth sampling steps (null = automatic sub-voxel resolution)
-    tau_s: 0.6                       # SSIM appearance variation detection threshold (paper Section III-B.1: tau_s = 0.6)
+    tau_s: 0.35                      # SSIM appearance variation detection threshold (0.35 robust to real-time render noise)
     tau_p: 0.2                       # Pruning TSDF surface threshold (paper Section III-B.2: tau_p = 0.2)
     tau_w: 1.0                       # Geometry variation weight threshold (voxels with W <= tau_w trigger GVD)
     max_weight: 10.0                 # Max TSDF weight clamp (allows stable accumulation W > tau_w to prevent static churn)
@@ -85,8 +85,8 @@ perception:
 
   # RecurGS SE(3) Rigid Object Tracking (Calibrate for GPU balance with MuJoCo controller)
   tracking:
-    se3_iterations: 15               # Lie algebra gradient optimization iterations per frame
-    se3_icp_iterations: 12           # Coarse ICP alignment iterations
+    se3_iterations: 12               # Lie algebra gradient optimization iterations per frame
+    se3_icp_iterations: 8            # Coarse ICP alignment iterations
     subsample: 256                   # Subsampled points per object (increase to 512/1024 for higher accuracy)
     learning_rate: 0.003             # Step size in se(3) tangent space
     tolerance: 0.0001                # Convergence criterion
