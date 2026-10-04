@@ -214,21 +214,11 @@ class MPPMPPIEngine:
         # ---------------------------------------------------------------------
         q_des_t = None
         if target_pos is not None:
-            # Primary IK query: PyBullet native C++ IK
-            if has_robot and PYBULLET_AVAILABLE:
-                try:
-                    ik_target = [float(target_pos[0]), float(target_pos[1]), float(target_pos[2])]
-                    pb_ik = p.calculateInverseKinematics(
-                        digital_twin.robot_id,
-                        7, # Franka end-effector link index
-                        ik_target,
-                        maxNumIterations=20,
-                        residualThreshold=1e-3
-                    )
-                    q_des_t = np.array(pb_ik[:7], dtype=np.float32)
+            # Primary IK query: Digital Twin backend IK (PyBullet, MuJoCo, etc.)
+            if digital_twin is not None and hasattr(digital_twin, 'calculate_inverse_kinematics'):
+                q_des_t = digital_twin.calculate_inverse_kinematics(target_pos, target_rot)
+                if q_des_t is not None:
                     self.last_ik_solution = q_des_t.copy()
-                except Exception:
-                    q_des_t = None
 
             # Fallback IK query: Analytical DLS IK
             if q_des_t is None:
@@ -237,6 +227,7 @@ class MPPMPPIEngine:
                 if success:
                     q_des_t = q_dls
                     self.last_ik_solution = q_des_t.copy()
+
 
         # Diagnostics: Check joint limits and IK status (instantaneous <0.001ms)
         near_min = q_curr < (self.kin.Q_MIN + 0.05)
@@ -271,14 +262,17 @@ class MPPMPPIEngine:
 
         # 2c. Motion Primitives Library U_p (Mathisen et al. 2026)
         obs_list = []
-        if has_robot and PYBULLET_AVAILABLE and hasattr(digital_twin, 'tracked_objects'):
-            for obj in digital_twin.tracked_objects.values():
-                if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0:
-                    try:
-                        pos, _ = p.getBasePositionAndOrientation(obj['body_id'])
-                        obs_list.append({'position': pos})
-                    except Exception:
-                        pass
+        if digital_twin is not None:
+            if hasattr(digital_twin, 'get_tracked_obstacles_info'):
+                obs_info_list = digital_twin.get_tracked_obstacles_info()
+                for obs in obs_info_list:
+                    if not obs.get('is_target', False):
+                        obs_list.append({'position': obs['position']})
+            elif hasattr(digital_twin, 'tracked_objects'):
+                for obj in digital_twin.tracked_objects.values():
+                    if not obj.get('is_target', False) and 'target_pos' in obj:
+                        obs_list.append({'position': tuple(obj['target_pos'])})
+
 
         U_p = self.primitive_lib.generate_primitives(
             q_current=q_curr,
@@ -525,171 +519,25 @@ class MPPMPPIEngine:
         digital_twin: Optional[Any]
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Evaluates exact mesh-level collision distance and GVM-SDF modulation.
-
-        Mathematical Foundations:
-        -------------------------
-        1. SDF Workspace Potential Function Phi(d) - Zhou et al. (IEEE T-RO 2025), Eq. (21):
-           Phi(d) = 1.0                              if d < sigma_1
-                    exp(-kappa * (d - sigma_1))      if sigma_1 <= d <= sigma_2
-                    0.0                              otherwise
-           where:
-             - d: Minimum signed distance between the robot link and obstacle surface [m].
-             - sigma_1: Inscribed safety radius / margin (self.sigma_1 = 0.02m).
-             - sigma_2: Inflation boundary radius (self.sigma_2 = 0.15m).
-             - kappa: Descending slope constant of the safety margin (self.kappa = 15.0).
-
-        2. Static Distance Potential Cost Coll_p - Zhou et al., Eq. (25):
-           Coll_p(x_{i,h}) = sum_{k=1}^L Phi(pt_k^*)
-           Used by the Greedy strategy (pi_greedy) and Judge (pi*).
-
-        3. Gradient-Velocity Modulated SDF Cost Coll_{ppv_theta} - Zhou et al., Eq. (10) & (25):
-           Coll_{ppv_theta}(x_{i,h}) = sum_{k=1}^L [ Phi(pt_k^*) + Phi(pt_k^*) * ||Vel(pt_k^*)|| * (1 - rho * cos(theta)) ]
-           where:
-             - Vel(pt_k^*): Cartesian velocity of the robot link control point, computed via
-               geometric Jacobian: Vel = J_v(q) * q_dot (Zhou et al., Eq. 24).
-             - rho: Modulation scaling factor in [0, 1] (self.rho = 0.8).
-             - theta: Angle between link velocity Vel and the obstacle escape gradient nabla Phi:
-               cos(theta) = (nabla Phi * Vel) / (||nabla Phi|| * ||Vel||) (Zhou et al., Eq. 11).
-               * If moving away from obstacle (theta < pi/2 => cos(theta) > 0): cost decreases!
-               * If moving towards obstacle (theta -> pi => cos(theta) < 0): cost is amplified!
-
-        Analytical Distance Gradient without Voxel Grid:
-        ------------------------------------------------
-        In Zhou et al., nabla Phi was computed via finite differencing on a 3D GPU voxel grid.
-        Here, we leverage PyBullet's exact GJK/EPA contact query: pt[7] ('contactNormalOnB') is
-        the unit normal on the obstacle surface pointing directly towards the robot.
-        This normal is mathematically identical to the normalized escape gradient:
-            nabla Phi / ||nabla Phi|| == contactNormalOnB
-        This provides an exact, continuous spatial gradient directly from 3D meshes without
-        voxelization artifacts or memory overhead.
-
-        IMPORTANT NOTE ON CPU OPTIMIZATION & GPU MIGRATION:
-        ---------------------------------------------------
-        - CPU Mode (Current PyBullet C++):
-          Evaluating all K * H candidate states (e.g. 80 * 15 = 1200 physics queries) sequentially
-          in Python takes ~250 ms. To maintain a real-time 20 Hz control rate (<100 ms), we evaluate
-          PyBullet collision checks at key lookahead waypoints (step_stride = max(1, H // 5), e.g.
-          5 waypoints across the horizon) and interpolate across intermediate steps.
-        - GPU Migration (Future Isaac Gym / PhysX GPU / CuRobo):
-          When moving simulation to GPU where thousands of rollouts execute concurrently on CUDA cores,
-          set `step_stride = 1` to query collisions on all lookahead timesteps simultaneously.
-
-        :param Q: Candidate joint positions of shape [K, H, 7].
-        :param QD: Candidate joint velocities of shape [K, H, 7].
-        :param digital_twin: PyBulletDigitalTwin instance with tracked meshes.
-        :return: (coll_p_costs [K, H], coll_gvm_costs [K, H])
+        Evaluates C_P (SDF potential penalty) and C_GVM-SDF (Gradient-Velocity Modulated
+        collision cost) for all candidate sample rollouts.
+        Delegates computation to the active Digital Twin backend (PyBullet or MuJoCo/MJX).
         """
         K, H, _ = Q.shape
-        coll_p = np.zeros((K, H), dtype=np.float32)
-        coll_gvm = np.zeros((K, H), dtype=np.float32)
+        if digital_twin is None:
+            return np.zeros((K, H), dtype=np.float32), np.zeros((K, H), dtype=np.float32)
 
-        has_robot = digital_twin is not None and getattr(digital_twin, 'robot_id', -1) >= 0
-        if not has_robot or not PYBULLET_AVAILABLE or len(digital_twin.tracked_objects) == 0:
-            return coll_p, coll_gvm
+        if hasattr(digital_twin, 'compute_trajectory_collision_costs'):
+            return digital_twin.compute_trajectory_collision_costs(
+                Q=Q,
+                QD=QD,
+                sigma_1=self.sigma_1,
+                sigma_2=self.sigma_2,
+                kappa=self.kappa,
+                rho=self.rho,
+                kin_helper=self.kin
+            )
 
-        # Extract dynamic obstacle body IDs (ignore target manipulation objects)
-        obstacle_body_ids = [
-            obj['body_id'] for obj in digital_twin.tracked_objects.values()
-            if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0
-        ]
-        if not obstacle_body_ids:
-            return coll_p, coll_gvm
+        return np.zeros((K, H), dtype=np.float32), np.zeros((K, H), dtype=np.float32)
 
-        robot_id = digital_twin.robot_id
 
-        # CPU OPTIMIZATION: Subsample lookahead waypoints to sustain 20 Hz control rate.
-        # On GPU PhysX, change step_stride to 1 to evaluate every lookahead step.
-        step_stride = max(1, H // 5)
-        eval_steps = list(range(0, H, step_stride))
-        if (H - 1) not in eval_steps:
-            eval_steps.append(H - 1)
-
-        for h in eval_steps:
-            for k in range(K):
-                q_step = Q[k, h]
-                qd_step = QD[k, h]
-
-                # Update Franka Panda joint positions in PyBullet for this candidate state
-                num_j = p.getNumJoints(robot_id)
-                arm_j = 0
-                for j_idx in range(num_j):
-                    info = p.getJointInfo(robot_id, j_idx)
-                    # Joints 0..6 in panda.urdf correspond to the 7 arm revolute joints
-                    if info[2] != p.JOINT_FIXED and arm_j < 7:
-                        p.resetJointState(robot_id, j_idx, float(q_step[arm_j]))
-                        arm_j += 1
-
-                # Update broadphase/narrowphase collision pairs (GJK/EPA between exact meshes)
-                p.performCollisionDetection()
-
-                step_coll_p = 0.0
-                step_coll_gvm = 0.0
-
-                for obs_id in obstacle_body_ids:
-                    # Query closest points within the inflation boundary (distance <= sigma_2)
-                    closest_pts = p.getClosestPoints(
-                        bodyA=robot_id,
-                        bodyB=obs_id,
-                        distance=float(self.sigma_2)
-                    )
-                    if not closest_pts:
-                        continue
-
-                    for pt in closest_pts:
-                        # PyBullet API Contact Point Tuple Indices:
-                        # pt[3]: linkIndexA (Index of the robot link closest to the obstacle)
-                        # pt[7]: contactNormalOnB (Vector on obstacle surface pointing towards robot link)
-                        # pt[8]: contactDistance (Signed Euclidean clearance distance in meters; <0 is penetration)
-                        d = pt[8]
-
-                        # 1. SDF Potential Phi(d) (Zhou et al., Eq. 21)
-                        if d < self.sigma_1:
-                            phi = 1.0
-                        elif d <= self.sigma_2:
-                            phi = float(np.exp(-self.kappa * (d - self.sigma_1)))
-                        else:
-                            phi = 0.0
-
-                        # Numerical cutoff for negligible potential
-                        if phi <= 1e-4:
-                            continue
-
-                        step_coll_p += phi
-
-                        # 2. Distance Gradient Vector nabla Phi (from PyBullet contactNormalOnB)
-                        normal_grad = np.array(pt[7], dtype=np.float32) # [nx, ny, nz]
-                        norm_mag = np.linalg.norm(normal_grad)
-                        if norm_mag > 1e-6: # Numerical epsilon to prevent division by zero
-                            normal_grad = normal_grad / norm_mag
-
-                        # 3. Cartesian Velocity of the Closest Link: Vel(pt_k^*) = J_v * qd (Zhou et al., Eq. 24)
-                        link_a = pt[3]
-                        # Map PyBullet Franka link index: 0..6 -> arm links 1..7; >=7 -> flange/hand/fingers
-                        fk_link_idx = -1 if (link_a < 0 or link_a >= 7) else (link_a + 1)
-                        vel_cart = self.kin.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
-                        vel_mag = np.linalg.norm(vel_cart)
-
-                        # 4. Cosine Alignment theta between velocity and escape gradient (Zhou et al., Eq. 11)
-                        if vel_mag > 1e-4: # Numerical epsilon for stationary robot link
-                            cos_theta = float(np.dot(normal_grad, vel_cart) / (norm_mag * vel_mag))
-                        else:
-                            cos_theta = 0.0
-
-                        # 5. GVM-SDF Modulation Term (Zhou et al., Eq. 10 & 25)
-                        # (1 - rho * cos(theta)): decreases when escaping (cos>0), amplifies when approaching (cos<0)
-                        modulation = 1.0 - self.rho * cos_theta
-                        gvm_term = phi * (1.0 + vel_mag * modulation)
-                        step_coll_gvm += gvm_term
-
-                coll_p[k, h] = step_coll_p
-                coll_gvm[k, h] = step_coll_gvm
-
-        # Interpolate across un-evaluated lookahead steps along horizon
-        for h in range(H):
-            if h not in eval_steps:
-                prev_h = max([s for s in eval_steps if s <= h], default=0)
-                coll_p[:, h] = coll_p[:, prev_h]
-                coll_gvm[:, h] = coll_gvm[:, prev_h]
-
-        return coll_p, coll_gvm

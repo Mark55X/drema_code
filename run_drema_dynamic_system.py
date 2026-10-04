@@ -177,8 +177,9 @@ class DremaDynamicSystem:
                 sim_substeps=sim_substeps
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
-        elif twin_engine == "mujoco":
+        elif twin_engine in ["mujoco", "mjx"]:
             mujoco_model_path = config.get_nested("digital_twin.mujoco_model_path", "assets/franka_panda/panda.xml")
+            enable_mjx = bool(config.get_nested("digital_twin.enable_mjx", False)) or (twin_engine == "mjx")
             self.digital_twin: BaseDigitalTwin = MuJoCoDigitalTwin(
                 visualize=twin_gui,
                 table_z=table_z,
@@ -189,9 +190,11 @@ class DremaDynamicSystem:
                 kd_pos=kd_pos,
                 kp_rot=kp_rot,
                 kd_rot=kd_rot,
-                sim_substeps=sim_substeps
+                sim_substeps=sim_substeps,
+                enable_mjx=enable_mjx
             )
-            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo, Tracking: {tracking_mode}) initialized.")
+            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
+
         else:
             raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported digital twin engine: '{twin_engine}' (expected 'pybullet', 'mujoco')")
 
@@ -767,8 +770,15 @@ def parse_args():
 
     # Networking & Visualization Overrides
     parser.add_argument("--port", type=int, default=None, help="gRPC Server port (overrides config)")
+    parser.add_argument("--twin_engine", "--engine", choices=["pybullet", "mujoco", "mjx"], default=None,
+                        help="Digital Twin Physics Engine: 'pybullet' or 'mujoco'/'mjx' (overrides config)")
+    parser.add_argument("--enable_mjx", dest="enable_mjx", action="store_true", default=None,
+                        help="Enable MJX GPU-accelerated parallel rollout bridge for MuJoCo")
+    parser.add_argument("--no_mjx", dest="enable_mjx", action="store_false",
+                        help="Disable MJX GPU acceleration (use C MuJoCo engine)")
     parser.add_argument("--visualize_twin", "--visualize_digital_twin", "--gui", dest="visualize_digital_twin", action="store_true", default=None, help="Open Digital Twin GUI window (PyBullet/MuJoCo)")
     parser.add_argument("--no_twin_gui", "--no_gui", dest="visualize_digital_twin", action="store_false", help="Disable Digital Twin GUI window")
+
     parser.add_argument("--visualize_pybullet", dest="visualize_digital_twin", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--no_pybullet_gui", dest="visualize_digital_twin", action="store_false", help=argparse.SUPPRESS)
     parser.add_argument("--visualize_viser", action="store_true", default=None, help="Launch Viser Web Visualizer")
@@ -818,7 +828,12 @@ if __name__ == "__main__":
     # 2. Apply CLI overrides
     if args.port is not None:
         cfg.set_nested("system.grpc_port", args.port)
+    if args.twin_engine is not None:
+        cfg.set_nested("digital_twin.engine", args.twin_engine)
+    if args.enable_mjx is not None:
+        cfg.set_nested("digital_twin.enable_mjx", args.enable_mjx)
     if args.visualize_digital_twin is not None:
+
         cfg.set_nested("digital_twin.gui", args.visualize_digital_twin)
     if args.visualize_viser is not None:
         cfg.set_nested("system.viser.enabled", args.visualize_viser)

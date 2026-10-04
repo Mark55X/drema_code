@@ -111,7 +111,9 @@ perception:
 # ------------------------------------------------------------------------------
 digital_twin:
   engine: "pybullet"                 # Physics engine backend: "pybullet" or "mujoco"
+  enable_mjx: false                  # Enable MJX GPU-accelerated parallel rollout bridge for MuJoCo
   gui: true                          # Show native physics visualizer window (GLFW for MuJoCo, OpenGL for PyBullet)
+
   time_step: 0.002                   # Physics simulation time step in seconds
   urdf_path: "assets/franka_panda/panda.urdf"               # URDF for PyBullet backend
   mujoco_model_path: "assets/franka_panda/panda.xml"        # MJCF XML for MuJoCo backend

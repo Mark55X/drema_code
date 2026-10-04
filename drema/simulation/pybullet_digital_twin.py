@@ -11,7 +11,8 @@ Agnostic & Dynamic Scene Manager:
 import os
 import sys
 import numpy as np
-from typing import Optional, Tuple, List, Dict, Union
+from typing import Optional, Tuple, List, Dict, Union, Any
+
 
 import pybullet as p
 import pybullet_data
@@ -461,6 +462,183 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             torque = self.kp_rot * rot_error - self.kd_rot * ang_vel
             p.applyExternalTorque(body_id, -1, torque.tolist(), p.WORLD_FRAME)
 
+    def get_tracked_obstacles_info(self) -> List[Dict[str, Any]]:
+        """Retrieves list of tracked dynamic obstacle dictionaries."""
+        obstacles = []
+        if self.client_id < 0 or len(self.tracked_objects) == 0:
+            return obstacles
+
+        for obj_id, obj_data in self.tracked_objects.items():
+            body_id = obj_data.get('body_id', -1)
+            pos = None
+            orn = None
+            if body_id >= 0:
+                try:
+                    p_pos, p_orn = p.getBasePositionAndOrientation(body_id)
+                    pos = tuple(float(x) for x in p_pos)
+                    orn = tuple(float(x) for x in p_orn)
+                except Exception:
+                    pass
+            if pos is None and 'target_pos' in obj_data:
+                pos = tuple(float(x) for x in obj_data['target_pos'])
+                orn = tuple(float(x) for x in obj_data.get('target_quat', (0, 0, 0, 1)))
+
+            if pos is not None:
+                obstacles.append({
+                    'id': obj_id,
+                    'body_id': body_id,
+                    'name': obj_data.get('name', f"obstacle_{obj_id}"),
+                    'position': pos,
+                    'orientation': orn if orn is not None else (0.0, 0.0, 0.0, 1.0),
+                    'is_target': bool(obj_data.get('is_target', False))
+                })
+        return obstacles
+
+    def calculate_inverse_kinematics(
+        self,
+        target_pos: Tuple[float, float, float],
+        target_quat: Optional[Tuple[float, float, float, float]] = None
+    ) -> Optional[np.ndarray]:
+        """Calculates inverse kinematics solution using PyBullet C++ solver."""
+        if self.client_id < 0 or self.robot_id < 0:
+            return None
+        try:
+            ik_target = [float(target_pos[0]), float(target_pos[1]), float(target_pos[2])]
+            kwargs = {
+                "maxNumIterations": 20,
+                "residualThreshold": 1e-3
+            }
+            if target_quat is not None:
+                kwargs["targetOrientation"] = [float(x) for x in target_quat]
+
+            pb_ik = p.calculateInverseKinematics(
+                self.robot_id,
+                7,  # Franka end-effector link index
+                ik_target,
+                **kwargs
+            )
+            return np.array(pb_ik[:7], dtype=np.float32)
+        except Exception:
+            return None
+
+    def compute_trajectory_collision_costs(
+        self,
+        Q: np.ndarray,
+        QD: np.ndarray,
+        sigma_1: float,
+        sigma_2: float,
+        kappa: float,
+        rho: float,
+        kin_helper: Any
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for
+        a batch of candidate trajectories Q (K x H x 7) and QD (K x H x 7) using PyBullet GJK/EPA.
+        """
+        K, H, _ = Q.shape
+        coll_p = np.zeros((K, H), dtype=np.float32)
+        coll_gvm = np.zeros((K, H), dtype=np.float32)
+
+        if self.client_id < 0 or self.robot_id < 0 or len(self.tracked_objects) == 0:
+            return coll_p, coll_gvm
+
+        obstacle_body_ids = [
+            obj['body_id'] for obj in self.tracked_objects.values()
+            if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0
+        ]
+        if not obstacle_body_ids:
+            return coll_p, coll_gvm
+
+        robot_id = self.robot_id
+
+        # Subsample lookahead waypoints to sustain high control frequency
+        step_stride = max(1, H // 5)
+        eval_steps = list(range(0, H, step_stride))
+        if (H - 1) not in eval_steps:
+            eval_steps.append(H - 1)
+
+        num_j = p.getNumJoints(robot_id)
+        # Pre-cache non-fixed arm joint indices
+        arm_joint_indices = []
+        for j_idx in range(num_j):
+            info = p.getJointInfo(robot_id, j_idx)
+            if info[2] != p.JOINT_FIXED and len(arm_joint_indices) < 7:
+                arm_joint_indices.append(j_idx)
+
+        for h in eval_steps:
+            for k in range(K):
+                q_step = Q[k, h]
+                qd_step = QD[k, h]
+
+                # Update Franka Panda joint positions in PyBullet
+                for arm_j, j_idx in enumerate(arm_joint_indices):
+                    p.resetJointState(robot_id, j_idx, float(q_step[arm_j]))
+
+                p.performCollisionDetection()
+
+                step_coll_p = 0.0
+                step_coll_gvm = 0.0
+
+                for obs_id in obstacle_body_ids:
+                    closest_pts = p.getClosestPoints(
+                        bodyA=robot_id,
+                        bodyB=obs_id,
+                        distance=float(sigma_2)
+                    )
+                    if not closest_pts:
+                        continue
+
+                    for pt in closest_pts:
+                        d = pt[8]
+
+                        # 1. SDF Potential Phi(d)
+                        if d < sigma_1:
+                            phi = 1.0
+                        elif d <= sigma_2:
+                            phi = float(np.exp(-kappa * (d - sigma_1)))
+                        else:
+                            phi = 0.0
+
+                        if phi <= 1e-4:
+                            continue
+
+                        step_coll_p += phi
+
+                        # 2. Distance Gradient Vector nabla Phi
+                        normal_grad = np.array(pt[7], dtype=np.float32)
+                        norm_mag = np.linalg.norm(normal_grad)
+                        if norm_mag > 1e-6:
+                            normal_grad = normal_grad / norm_mag
+
+                        # 3. Cartesian Velocity of Closest Link
+                        link_a = pt[3]
+                        fk_link_idx = -1 if (link_a < 0 or link_a >= 7) else (link_a + 1)
+                        vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
+                        vel_mag = np.linalg.norm(vel_cart)
+
+                        # 4. Cosine Alignment theta
+                        if vel_mag > 1e-4:
+                            cos_theta = float(np.dot(normal_grad, vel_cart) / (norm_mag * vel_mag))
+                        else:
+                            cos_theta = 0.0
+
+                        # 5. GVM-SDF Modulation Term
+                        modulation = 1.0 - rho * cos_theta
+                        gvm_term = phi * (1.0 + vel_mag * modulation)
+                        step_coll_gvm += gvm_term
+
+                coll_p[k, h] = step_coll_p
+                coll_gvm[k, h] = step_coll_gvm
+
+        # Interpolate across un-evaluated lookahead steps
+        for h in range(H):
+            if h not in eval_steps:
+                prev_h = max([s for s in eval_steps if s <= h], default=0)
+                coll_p[:, h] = coll_p[:, prev_h]
+                coll_gvm[:, h] = coll_gvm[:, prev_h]
+
+        return coll_p, coll_gvm
+
     def step_simulation(self):
         self.step()
 
@@ -481,3 +659,4 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
     def shutdown(self):
         self.close()
+

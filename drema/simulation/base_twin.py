@@ -6,6 +6,8 @@ Defines the required simulation contract for physics backends (e.g., PyBullet, I
 
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List, Dict, Any, Union
+import numpy as np
+
 
 
 # Default physical / visual rendering attributes across all digital twin backends
@@ -90,6 +92,50 @@ class BaseDigitalTwin(ABC):
         """Alias for step_simulation()."""
         self.step_simulation()
 
+    def get_tracked_obstacles_info(self) -> List[Dict[str, Any]]:
+        """
+        Retrieves list of tracked dynamic obstacle dictionaries.
+        Each dictionary contains:
+            - 'id': integer obstacle identifier
+            - 'position': (x, y, z) tuple
+            - 'orientation': (x, y, z, w) tuple
+            - 'name': str name
+            - 'is_target': bool flag indicating if object is the target to manipulate
+        """
+        return []
+
+    def calculate_inverse_kinematics(
+        self,
+        target_pos: Tuple[float, float, float],
+        target_quat: Optional[Tuple[float, float, float, float]] = None
+    ) -> Optional[np.ndarray]:
+        """
+        Calculates inverse kinematics solution for Franka Panda end-effector.
+        Returns 7-element numpy array of joint angles, or None if unavailable/unconverged.
+        """
+        return None
+
+    def compute_trajectory_collision_costs(
+        self,
+        Q: np.ndarray,
+        QD: np.ndarray,
+        sigma_1: float,
+        sigma_2: float,
+        kappa: float,
+        rho: float,
+        kin_helper: Any
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for
+        a batch of candidate trajectories Q (K x H x 7) and QD (K x H x 7).
+        
+        Returns:
+            coll_p: (K x H) float32 numpy array of static proximity/penetration costs
+            coll_gvm: (K x H) float32 numpy array of dynamic approach-velocity modulated costs
+        """
+        K, H, _ = Q.shape
+        return np.zeros((K, H), dtype=np.float32), np.zeros((K, H), dtype=np.float32)
+
     @abstractmethod
     def reset(self) -> None:
         """Resets the simulation environment and cleans up dynamic bodies."""
@@ -103,3 +149,4 @@ class BaseDigitalTwin(ABC):
     def close(self) -> None:
         """Alias for shutdown()."""
         self.shutdown()
+

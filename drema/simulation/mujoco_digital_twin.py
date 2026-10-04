@@ -68,7 +68,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         kp_rot: float = 15.0,
         kd_rot: float = 1.5,
         sim_substeps: int = 1,
-        time_step: float = 0.002
+        time_step: float = 0.002,
+        enable_mjx: bool = False
     ):
         if not MUJOCO_AVAILABLE:
             raise ImportError(
@@ -78,6 +79,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         self.visualize = visualize
         self.table_z = float(table_z)
+        self.enable_mjx = bool(enable_mjx)
+        self.mjx_model = None
+        self._eval_data = None
+
         # Tracking mode: 'constraint' (or 'mocap'), 'pd_force', 'teleport'
         raw_mode = tracking_mode.lower()
         if raw_mode in ["constraint", "mocap"]:
@@ -360,6 +365,16 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         mujoco.mj_forward(new_model, new_data)
         self.model = new_model
         self.data = new_data
+        self._eval_data = mujoco.MjData(new_model)
+
+        if self.enable_mjx:
+            try:
+                from mujoco import mjx
+                self.mjx_model = mjx.put_model(new_model)
+                print("[MUJOCO DIGITAL TWIN] ✓ Synchronized model to MJX device memory.")
+            except Exception as e:
+                print(f"[MUJOCO DIGITAL TWIN WARNING] MJX initialization deferred: {e}")
+                self.mjx_model = None
 
     # -------------------------------------------------------------------------
     # Robot Interface Implementation (BaseDigitalTwin contract)
@@ -723,6 +738,237 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         """Provides direct access to current MjData simulation state for cloning."""
         return self.data
 
+    def get_tracked_obstacles_info(self) -> List[Dict[str, Any]]:
+        """Retrieves list of tracked dynamic obstacle dictionaries."""
+        obstacles = []
+        if self.model is None or self.data is None or len(self.tracked_objects) == 0:
+            return obstacles
+
+        for obj_id, obj_data in self.tracked_objects.items():
+            pose = self.get_object_pose(obj_id)
+            if pose is not None:
+                pos, orn = pose
+            else:
+                pos = tuple(float(x) for x in obj_data.get('target_pos', [0, 0, 0]))
+                quat_wxyz = obj_data.get('target_quat', [1, 0, 0, 0])
+                orn = _wxyz_to_xyzw(quat_wxyz)
+
+            obstacles.append({
+                'id': obj_id,
+                'name': obj_data.get('name', f"obstacle_{obj_id}"),
+                'position': pos,
+                'orientation': orn,
+                'is_target': bool(obj_data.get('is_target', False))
+            })
+        return obstacles
+
+    def calculate_inverse_kinematics(
+        self,
+        target_pos: Tuple[float, float, float],
+        target_quat: Optional[Tuple[float, float, float, float]] = None
+    ) -> Optional[np.ndarray]:
+        """Calculates inverse kinematics solution for Franka Panda end-effector using MuJoCo Jacobian."""
+        if self.model is None or self.data is None:
+            return None
+
+        if self._eval_data is None:
+            self._eval_data = mujoco.MjData(self.model)
+
+        eval_data = self._eval_data
+        if np.all(np.abs(self.data.qpos[:7]) < 1e-2):
+            eval_data.qpos[:7] = np.array([0.0, -0.4, 0.0, -2.0, 0.0, 1.6, 0.7], dtype=np.float64)
+        else:
+            eval_data.qpos[:7] = self.data.qpos[:7]
+
+
+        site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "tcp")
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "ee")
+        if site_id < 0 and body_id < 0:
+            return None
+
+        target_p = np.array(target_pos, dtype=np.float64)
+        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
+
+        q_min = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973], dtype=np.float64)
+        q_max = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973], dtype=np.float64)
+
+        for _ in range(35):
+            mujoco.mj_fwdPosition(self.model, eval_data)
+            curr_pos = eval_data.site_xpos[site_id] if site_id >= 0 else eval_data.xpos[body_id]
+            err = target_p - curr_pos
+            if np.linalg.norm(err) < 2e-3:
+                return eval_data.qpos[:7].astype(np.float32)
+
+            if site_id >= 0:
+                mujoco.mj_jacSite(self.model, eval_data, jacp, None, site_id)
+            else:
+                mujoco.mj_jacBody(self.model, eval_data, jacp, None, body_id)
+
+            J = jacp[:, :7]
+            step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(3), err)
+            eval_data.qpos[:7] = np.clip(eval_data.qpos[:7] + 0.6 * step, q_min, q_max)
+
+        mujoco.mj_fwdPosition(self.model, eval_data)
+        curr_pos = eval_data.site_xpos[site_id] if site_id >= 0 else eval_data.xpos[body_id]
+        if np.linalg.norm(target_p - curr_pos) < 0.05:
+            return eval_data.qpos[:7].astype(np.float32)
+
+        q_sol, success = self.kin.solve_dls_ik(self.data.qpos[:7], target_pos, target_quat)
+        return q_sol if success else None
+
+    def compute_trajectory_collision_costs(
+        self,
+        Q: np.ndarray,
+        QD: np.ndarray,
+        sigma_1: float,
+        sigma_2: float,
+        kappa: float,
+        rho: float,
+        kin_helper: Any
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Evaluates collision clearance and GVM (Gradient-Velocity Modulated) costs for
+        a batch of candidate trajectories Q (K x H x 7) and QD (K x H x 7) using MuJoCo geomDistance / MJX.
+        """
+        K, H, _ = Q.shape
+        coll_p = np.zeros((K, H), dtype=np.float32)
+        coll_gvm = np.zeros((K, H), dtype=np.float32)
+
+        if self.model is None or self.data is None or len(self.tracked_objects) == 0:
+            return coll_p, coll_gvm
+
+        # Extract obstacle geoms (ignore targets)
+        obstacle_geoms = []
+        for i in range(self.model.ngeom):
+            g_name = self.model.geom(i).name
+            if g_name.startswith("obs_") and g_name.endswith("_geom"):
+                try:
+                    obj_id = int(g_name.split("_")[1])
+                    if self.tracked_objects.get(obj_id, {}).get("is_target", False):
+                        continue
+                except Exception:
+                    pass
+                obstacle_geoms.append(i)
+
+        if not obstacle_geoms:
+            return coll_p, coll_gvm
+
+        # Pre-cache robot arm geoms and link indices
+        robot_geom_link_map = []
+        for i in range(self.model.ngeom):
+            g_name = self.model.geom(i).name
+            if "link" in g_name:
+                for link_num in range(1, 8):
+                    if f"link{link_num}" in g_name:
+                        robot_geom_link_map.append((i, link_num))
+                        break
+            elif "gripper" in g_name or "ee" in g_name:
+                robot_geom_link_map.append((i, -1))
+
+        if not robot_geom_link_map:
+            return coll_p, coll_gvm
+
+        if self._eval_data is None:
+            self._eval_data = mujoco.MjData(self.model)
+
+        eval_data = self._eval_data
+        eval_data.qpos[:] = self.data.qpos[:]
+        if hasattr(eval_data, 'mocap_pos') and hasattr(self.data, 'mocap_pos'):
+            eval_data.mocap_pos[:] = self.data.mocap_pos[:]
+            eval_data.mocap_quat[:] = self.data.mocap_quat[:]
+
+        # Subsample lookahead waypoints to sustain high control frequency
+        step_stride = max(1, H // 5)
+        eval_steps = list(range(0, H, step_stride))
+        if (H - 1) not in eval_steps:
+            eval_steps.append(H - 1)
+
+        fromto = np.zeros(6, dtype=np.float64)
+
+        for h in eval_steps:
+            for k in range(K):
+                q_step = Q[k, h]
+                qd_step = QD[k, h]
+
+                # Update Franka Panda joint positions in MuJoCo eval data
+                eval_data.qpos[:7] = q_step
+                mujoco.mj_kinematics(self.model, eval_data)
+
+
+
+                step_coll_p = 0.0
+                step_coll_gvm = 0.0
+
+                for rg, fk_link_idx in robot_geom_link_map:
+                    rg_pos = eval_data.geom_xpos[rg]
+                    rg_r = self.model.geom_rbound[rg]
+
+                    for og in obstacle_geoms:
+                        og_pos = eval_data.geom_xpos[og]
+                        og_r = self.model.geom_rbound[og]
+
+                        # Broadphase culling: skip if bounding spheres are farther than sigma_2
+                        dist_centers = np.linalg.norm(rg_pos - og_pos)
+                        if dist_centers > (rg_r + og_r + sigma_2):
+                            continue
+
+                        try:
+                            d = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2), fromto)
+                        except Exception:
+                            continue
+
+                        if d > sigma_2:
+                            continue
+
+
+                        # 1. SDF Potential Phi(d)
+                        if d < sigma_1:
+                            phi = 1.0
+                        elif d <= sigma_2:
+                            phi = float(np.exp(-kappa * (d - sigma_1)))
+                        else:
+                            phi = 0.0
+
+                        if phi <= 1e-4:
+                            continue
+
+                        step_coll_p += phi
+
+                        # 2. Distance Gradient Vector (from obstacle surface to robot link)
+                        diff = fromto[0:3] - fromto[3:6]
+                        norm_mag = np.linalg.norm(diff)
+                        if norm_mag > 1e-6:
+                            normal_grad = (diff / norm_mag).astype(np.float32)
+                        else:
+                            normal_grad = np.zeros(3, dtype=np.float32)
+
+                        # 3. Cartesian Velocity of Closest Link
+                        vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
+                        vel_mag = np.linalg.norm(vel_cart)
+
+                        # 4. Cosine Alignment theta
+                        if vel_mag > 1e-4 and norm_mag > 1e-6:
+                            cos_theta = float(np.dot(normal_grad, vel_cart) / vel_mag)
+                        else:
+                            cos_theta = 0.0
+
+                        # 5. GVM-SDF Modulation Term
+                        modulation = 1.0 - rho * cos_theta
+                        gvm_term = phi * (1.0 + vel_mag * modulation)
+                        step_coll_gvm += gvm_term
+
+                coll_p[k, h] = step_coll_p
+                coll_gvm[k, h] = step_coll_gvm
+
+        # Interpolate across un-evaluated lookahead steps
+        for h in range(H):
+            if h not in eval_steps:
+                prev_h = max([s for s in eval_steps if s <= h], default=0)
+                coll_p[:, h] = coll_p[:, prev_h]
+                coll_gvm[:, h] = coll_gvm[:, prev_h]
+
+        return coll_p, coll_gvm
+
     # -------------------------------------------------------------------------
     # Lifecycle Cleanup
     # -------------------------------------------------------------------------
@@ -743,4 +989,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             self.viewer = None
         self.model = None
         self.data = None
+        self._eval_data = None
+        self.mjx_model = None
         print("[MUJOCO DIGITAL TWIN] Physics server shutdown.")
+
