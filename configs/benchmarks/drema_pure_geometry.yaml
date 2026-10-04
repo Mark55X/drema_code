@@ -87,7 +87,7 @@ digital_twin:
   engine: "pybullet"
   gui: true
   time_step: 0.002
-  urdf_path: "assets/franka_panda/panda.urdf"
+  urdf_path: "franka_panda/panda.urdf"
   mujoco_model_path: "assets/franka_panda/panda.xml"
   tracking_mode: "constraint"
   constraint_max_force: 300.0

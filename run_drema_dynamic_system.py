@@ -153,7 +153,7 @@ class DremaDynamicSystem:
         twin_engine = str(config.get_nested("digital_twin.engine", "pybullet")).lower()
         twin_gui = bool(config.get_nested("digital_twin.gui", True))
         table_z = float(config.get_nested("perception.workspace.table_z_prior", 0.75))
-        urdf_path = config.get_nested("digital_twin.urdf_path", "assets/franka_panda/panda.urdf")
+        urdf_path = config.get_nested("digital_twin.urdf_path", "franka_panda/panda.urdf")
 
         tracking_mode = str(config.get_nested("digital_twin.tracking_mode", "constraint")).lower()
         constraint_max_force = float(config.get_nested("digital_twin.constraint_max_force", 300.0))

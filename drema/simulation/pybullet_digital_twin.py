@@ -401,7 +401,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             contact_pts = p.getClosestPoints(
                 bodyA=self.robot_id,
                 bodyB=body_id,
-                distance=0.5
+                distance=2.0
             )
 
             if contact_pts:

@@ -120,7 +120,8 @@ class MPCController:
         if digital_twin is not None and hasattr(digital_twin, 'get_min_obstacle_distance'):
             try:
                 min_dist = digital_twin.get_min_obstacle_distance()
-            except Exception:
+            except Exception as e:
+                print(f"[MPC CONTROLLER WARNING] get_min_obstacle_distance error: {e}")
                 min_dist = float('inf')
 
         if min_dist <= self.safety_collision_distance:
