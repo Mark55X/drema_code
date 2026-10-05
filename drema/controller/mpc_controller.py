@@ -36,12 +36,16 @@ class MPCController:
         dt: float = 0.05,                         # Planning timestep dt (s)
         num_samples_per_planner: int = 24,        # Stochastic samples per strategy
         top_k: int = 12,                          # Candidates evaluated by the Judge
-        max_joint_acc: float = 0.50               # Joint acceleration saturation limit (rad/s^2)
+        max_joint_acc: float = 0.50,              # Joint acceleration saturation limit (rad/s^2)
+        alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
+        alpha_rot: float = 0.25                   # Orientation error weight (Zhou et al. Eq. 27)
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
         self.max_joint_velocity = max_joint_velocity
         self.safety_collision_distance = safety_collision_distance
+        self.alpha_pos = alpha_pos
+        self.alpha_rot = alpha_rot
 
         # Kinematics & MP-PMPPI engine
         self.kinematics = FrankaKinematics(base_position=None)
@@ -56,7 +60,9 @@ class MPCController:
             beta_param=0.8,
             alpha_param=1.0,
             alpha_mu=0.8,
-            alpha_sigma=0.2
+            alpha_sigma=0.2,
+            alpha_pos=alpha_pos,
+            alpha_rot=alpha_rot
         )
 
     def set_digital_twin(self, digital_twin: Any) -> None:

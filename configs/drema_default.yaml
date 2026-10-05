@@ -137,4 +137,6 @@ controller:
   max_joint_acc: 0.50                # Joint acceleration saturation limit (rad/s^2)
   num_samples_per_planner: 24        # Stochastic samples per MPPI strategy
   top_k: 12                          # Top candidates evaluated by the Judge
+  alpha_pos: 1.0                     # Cartesian position tracking weight (Zhou et al. Eq. 27)
+  alpha_rot: 0.25                    # Cartesian orientation tracking weight (Zhou et al. Eq. 27)
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)

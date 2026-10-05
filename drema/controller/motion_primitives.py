@@ -23,18 +23,30 @@ class MotionPrimitiveLibrary:
         kinematics: FrankaKinematics,
         horizon: int = 20,
         dt: float = 0.05,
-        max_joint_acc: float = 0.5
+        max_joint_acc: float = 0.5,
+        rot_tracking_gain: float = 2.0,
+        align_rot_gain: float = 3.0,
+        approach_vel_slow: float = 0.15,
+        approach_vel_fast: float = 0.30
     ):
         """
         :param kinematics: FrankaKinematics instance for Jacobian and FK computations.
         :param horizon: Prediction horizon H steps.
         :param dt: Timestep delta (seconds).
-        :param max_joint_acc: Maximum joint acceleration limit.
+        :param max_joint_acc: Maximum joint acceleration limit [rad/s^2].
+        :param rot_tracking_gain: Proportional gain converting orientation error to angular twist [rad/s per rad].
+        :param align_rot_gain: Proportional gain for dedicated orientation alignment primitive [rad/s per rad].
+        :param approach_vel_slow: Speed limit for slow approach primitive [m/s].
+        :param approach_vel_fast: Speed limit for fast approach primitive [m/s].
         """
         self.kin = kinematics
         self.H = horizon
         self.dt = dt
         self.max_acc = max_joint_acc
+        self.rot_tracking_gain = rot_tracking_gain
+        self.align_rot_gain = align_rot_gain
+        self.approach_vel_slow = approach_vel_slow
+        self.approach_vel_fast = approach_vel_fast
         self.last_primitive_names: List[str] = []
 
     def generate_primitives(
@@ -72,8 +84,8 @@ class MotionPrimitiveLibrary:
             dist_to_goal = np.linalg.norm(dir_to_goal)
             if dist_to_goal > 1e-4:
                 unit_dir = dir_to_goal / dist_to_goal
-                v_cart_des = unit_dir * min(0.15, dist_to_goal / (self.H * self.dt))
-                v_cart_fast = unit_dir * min(0.30, dist_to_goal / (self.H * self.dt * 0.5))
+                v_cart_des = unit_dir * min(self.approach_vel_slow, dist_to_goal / (self.H * self.dt))
+                v_cart_fast = unit_dir * min(self.approach_vel_fast, dist_to_goal / (self.H * self.dt * 0.5))
 
                 if target_rot is not None:
                     # Calculate orientation error vector omega_des
@@ -82,7 +94,7 @@ class MotionPrimitiveLibrary:
                         np.cross(ee_rot[:, 1], target_rot[:, 1]) +
                         np.cross(ee_rot[:, 2], target_rot[:, 2])
                     )
-                    w_des = rot_err * 2.0
+                    w_des = rot_err * self.rot_tracking_gain
                     u_approach = self._project_cartesian_twist(q_current, qd_current, v_cart_des, w_des)
                     u_fast = self._project_cartesian_twist(q_current, qd_current, v_cart_fast, w_des)
                 else:
@@ -150,7 +162,7 @@ class MotionPrimitiveLibrary:
                 np.cross(ee_rot[:, 1], target_rot[:, 1]) +
                 np.cross(ee_rot[:, 2], target_rot[:, 2])
             )
-            w_align = rot_err * 3.0
+            w_align = rot_err * self.align_rot_gain
             primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_align))
             primitive_names.append("align_rot")
 

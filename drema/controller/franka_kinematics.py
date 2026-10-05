@@ -46,8 +46,14 @@ class FrankaKinematics:
     # https://frankaemika.github.io/docs/control_parameters.html
     # Note: In Zhou et al. (IEEE T-RO 2025, Table I) sampling is performed in
     # acceleration space with bounds [-0.5, 0.5] rad/s^2 for smooth MPC sampling.
-    # -------------------------------------------------------------------------
     QDD_MAX = np.array([15.0, 7.5, 10.0, 12.5, 15.0, 20.0, 20.0], dtype=np.float32)
+
+    # -------------------------------------------------------------------------
+    # Canonical Franka Panda Ready / Home Pose [rad] (Q_REST)
+    # [0.0, -pi/4, 0.0, -3*pi/4, 0.0, pi/2, pi/4]
+    # Standard rest configuration for nullspace posture and IK regularization.
+    # -------------------------------------------------------------------------
+    Q_REST = np.array([0.0, -0.785398, 0.0, -2.356194, 0.0, 1.570796, 0.785398], dtype=np.float32)
 
     # -------------------------------------------------------------------------
     # Modified Denavit-Hartenberg (MDH) Parameters for Franka Panda:
@@ -286,6 +292,22 @@ class FrankaKinematics:
         q = np.array([qx, qy, qz, qw], dtype=np.float32)
         norm = np.linalg.norm(q)
         return q / norm if norm > 1e-6 else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    @staticmethod
+    def quat_to_rot_matrix(q: np.ndarray) -> np.ndarray:
+        """
+        Converts a normalized quaternion [qx, qy, qz, qw] (scalar-last) to a 3x3 rotation matrix.
+        """
+        q_arr = np.asarray(q, dtype=np.float32).flatten()
+        norm = float(np.linalg.norm(q_arr))
+        if norm > 1e-6:
+            q_arr = q_arr / norm
+        qx, qy, qz, qw = float(q_arr[0]), float(q_arr[1]), float(q_arr[2]), float(q_arr[3])
+        return np.array([
+            [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw),       2.0 * (qx * qz + qy * qw)],
+            [2.0 * (qx * qy + qz * qw),       1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+            [2.0 * (qx * qz - qy * qw),       2.0 * (qy * qz + qx * qw),       1.0 - 2.0 * (qx * qx + qy * qy)]
+        ], dtype=np.float32)
 
     def batch_forward_kinematics_ee(
         self,

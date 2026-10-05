@@ -19,6 +19,7 @@ import pybullet as p
 import pybullet_data
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
+from drema.controller.franka_kinematics import FrankaKinematics
 
 
 class PyBulletDigitalTwin(BaseDigitalTwin):
@@ -531,20 +532,24 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             if target_quat is not None:
                 tq = np.asarray(target_quat)
                 if tq.shape == (3, 3):
-                    from scipy.spatial.transform import Rotation
-                    quat = Rotation.from_matrix(tq).as_quat()
-                    kwargs["targetOrientation"] = [float(x) for x in quat]
+                    q_conv = FrankaKinematics.rot_matrix_to_quat(tq)
+                    kwargs["targetOrientation"] = [float(x) for x in q_conv]
                 elif len(tq.flatten()) == 4:
                     kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 
             num_j = p.getNumJoints(self.robot_id)
             ee_idx = 11 if num_j > 11 else max(0, num_j - 1)
 
-            # Supply Franka Panda joint limits and rest poses
-            q_min = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973] + [0.0] * max(0, num_j - 7)
-            q_max = [ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973] + [0.0] * max(0, num_j - 7)
+            # Supply Franka Panda joint limits and rest poses from official kinematics specifications
+            q_min_7 = FrankaKinematics.Q_MIN.tolist()
+            q_max_7 = FrankaKinematics.Q_MAX.tolist()
+            rest_7 = FrankaKinematics.Q_REST.tolist()
+            extra_j = max(0, num_j - 7)
+
+            q_min = q_min_7 + [0.0] * extra_j
+            q_max = q_max_7 + [0.0] * extra_j
             q_range = [mx - mn for mn, mx in zip(q_min, q_max)]
-            rest_poses = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785] + [0.0] * max(0, num_j - 7)
+            rest_poses = rest_7 + [0.0] * extra_j
 
             kwargs["lowerLimits"] = q_min
             kwargs["upperLimits"] = q_max
@@ -560,9 +565,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             q_cand = np.array(pb_ik[:7], dtype=np.float32)
 
             # Verify that candidate strictly satisfies physical joint limits
-            q_min_7 = np.array(q_min[:7], dtype=np.float32)
-            q_max_7 = np.array(q_max[:7], dtype=np.float32)
-            if np.any(q_cand < (q_min_7 - 1e-3)) or np.any(q_cand > (q_max_7 + 1e-3)):
+            if np.any(q_cand < (FrankaKinematics.Q_MIN - 1e-3)) or np.any(q_cand > (FrankaKinematics.Q_MAX + 1e-3)):
                 return None
             return q_cand
         except Exception:
