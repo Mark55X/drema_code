@@ -519,14 +519,14 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         target_pos: Tuple[float, float, float],
         target_quat: Optional[Tuple[float, float, float, float]] = None
     ) -> Optional[np.ndarray]:
-        """Calculates inverse kinematics solution using PyBullet C++ solver."""
+        """Calculates inverse kinematics solution using PyBullet C++ solver with Franka joint limits."""
         if self.client_id < 0 or self.robot_id < 0:
             return None
         try:
             ik_target = [float(target_pos[0]), float(target_pos[1]), float(target_pos[2])]
             kwargs = {
-                "maxNumIterations": 20,
-                "residualThreshold": 1e-3
+                "maxNumIterations": 50,
+                "residualThreshold": 1e-4
             }
             if target_quat is not None:
                 tq = np.asarray(target_quat)
@@ -537,14 +537,34 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 elif len(tq.flatten()) == 4:
                     kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 
-            ee_idx = 11 if p.getNumJoints(self.robot_id) > 11 else 7
+            num_j = p.getNumJoints(self.robot_id)
+            ee_idx = 11 if num_j > 11 else max(0, num_j - 1)
+
+            # Supply Franka Panda joint limits and rest poses
+            q_min = [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973] + [0.0] * max(0, num_j - 7)
+            q_max = [ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973] + [0.0] * max(0, num_j - 7)
+            q_range = [mx - mn for mn, mx in zip(q_min, q_max)]
+            rest_poses = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785] + [0.0] * max(0, num_j - 7)
+
+            kwargs["lowerLimits"] = q_min
+            kwargs["upperLimits"] = q_max
+            kwargs["jointRanges"] = q_range
+            kwargs["restPoses"] = rest_poses
+
             pb_ik = p.calculateInverseKinematics(
                 self.robot_id,
                 ee_idx,
                 ik_target,
                 **kwargs
             )
-            return np.array(pb_ik[:7], dtype=np.float32)
+            q_cand = np.array(pb_ik[:7], dtype=np.float32)
+
+            # Verify that candidate strictly satisfies physical joint limits
+            q_min_7 = np.array(q_min[:7], dtype=np.float32)
+            q_max_7 = np.array(q_max[:7], dtype=np.float32)
+            if np.any(q_cand < (q_min_7 - 1e-3)) or np.any(q_cand > (q_max_7 + 1e-3)):
+                return None
+            return q_cand
         except Exception:
             return None
 

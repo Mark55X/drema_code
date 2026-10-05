@@ -88,9 +88,12 @@ class MPPMPPIEngine:
         # Task Cost Parameters (100% from Zhou et al. Section V & Table I):
         # - convergence_radius_xi = 0.03m (3 cm attraction bubble for Sparse Reward, Eq. 12, 28)
         # - rho_modulation = 0.8 (GVM-SDF velocity-gradient scaling factor in [0, 1], Eq. 10, 25)
+        # - alpha_pos = 1.0, alpha_rot = 0.25 (Eq. 27 weighting for position vs orientation)
         # ---------------------------------------------------------------------
         convergence_radius_xi: float = 0.03,
-        rho_modulation: float = 0.8
+        rho_modulation: float = 0.8,
+        alpha_pos: float = 1.0,
+        alpha_rot: float = 0.25
     ):
         self.kin = kinematics if kinematics is not None else FrankaKinematics()
         self.H = horizon
@@ -108,6 +111,8 @@ class MPPMPPIEngine:
         self.init_noise_std = init_noise_std
         self.xi = convergence_radius_xi
         self.rho = rho_modulation
+        self.alpha_pos = float(alpha_pos)
+        self.alpha_rot = float(alpha_rot)
 
         # SDF potential parameters (Zhou et al. Eq. 21)
         self.sigma_1 = 0.02   # Inscribed safety margin [m]
@@ -209,6 +214,26 @@ class MPPMPPIEngine:
 
         has_robot = digital_twin is not None and getattr(digital_twin, 'robot_id', -1) >= 0
 
+        # Parse target orientation into both 3x3 rotation matrix and normalized quaternion
+        target_rot_mat = None
+        target_quat = None
+        if target_rot is not None:
+            tr_arr = np.asarray(target_rot, dtype=np.float32)
+            if tr_arr.shape == (3, 3):
+                target_rot_mat = tr_arr
+                target_quat = self.kin.rot_matrix_to_quat(tr_arr)
+            elif len(tr_arr.flatten()) == 4:
+                target_quat = tr_arr.flatten()
+                q_norm = float(np.linalg.norm(target_quat))
+                if q_norm > 1e-6:
+                    target_quat = target_quat / q_norm
+                qx, qy, qz, qw = target_quat
+                target_rot_mat = np.array([
+                    [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw),       2.0 * (qx * qz + qy * qw)],
+                    [2.0 * (qx * qy + qz * qw),       1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
+                    [2.0 * (qx * qz - qy * qw),       2.0 * (qy * qz + qx * qw),       1.0 - 2.0 * (qx * qx + qy * qy)]
+                ], dtype=np.float32)
+
         # ---------------------------------------------------------------------
         # Step 1: Inverse Kinematics Guidance Target (q_des,t, Eq. 26)
         # ---------------------------------------------------------------------
@@ -217,14 +242,18 @@ class MPPMPPIEngine:
         if target_pos is not None:
             # Primary IK query: Digital Twin backend IK (PyBullet, MuJoCo, etc.)
             if digital_twin is not None and hasattr(digital_twin, 'calculate_inverse_kinematics'):
-                q_des_t = digital_twin.calculate_inverse_kinematics(target_pos, target_rot)
+                q_des_t = digital_twin.calculate_inverse_kinematics(target_pos, target_rot_mat)
                 if q_des_t is not None:
-                    self.last_ik_solution = q_des_t.copy()
+                    # Validate physical joint limits on IK candidate
+                    if np.any(q_des_t < (self.kin.Q_MIN - 1e-3)) or np.any(q_des_t > (self.kin.Q_MAX + 1e-3)):
+                        q_des_t = None
+                    else:
+                        self.last_ik_solution = q_des_t.copy()
 
             # Fallback IK query: Analytical DLS IK
             if q_des_t is None:
                 q_init_ik = self.last_ik_solution if self.last_ik_solution is not None else q_curr
-                q_dls, success = self.kin.solve_dls_ik(q_init_ik, target_pos, target_rot)
+                q_dls, success = self.kin.solve_dls_ik(q_init_ik, target_pos, target_rot_mat)
                 if success:
                     q_des_t = q_dls
                     self.last_ik_solution = q_des_t.copy()
@@ -282,7 +311,7 @@ class MPPMPPIEngine:
             q_current=q_curr,
             qd_current=qd_curr,
             target_pos=target_pos,
-            target_rot=target_rot,
+            target_rot=target_rot_mat,
             obstacles=obs_list
         )
         sample_batches.append(U_p)
@@ -325,20 +354,42 @@ class MPPMPPIEngine:
         # Step 4: Subcost Computations (Eq. 17, 26, 27, 28)
         # ---------------------------------------------------------------------
         t_cost_start = time.perf_counter()
-        # 4a. Goal distance cost: dist(x_{i,h})
+        # 4a. Goal distance cost: dist(x_{i,h}) (Zhou et al. Eq. 26, 27, 28)
         goal_costs = np.zeros((total_K, self.H), dtype=np.float32)
         sparse_rewards = np.zeros((total_K, self.H), dtype=np.float32)
 
         if target_pos is not None:
+            # Batch forward kinematics: positions and quaternions for 6-DoF tracking
+            ee_pos_batch, ee_quat_batch = self.kin.batch_forward_kinematics_ee(Q, return_orientations=True)
+
+            # Cartesian position error ||p_ee - p_g||_2
+            pos_diff = ee_pos_batch - target_pos[None, None, :]
+            err_pos = np.linalg.norm(pos_diff, axis=-1)
+
+            # Cartesian orientation error (Zhou et al. Eq. 27):
+            # dist_rot = arccos(2 * <q_ee, q_g>^2 - 1)
+            if target_quat is not None:
+                inner_prod = np.sum(ee_quat_batch * target_quat[None, None, :], axis=-1)
+                inner_prod = np.clip(inner_prod, -1.0, 1.0)
+                cos_theta = np.clip(2.0 * (inner_prod ** 2) - 1.0, -1.0, 1.0)
+                err_rot = np.arccos(cos_theta)  # [0, pi] rad
+            else:
+                err_rot = 0.0
+
+            dist_cart = self.alpha_pos * err_pos + self.alpha_rot * err_rot
+
             if q_des_t is not None:
                 # Joint-space goal distance: ||q_{i,h} - q_{des,t}||_2 (Eq. 26)
                 diff = Q - q_des_t[None, None, :]
-                dist_matrix = np.linalg.norm(diff, axis=-1)
+                dist_joint = np.linalg.norm(diff, axis=-1)
+                # Augment joint-space tracking with direct Cartesian orientation cost
+                if target_quat is not None:
+                    dist_matrix = dist_joint + self.alpha_rot * err_rot
+                else:
+                    dist_matrix = dist_joint
             else:
                 # Cartesian goal distance fallback (Eq. 27)
-                ee_pos_batch = self.kin.batch_forward_kinematics_ee(Q)
-                diff = ee_pos_batch - target_pos[None, None, :]
-                dist_matrix = np.linalg.norm(diff, axis=-1)
+                dist_matrix = dist_cart
 
             goal_costs = dist_matrix.copy()
 

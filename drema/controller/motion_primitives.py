@@ -65,7 +65,7 @@ class MotionPrimitiveLibrary:
         y_ee = ee_rot[:, 1]  # Local Y
 
         # ---------------------------------------------------------------------
-        # 1. Linear Cartesian Approach Primitive (Target Seeking)
+        # 1. 6-DoF Cartesian Approach Primitives (Target Seeking + Reorientation)
         # ---------------------------------------------------------------------
         if target_pos is not None:
             dir_to_goal = target_pos - ee_pos
@@ -73,13 +73,24 @@ class MotionPrimitiveLibrary:
             if dist_to_goal > 1e-4:
                 unit_dir = dir_to_goal / dist_to_goal
                 v_cart_des = unit_dir * min(0.15, dist_to_goal / (self.H * self.dt))
-                u_approach = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_des)
+                v_cart_fast = unit_dir * min(0.30, dist_to_goal / (self.H * self.dt * 0.5))
+
+                if target_rot is not None:
+                    # Calculate orientation error vector omega_des
+                    rot_err = 0.5 * (
+                        np.cross(ee_rot[:, 0], target_rot[:, 0]) +
+                        np.cross(ee_rot[:, 1], target_rot[:, 1]) +
+                        np.cross(ee_rot[:, 2], target_rot[:, 2])
+                    )
+                    w_des = rot_err * 2.0
+                    u_approach = self._project_cartesian_twist(q_current, qd_current, v_cart_des, w_des)
+                    u_fast = self._project_cartesian_twist(q_current, qd_current, v_cart_fast, w_des)
+                else:
+                    u_approach = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_des)
+                    u_fast = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_fast)
+
                 primitives.append(u_approach)
                 primitive_names.append("appr_slow")
-
-                # Accelerated approach variant (higher speed)
-                v_cart_fast = unit_dir * min(0.30, dist_to_goal / (self.H * self.dt * 0.5))
-                u_fast = self._project_cartesian_linear_velocity(q_current, qd_current, v_cart_fast)
                 primitives.append(u_fast)
                 primitive_names.append("appr_fast")
 
@@ -131,10 +142,20 @@ class MotionPrimitiveLibrary:
                     break
 
         # ---------------------------------------------------------------------
-        # 4. Pure Screwing / Rotational Primitive (Local Z-axis spin)
+        # 4. Pure Rotational Primitives (Orientation Alignment / Tool Spin)
         # ---------------------------------------------------------------------
+        if target_rot is not None:
+            rot_err = 0.5 * (
+                np.cross(ee_rot[:, 0], target_rot[:, 0]) +
+                np.cross(ee_rot[:, 1], target_rot[:, 1]) +
+                np.cross(ee_rot[:, 2], target_rot[:, 2])
+            )
+            w_align = rot_err * 3.0
+            primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_align))
+            primitive_names.append("align_rot")
+
         w_screw = z_ee * 0.5  # 0.5 rad/s pure rotation around tool axis
-        primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3), w_angular=w_screw))
+        primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_screw))
         primitive_names.append("screw_tool")
 
         # ---------------------------------------------------------------------

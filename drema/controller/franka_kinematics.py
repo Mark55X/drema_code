@@ -15,7 +15,7 @@ References:
 """
 
 import numpy as np
-from typing import Tuple, List, Optional, Dict
+from typing import Tuple, List, Optional, Dict, Union
 
 
 class FrankaKinematics:
@@ -252,19 +252,68 @@ class FrankaKinematics:
         success = np.linalg.norm(target_pos - curr_p) < pos_tolerance * 5.0
         return q, success
 
-    def batch_forward_kinematics_ee(self, q_batch: np.ndarray) -> np.ndarray:
+    @staticmethod
+    def rot_matrix_to_quat(R: np.ndarray) -> np.ndarray:
         """
-        Fast forward kinematics of end-effector positions for an entire batch of trajectories.
+        Converts a 3x3 rotation matrix to a normalized quaternion [qx, qy, qz, qw] (scalar-last).
+        """
+        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+        if tr > 0.0:
+            s = 0.5 / np.sqrt(tr + 1.0)
+            qw = 0.25 / s
+            qx = (R[2, 1] - R[1, 2]) * s
+            qy = (R[0, 2] - R[2, 0]) * s
+            qz = (R[1, 0] - R[0, 1]) * s
+        elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
+            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+            qw = (R[2, 1] - R[1, 2]) / s
+            qx = 0.25 * s
+            qy = (R[0, 1] + R[1, 0]) / s
+            qz = (R[0, 2] + R[2, 0]) / s
+        elif R[1, 1] > R[2, 2]:
+            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+            qw = (R[0, 2] - R[2, 0]) / s
+            qx = (R[0, 1] + R[1, 0]) / s
+            qy = 0.25 * s
+            qz = (R[1, 2] + R[2, 1]) / s
+        else:
+            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+            qw = (R[1, 0] - R[0, 1]) / s
+            qx = (R[0, 2] + R[2, 0]) / s
+            qy = (R[1, 2] + R[2, 1]) / s
+            qz = 0.25 * s
+
+        q = np.array([qx, qy, qz, qw], dtype=np.float32)
+        norm = np.linalg.norm(q)
+        return q / norm if norm > 1e-6 else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+
+    def batch_forward_kinematics_ee(
+        self,
+        q_batch: np.ndarray,
+        return_orientations: bool = False
+    ) -> Union[np.ndarray, Tuple[np.ndarray, np.ndarray]]:
+        """
+        Fast forward kinematics of end-effector positions (and optionally quaternions)
+        for an entire batch of trajectories.
 
         :param q_batch: Array of shape [K, H, 7] containing joint trajectories.
-        :return: Array of shape [K, H, 3] containing end-effector positions in world coordinates.
+        :param return_orientations: If True, also returns normalized quaternions [K, H, 4].
+        :return: If return_orientations is False:
+                     ee_positions: [K, H, 3]
+                 If return_orientations is True:
+                     (ee_positions [K, H, 3], ee_quaternions [K, H, 4])
         """
         K, H, _ = q_batch.shape
         ee_positions = np.zeros((K, H, 3), dtype=np.float32)
+        ee_quats = np.zeros((K, H, 4), dtype=np.float32) if return_orientations else None
 
         for k in range(K):
             for h in range(H):
-                pos, _ = self.forward_kinematics_ee(q_batch[k, h])
+                pos, rot = self.forward_kinematics_ee(q_batch[k, h])
                 ee_positions[k, h] = pos
+                if return_orientations:
+                    ee_quats[k, h] = self.rot_matrix_to_quat(rot)
 
+        if return_orientations:
+            return ee_positions, ee_quats
         return ee_positions
