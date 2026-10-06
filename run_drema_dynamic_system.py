@@ -215,7 +215,14 @@ class DremaDynamicSystem:
             sigma_1=float(ctrl_cfg.get("sigma_1", 0.02)),
             sigma_2=float(ctrl_cfg.get("sigma_2", 0.08)),
             kappa=float(ctrl_cfg.get("kappa", 15.0)),
-            adaptive_goal_margin=bool(ctrl_cfg.get("adaptive_goal_margin", True))
+            adaptive_goal_margin=bool(ctrl_cfg.get("adaptive_goal_margin", True)),
+            evade_min_distance=float(ctrl_cfg.get("evade_min_distance", 0.01)),
+            evade_max_distance=float(ctrl_cfg.get("evade_max_distance", 0.35)),
+            evade_ttc_threshold=float(ctrl_cfg.get("evade_ttc_threshold", 2.0)),
+            evade_min_speed=float(ctrl_cfg.get("evade_min_speed", 0.03)),
+            evade_imminent_distance=float(ctrl_cfg.get("evade_imminent_distance", 0.06)),
+            evade_retreat_speed=float(ctrl_cfg.get("evade_retreat_speed", 0.15)),
+            evade_lift_speed=float(ctrl_cfg.get("evade_lift_speed", 0.12))
         )
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 

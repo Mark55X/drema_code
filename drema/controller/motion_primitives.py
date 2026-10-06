@@ -27,7 +27,17 @@ class MotionPrimitiveLibrary:
         rot_tracking_gain: float = 2.0,
         align_rot_gain: float = 3.0,
         approach_vel_slow: float = 0.15,
-        approach_vel_fast: float = 0.30
+        approach_vel_fast: float = 0.30,
+        evade_min_distance: float = 0.01,
+        evade_max_distance: float = 0.35,
+        evade_ttc_threshold: float = 2.0,
+        evade_min_speed: float = 0.03,
+        evade_imminent_distance: float = 0.06,
+        evade_retreat_speed: float = 0.15,
+        evade_lift_speed: float = 0.12,
+        descend_speed: float = 0.08,
+        lift_speed: float = 0.10,
+        lateral_speed: float = 0.12
     ):
         """
         :param kinematics: FrankaKinematics instance for Jacobian and FK computations.
@@ -38,6 +48,16 @@ class MotionPrimitiveLibrary:
         :param align_rot_gain: Proportional gain for dedicated orientation alignment primitive [rad/s per rad].
         :param approach_vel_slow: Speed limit for slow approach primitive [m/s].
         :param approach_vel_fast: Speed limit for fast approach primitive [m/s].
+        :param evade_min_distance: Minimum distance threshold to consider obstacle for avoidance [m].
+        :param evade_max_distance: Maximum distance threshold to consider obstacle for dynamic evasion [m].
+        :param evade_ttc_threshold: Time-To-Collision threshold to trigger active evasion [s].
+        :param evade_min_speed: Minimum speed threshold to classify obstacle as dynamic [m/s].
+        :param evade_imminent_distance: Immediate physical proximity margin triggering evasion [m].
+        :param evade_retreat_speed: Linear retreat velocity magnitude for evasion [m/s].
+        :param evade_lift_speed: Upward vertical lift velocity component for evade_over [m/s].
+        :param descend_speed: Speed limit for vertical descent primitive [m/s].
+        :param lift_speed: Speed limit for vertical retract/lift primitive [m/s].
+        :param lateral_speed: Speed limit for sideways evasion primitives [m/s].
         """
         self.kin = kinematics
         self.H = horizon
@@ -47,6 +67,16 @@ class MotionPrimitiveLibrary:
         self.align_rot_gain = align_rot_gain
         self.approach_vel_slow = approach_vel_slow
         self.approach_vel_fast = approach_vel_fast
+        self.evade_min_distance = float(evade_min_distance)
+        self.evade_max_distance = float(evade_max_distance)
+        self.evade_ttc_threshold = float(evade_ttc_threshold)
+        self.evade_min_speed = float(evade_min_speed)
+        self.evade_imminent_distance = float(evade_imminent_distance)
+        self.evade_retreat_speed = float(evade_retreat_speed)
+        self.evade_lift_speed = float(evade_lift_speed)
+        self.descend_speed = float(descend_speed)
+        self.lift_speed = float(lift_speed)
+        self.lateral_speed = float(lateral_speed)
         self.last_primitive_names: List[str] = []
 
     def generate_primitives(
@@ -110,12 +140,12 @@ class MotionPrimitiveLibrary:
         # 2. Vertical Insertion & Retraction (Bottleneck & Peg-in-Hole)
         # ---------------------------------------------------------------------
         # Primitive: Vertical descent (-Z_world or +Z_ee)
-        v_descend = np.array([0.0, 0.0, -0.08], dtype=np.float32)
+        v_descend = np.array([0.0, 0.0, -self.descend_speed], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_descend))
         primitive_names.append("descend_z")
 
         # Primitive: Vertical retract (+Z_world) to safely disengage
-        v_lift = np.array([0.0, 0.0, 0.10], dtype=np.float32)
+        v_lift = np.array([0.0, 0.0, self.lift_speed], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_lift))
         primitive_names.append("lift_z")
 
@@ -123,12 +153,12 @@ class MotionPrimitiveLibrary:
         # 3. Lateral, Upward & Reactive Obstacle Evasion Primitives (Bypass Obstacles)
         # ---------------------------------------------------------------------
         # Sidestep Left (+Y world)
-        v_left = np.array([0.0, 0.12, 0.0], dtype=np.float32)
+        v_left = np.array([0.0, self.lateral_speed, 0.0], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_left))
         primitive_names.append("side_left")
 
         # Sidestep Right (-Y world)
-        v_right = np.array([0.0, -0.12, 0.0], dtype=np.float32)
+        v_right = np.array([0.0, -self.lateral_speed, 0.0], dtype=np.float32)
         primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_right))
         primitive_names.append("side_right")
 
@@ -136,19 +166,36 @@ class MotionPrimitiveLibrary:
         primitives.append(self._create_parabolic_arc(q_current, qd_current, forward_speed=0.08, arc_height=0.12))
         primitive_names.append("upward_arc")
 
-        # Reactive Obstacle Evasion Primitive:
-        # Generates a repulsive velocity vector directed away from closest dynamic obstacle
+        # Reactive Obstacle Evasion Primitive (Time-To-Collision & Approach aware):
+        # Generates a repulsive velocity vector directed away from dynamic approaching obstacles
         if obstacles:
             for obs in obstacles:
                 obs_pos = np.array(obs.get('position', [0, 0, 0]), dtype=np.float32)
+                obs_vel = np.array(obs.get('velocity', [0, 0, 0]), dtype=np.float32)
                 vec_away = ee_pos - obs_pos
                 dist_obs = np.linalg.norm(vec_away)
-                if 0.01 < dist_obs < 0.40:
-                    v_evade = (vec_away / dist_obs) * 0.15 # 15 cm/s evasive retreat
+                vel_obs_mag = float(np.linalg.norm(obs_vel))
+
+                # Relative approach velocity: positive if obstacle is closing in towards robot EE
+                if dist_obs > 1e-4:
+                    v_approach = float(-np.dot(vec_away / dist_obs, obs_vel))
+                else:
+                    v_approach = 0.0
+
+                is_approaching = (vel_obs_mag > self.evade_min_speed) and (v_approach > 0.02)
+                ttc = (dist_obs / v_approach) if (is_approaching and v_approach > 1e-4) else float('inf')
+
+                # Active threat condition:
+                # 1. Dynamic approaching threat: obstacle moves towards robot, within max distance, TTC < threshold
+                # 2. Imminent static proximity: obstacle closer than emergency clearance margin
+                is_threat = (is_approaching and dist_obs < self.evade_max_distance and ttc < self.evade_ttc_threshold) or (dist_obs < self.evade_imminent_distance)
+
+                if is_threat and (self.evade_min_distance < dist_obs < self.evade_max_distance):
+                    v_evade = (vec_away / dist_obs) * self.evade_retreat_speed
                     primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_evade))
                     primitive_names.append("evade_obs")
                     # Also an upward bypass arc over the obstacle
-                    v_over = (vec_away / dist_obs) * 0.08 + np.array([0.0, 0.0, 0.12], dtype=np.float32)
+                    v_over = (vec_away / dist_obs) * (self.evade_retreat_speed * 0.5) + np.array([0.0, 0.0, self.evade_lift_speed], dtype=np.float32)
                     primitives.append(self._project_cartesian_linear_velocity(q_current, qd_current, v_over))
                     primitive_names.append("evade_over")
                     break

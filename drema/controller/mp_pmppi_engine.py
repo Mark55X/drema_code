@@ -104,7 +104,24 @@ class MPPMPPIEngine:
         sigma_1: float = 0.02,
         sigma_2: float = 0.08,
         kappa: float = 15.0,
-        adaptive_goal_margin: bool = True
+        adaptive_goal_margin: bool = True,
+        # ---------------------------------------------------------------------
+        # Dynamic Collision Evasion Thresholds (TTC / Approach velocity):
+        # - evade_min_distance: Min distance threshold to avoid numerical singularities [m]
+        # - evade_max_distance: Max search radius for evasive obstacle tracking [m]
+        # - evade_ttc_threshold: Time-To-Collision threshold to trigger active evasion [s]
+        # - evade_min_speed: Speed threshold to classify obstacle as dynamic [m/s]
+        # - evade_imminent_distance: Immediate physical proximity margin [m]
+        # - evade_retreat_speed: Speed of evasive retreat [m/s]
+        # - evade_lift_speed: Vertical upward lift speed in evade_over [m/s]
+        # ---------------------------------------------------------------------
+        evade_min_distance: float = 0.01,
+        evade_max_distance: float = 0.35,
+        evade_ttc_threshold: float = 2.0,
+        evade_min_speed: float = 0.03,
+        evade_imminent_distance: float = 0.06,
+        evade_retreat_speed: float = 0.15,
+        evade_lift_speed: float = 0.12
     ):
         self.kin = kinematics if kinematics is not None else FrankaKinematics()
         self.H = horizon
@@ -136,7 +153,14 @@ class MPPMPPIEngine:
             kinematics=self.kin,
             horizon=self.H,
             dt=self.dt,
-            max_joint_acc=self.max_acc
+            max_joint_acc=self.max_acc,
+            evade_min_distance=evade_min_distance,
+            evade_max_distance=evade_max_distance,
+            evade_ttc_threshold=evade_ttc_threshold,
+            evade_min_speed=evade_min_speed,
+            evade_imminent_distance=evade_imminent_distance,
+            evade_retreat_speed=evade_retreat_speed,
+            evade_lift_speed=evade_lift_speed
         )
 
         # ---------------------------------------------------------------------
@@ -307,11 +331,17 @@ class MPPMPPIEngine:
                 obs_info_list = digital_twin.get_tracked_obstacles_info()
                 for obs in obs_info_list:
                     if not obs.get('is_target', False):
-                        obs_list.append({'position': obs['position']})
+                        obs_list.append({
+                            'position': obs['position'],
+                            'velocity': obs.get('velocity', (0.0, 0.0, 0.0))
+                        })
             elif hasattr(digital_twin, 'tracked_objects'):
                 for obj in digital_twin.tracked_objects.values():
                     if not obj.get('is_target', False) and 'target_pos' in obj:
-                        obs_list.append({'position': tuple(obj['target_pos'])})
+                        obs_list.append({
+                            'position': tuple(obj['target_pos']),
+                            'velocity': tuple(obj.get('target_vel', (0.0, 0.0, 0.0)))
+                        })
 
 
         U_p = self.primitive_lib.generate_primitives(

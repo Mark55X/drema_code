@@ -42,7 +42,14 @@ class MPCController:
         sigma_1: float = 0.02,                    # Inscribed hard safety collision margin (m)
         sigma_2: float = 0.08,                    # Inflation potential radius (m)
         kappa: float = 15.0,                      # Descending potential slope
-        adaptive_goal_margin: bool = True         # Adaptive inflation radius near goal (<25cm)
+        adaptive_goal_margin: bool = True,        # Adaptive inflation radius near goal (<25cm)
+        evade_min_distance: float = 0.01,
+        evade_max_distance: float = 0.35,
+        evade_ttc_threshold: float = 2.0,
+        evade_min_speed: float = 0.03,
+        evade_imminent_distance: float = 0.06,
+        evade_retreat_speed: float = 0.15,
+        evade_lift_speed: float = 0.12
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
@@ -70,7 +77,14 @@ class MPCController:
             sigma_1=sigma_1,
             sigma_2=sigma_2,
             kappa=kappa,
-            adaptive_goal_margin=adaptive_goal_margin
+            adaptive_goal_margin=adaptive_goal_margin,
+            evade_min_distance=evade_min_distance,
+            evade_max_distance=evade_max_distance,
+            evade_ttc_threshold=evade_ttc_threshold,
+            evade_min_speed=evade_min_speed,
+            evade_imminent_distance=evade_imminent_distance,
+            evade_retreat_speed=evade_retreat_speed,
+            evade_lift_speed=evade_lift_speed
         )
 
     def set_digital_twin(self, digital_twin: Any) -> None:

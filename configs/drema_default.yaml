@@ -144,3 +144,12 @@ controller:
   sigma_2: 0.08                      # Inflation radius [m] - calibrated for tabletop manipulation (was 0.15)
   kappa: 15.0                        # Descending potential slope (Zhou et al. Eq. 21)
   adaptive_goal_margin: true         # Gracefully scale inflation bubble when reaching close to goal (<25cm)
+  # Dynamic Collision Evasion Thresholds (TTC / Approach velocity aware)
+  evade_min_distance: 0.01           # Min distance threshold to avoid numerical singularities [m]
+  evade_max_distance: 0.35           # Max search radius for evasive obstacle tracking [m]
+  evade_ttc_threshold: 2.0           # Time-to-Collision threshold to trigger active evasion [s]
+  evade_min_speed: 0.03              # Speed threshold to classify obstacle as dynamic [m/s]
+  evade_imminent_distance: 0.06      # Immediate physical proximity margin triggering evasion [m]
+  evade_retreat_speed: 0.15          # Linear retreat speed for evasive maneuvers [m/s]
+  evade_lift_speed: 0.12             # Upward vertical lift component for evade_over [m/s]
+
