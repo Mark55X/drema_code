@@ -38,7 +38,11 @@ class MPCController:
         top_k: int = 12,                          # Candidates evaluated by the Judge
         max_joint_acc: float = 0.50,              # Joint acceleration saturation limit (rad/s^2)
         alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
-        alpha_rot: float = 0.25                   # Orientation error weight (Zhou et al. Eq. 27)
+        alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
+        sigma_1: float = 0.02,                    # Inscribed hard safety collision margin (m)
+        sigma_2: float = 0.08,                    # Inflation potential radius (m)
+        kappa: float = 15.0,                      # Descending potential slope
+        adaptive_goal_margin: bool = True         # Adaptive inflation radius near goal (<25cm)
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
@@ -62,7 +66,11 @@ class MPCController:
             alpha_mu=0.8,
             alpha_sigma=0.2,
             alpha_pos=alpha_pos,
-            alpha_rot=alpha_rot
+            alpha_rot=alpha_rot,
+            sigma_1=sigma_1,
+            sigma_2=sigma_2,
+            kappa=kappa,
+            adaptive_goal_margin=adaptive_goal_margin
         )
 
     def set_digital_twin(self, digital_twin: Any) -> None:

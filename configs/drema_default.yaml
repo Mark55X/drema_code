@@ -140,3 +140,7 @@ controller:
   alpha_pos: 1.0                     # Cartesian position tracking weight (Zhou et al. Eq. 27)
   alpha_rot: 0.25                    # Cartesian orientation tracking weight (Zhou et al. Eq. 27)
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
+  sigma_1: 0.02                      # Inscribed hard safety collision margin [m]
+  sigma_2: 0.08                      # Inflation radius [m] - calibrated for tabletop manipulation (was 0.15)
+  kappa: 15.0                        # Descending potential slope (Zhou et al. Eq. 21)
+  adaptive_goal_margin: true         # Gracefully scale inflation bubble when reaching close to goal (<25cm)

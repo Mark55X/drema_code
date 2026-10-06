@@ -540,7 +540,7 @@ class CoppeliaSimulationClient:
                     try:
                         target_obj = task_inst.target
                         pos = list(target_obj.get_position())
-                        if hasattr(task_inst, 'target_ee_orientation'):
+                        if hasattr(task_inst, 'target_ee_orientation') and task_inst.target_ee_orientation is not None:
                             target_pose = pos + list(task_inst.target_ee_orientation)
                         else:
                             # Position-only goal if no EE orientation specified by task

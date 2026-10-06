@@ -93,7 +93,18 @@ class MPPMPPIEngine:
         convergence_radius_xi: float = 0.03,
         rho_modulation: float = 0.8,
         alpha_pos: float = 1.0,
-        alpha_rot: float = 0.25
+        alpha_rot: float = 0.25,
+        # ---------------------------------------------------------------------
+        # Collision Potential Parameters (Zhou et al. Eq. 21):
+        # - sigma_1: Inscribed hard safety collision margin (m)
+        # - sigma_2: Inflation potential radius (m, default 0.08m for manipulation)
+        # - kappa: Exponential decay slope
+        # - adaptive_goal_margin: Dynamically narrows inflation near goal (<25cm)
+        # ---------------------------------------------------------------------
+        sigma_1: float = 0.02,
+        sigma_2: float = 0.08,
+        kappa: float = 15.0,
+        adaptive_goal_margin: bool = True
     ):
         self.kin = kinematics if kinematics is not None else FrankaKinematics()
         self.H = horizon
@@ -115,9 +126,10 @@ class MPPMPPIEngine:
         self.alpha_rot = float(alpha_rot)
 
         # SDF potential parameters (Zhou et al. Eq. 21)
-        self.sigma_1 = 0.02   # Inscribed safety margin [m]
-        self.sigma_2 = 0.15   # Inflation radius [m]
-        self.kappa = 15.0     # Descending potential slope
+        self.sigma_1 = float(sigma_1)   # Inscribed safety margin [m]
+        self.sigma_2 = float(sigma_2)   # Inflation radius [m]
+        self.kappa = float(kappa)       # Descending potential slope
+        self.adaptive_goal_margin = bool(adaptive_goal_margin)
 
         # Motion Primitives Library (Mathisen et al. 2026)
         self.primitive_lib = MotionPrimitiveLibrary(
@@ -407,7 +419,9 @@ class MPPMPPIEngine:
         coll_p_costs, coll_gvm_costs = self._evaluate_collision_costs(
             Q=Q,
             QD=QD,
-            digital_twin=digital_twin
+            digital_twin=digital_twin,
+            target_pos=target_pos,
+            q_curr=q_curr
         )
         t_coll_ms = (time.perf_counter() - t_coll_start) * 1000.0
 
@@ -613,7 +627,9 @@ class MPPMPPIEngine:
         self,
         Q: np.ndarray,
         QD: np.ndarray,
-        digital_twin: Optional[Any]
+        digital_twin: Optional[Any],
+        target_pos: Optional[np.ndarray] = None,
+        q_curr: Optional[np.ndarray] = None
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Evaluates C_P (SDF potential penalty) and C_GVM-SDF (Gradient-Velocity Modulated
@@ -624,12 +640,22 @@ class MPPMPPIEngine:
         if digital_twin is None:
             return np.zeros((K, H), dtype=np.float32), np.zeros((K, H), dtype=np.float32)
 
+        # Dynamically scale inflation margin near target to avoid false repulsion barrier,
+        # while strictly maintaining hard physical collision safety sigma_1.
+        eff_sigma_2 = self.sigma_2
+        if self.adaptive_goal_margin and target_pos is not None:
+            q_ref = q_curr if q_curr is not None else Q[0, 0]
+            ee_p_curr, _ = self.kin.forward_kinematics_ee(q_ref)
+            d_to_goal = float(np.linalg.norm(ee_p_curr - target_pos))
+            if d_to_goal < 0.25:
+                eff_sigma_2 = max(self.sigma_1 + 0.02, min(self.sigma_2, d_to_goal * 0.6))
+
         if hasattr(digital_twin, 'compute_trajectory_collision_costs'):
             return digital_twin.compute_trajectory_collision_costs(
                 Q=Q,
                 QD=QD,
                 sigma_1=self.sigma_1,
-                sigma_2=self.sigma_2,
+                sigma_2=eff_sigma_2,
                 kappa=self.kappa,
                 rho=self.rho,
                 kin_helper=self.kin,

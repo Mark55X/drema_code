@@ -211,7 +211,11 @@ class DremaDynamicSystem:
             top_k=int(ctrl_cfg.get("top_k", 12)),
             max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 0.50)),
             alpha_pos=float(ctrl_cfg.get("alpha_pos", 1.0)),
-            alpha_rot=float(ctrl_cfg.get("alpha_rot", 0.25))
+            alpha_rot=float(ctrl_cfg.get("alpha_rot", 0.25)),
+            sigma_1=float(ctrl_cfg.get("sigma_1", 0.02)),
+            sigma_2=float(ctrl_cfg.get("sigma_2", 0.08)),
+            kappa=float(ctrl_cfg.get("kappa", 15.0)),
+            adaptive_goal_margin=bool(ctrl_cfg.get("adaptive_goal_margin", True))
         )
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 
