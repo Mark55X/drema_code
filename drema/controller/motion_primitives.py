@@ -166,9 +166,10 @@ class MotionPrimitiveLibrary:
             primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_align))
             primitive_names.append("align_rot")
 
-        w_screw = z_ee * 0.5  # 0.5 rad/s pure rotation around tool axis
-        primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_screw))
-        primitive_names.append("screw_tool")
+        # Pure rotational screw primitive disabled to avoid zero-velocity local minima
+        # w_screw = z_ee * 0.5  # 0.5 rad/s pure rotation around tool axis
+        # primitives.append(self._project_cartesian_twist(q_current, qd_current, v_linear=np.zeros(3, dtype=np.float32), w_angular=w_screw))
+        # primitive_names.append("screw_tool")
 
         # ---------------------------------------------------------------------
         # 5. Deceleration / Brake Primitive (Safe Stop / Hold)
