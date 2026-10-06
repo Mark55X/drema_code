@@ -227,12 +227,7 @@ class MPPMPPIEngine:
                 q_norm = float(np.linalg.norm(target_quat))
                 if q_norm > 1e-6:
                     target_quat = target_quat / q_norm
-                qx, qy, qz, qw = target_quat
-                target_rot_mat = np.array([
-                    [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw),       2.0 * (qx * qz + qy * qw)],
-                    [2.0 * (qx * qy + qz * qw),       1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
-                    [2.0 * (qx * qz - qy * qw),       2.0 * (qy * qz + qx * qw),       1.0 - 2.0 * (qx * qx + qy * qy)]
-                ], dtype=np.float32)
+                target_rot_mat = self.kin.quat_to_rot_matrix(target_quat)
 
         # ---------------------------------------------------------------------
         # Step 1: Inverse Kinematics Guidance Target (q_des,t, Eq. 26)

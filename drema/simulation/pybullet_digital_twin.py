@@ -20,6 +20,7 @@ import pybullet_data
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 from drema.controller.franka_kinematics import FrankaKinematics
+from scipy.spatial.transform import Rotation
 
 
 class PyBulletDigitalTwin(BaseDigitalTwin):
@@ -532,8 +533,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             if target_quat is not None:
                 tq = np.asarray(target_quat)
                 if tq.shape == (3, 3):
-                    q_conv = FrankaKinematics.rot_matrix_to_quat(tq)
-                    kwargs["targetOrientation"] = [float(x) for x in q_conv]
+                    kwargs["targetOrientation"] = [float(x) for x in Rotation.from_matrix(tq).as_quat()]
                 elif len(tq.flatten()) == 4:
                     kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 

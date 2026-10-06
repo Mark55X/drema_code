@@ -219,12 +219,5 @@ class MPCController:
 
     @staticmethod
     def _quat_to_rot_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:
-        """Converts quaternion (x, y, z, w) to 3x3 rotation matrix."""
-        norm = np.sqrt(x * x + y * y + z * z + w * w)
-        if norm > 1e-6:
-            x, y, z, w = x / norm, y / norm, z / norm, w / norm
-        return np.array([
-            [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),       2.0 * (x * z + y * w)],
-            [2.0 * (x * y + z * w),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z - x * w)],
-            [2.0 * (x * z - y * w),       2.0 * (y * z + x * w),       1.0 - 2.0 * (x * x + y * y)]
-        ], dtype=np.float32)
+        """Converts quaternion (x, y, z, w) to 3x3 rotation matrix using FrankaKinematics (scipy)."""
+        return FrankaKinematics.quat_to_rot_matrix(np.array([x, y, z, w], dtype=np.float32))

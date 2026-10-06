@@ -105,3 +105,5 @@ controller:
   max_joint_acc: 0.50
   num_samples_per_planner: 24
   top_k: 12
+  alpha_pos: 1.0
+  alpha_rot: 0.25

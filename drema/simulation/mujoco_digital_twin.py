@@ -15,6 +15,7 @@ import sys
 import time
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union, Any
+from scipy.spatial.transform import Rotation
 
 try:
     import mujoco
@@ -801,7 +802,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             if tq.shape == (3, 3):
                 rot_mat = tq.astype(np.float64)
             elif len(tq.flatten()) == 4:
-                from scipy.spatial.transform import Rotation
                 rot_mat = Rotation.from_quat(tq.flatten()).as_matrix().astype(np.float64)
 
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "tcp")

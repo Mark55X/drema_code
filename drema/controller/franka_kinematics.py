@@ -16,6 +16,7 @@ References:
 
 import numpy as np
 from typing import Tuple, List, Optional, Dict, Union
+from scipy.spatial.transform import Rotation
 
 
 class FrankaKinematics:
@@ -261,53 +262,22 @@ class FrankaKinematics:
     @staticmethod
     def rot_matrix_to_quat(R: np.ndarray) -> np.ndarray:
         """
-        Converts a 3x3 rotation matrix to a normalized quaternion [qx, qy, qz, qw] (scalar-last).
+        Converts a 3x3 rotation matrix to a normalized quaternion [qx, qy, qz, qw] (scalar-last)
+        using scipy.spatial.transform.Rotation.
         """
-        tr = float(R[0, 0] + R[1, 1] + R[2, 2])
-        if tr > 0.0:
-            s = 0.5 / np.sqrt(tr + 1.0)
-            qw = 0.25 / s
-            qx = (R[2, 1] - R[1, 2]) * s
-            qy = (R[0, 2] - R[2, 0]) * s
-            qz = (R[1, 0] - R[0, 1]) * s
-        elif (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
-            s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
-            qw = (R[2, 1] - R[1, 2]) / s
-            qx = 0.25 * s
-            qy = (R[0, 1] + R[1, 0]) / s
-            qz = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
-            qw = (R[0, 2] - R[2, 0]) / s
-            qx = (R[0, 1] + R[1, 0]) / s
-            qy = 0.25 * s
-            qz = (R[1, 2] + R[2, 1]) / s
-        else:
-            s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
-            qw = (R[1, 0] - R[0, 1]) / s
-            qx = (R[0, 2] + R[2, 0]) / s
-            qy = (R[1, 2] + R[2, 1]) / s
-            qz = 0.25 * s
-
-        q = np.array([qx, qy, qz, qw], dtype=np.float32)
-        norm = np.linalg.norm(q)
-        return q / norm if norm > 1e-6 else np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+        return Rotation.from_matrix(R).as_quat().astype(np.float32)
 
     @staticmethod
     def quat_to_rot_matrix(q: np.ndarray) -> np.ndarray:
         """
-        Converts a normalized quaternion [qx, qy, qz, qw] (scalar-last) to a 3x3 rotation matrix.
+        Converts a normalized quaternion [qx, qy, qz, qw] (scalar-last) to a 3x3 rotation matrix
+        using scipy.spatial.transform.Rotation.
         """
         q_arr = np.asarray(q, dtype=np.float32).flatten()
         norm = float(np.linalg.norm(q_arr))
         if norm > 1e-6:
             q_arr = q_arr / norm
-        qx, qy, qz, qw = float(q_arr[0]), float(q_arr[1]), float(q_arr[2]), float(q_arr[3])
-        return np.array([
-            [1.0 - 2.0 * (qy * qy + qz * qz), 2.0 * (qx * qy - qz * qw),       2.0 * (qx * qz + qy * qw)],
-            [2.0 * (qx * qy + qz * qw),       1.0 - 2.0 * (qx * qx + qz * qz), 2.0 * (qy * qz - qx * qw)],
-            [2.0 * (qx * qz - qy * qw),       2.0 * (qy * qz + qx * qw),       1.0 - 2.0 * (qx * qx + qy * qy)]
-        ], dtype=np.float32)
+        return Rotation.from_quat(q_arr).as_matrix().astype(np.float32)
 
     def batch_forward_kinematics_ee(
         self,
