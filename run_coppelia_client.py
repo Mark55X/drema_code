@@ -240,11 +240,10 @@ class CoppeliaSimulationClient:
             print(f"[CoppeliaClient Scan] Extracted {len(semantic_labels)} semantic labels from CoppeliaSim scene.")
 
             # Retrieve real robot base position and initial joint positions
-            robot_base_pos = [0.0, 0.0, 0.0]
+            robot_base_pos = self.get_calibrated_robot_base_pos()
             robot_joint_positions = []
             if hasattr(self, 'task') and hasattr(self.task, '_robot'):
                 try:
-                    robot_base_pos = list(self.task._robot.arm.get_position())
                     robot_joint_positions = list(self.task._robot.arm.get_joint_positions())
                 except Exception:
                     pass
@@ -438,6 +437,29 @@ class CoppeliaSimulationClient:
                 continue
         return cam_dict
 
+    def get_calibrated_robot_base_pos(self) -> List[float]:
+        """
+        Computes true world origin coordinates of panda_link0 base frame [x, y, z].
+        In CoppeliaSim, arm.get_position() returns the pedestal bounding root [-0.309, 0.0, 0.820].
+        However, the physical robot kinematic chain starts at the tabletop mount where
+        Joint 1 is positioned at d1 = 0.333m above panda_link0.
+        Thus: base_z = j1_z - 0.333m = 0.750m (exact tabletop level).
+        """
+        if hasattr(self, 'task') and hasattr(self.task, '_robot'):
+            arm = getattr(self.task._robot, 'arm', None)
+            if arm is not None and hasattr(arm, 'joints') and len(arm.joints) > 0:
+                try:
+                    j1 = arm.joints[0].get_position()
+                    return [float(j1[0]), float(j1[1]), float(j1[2] - 0.333)]
+                except Exception:
+                    pass
+            if arm is not None and hasattr(arm, 'get_position'):
+                try:
+                    return [float(x) for x in arm.get_position()]
+                except Exception:
+                    pass
+        return [0.0, 0.0, 0.0]
+
     def run(self):
         """Main execution loop balancing sensing and control rates."""
         print(f"[CoppeliaClient] Simulation loop started (Sync Mode: {self.sync_mode}).")
@@ -446,6 +468,25 @@ class CoppeliaSimulationClient:
         robot = self.task._robot
         arm = robot.arm
         gripper = robot.gripper
+
+        try:
+            tip_rel_j7 = arm.get_tip().get_position(relative_to=arm.joints[6])
+            tip_rel_arm = arm.get_tip().get_position(relative_to=arm)
+            print("\n" + "=" * 60)
+            print("  [KINEMATICS INSPECTION FROM COPPELIASIM]")
+            print(f"  • Robot model root pos (arm.get_position()):      {arm.get_position().round(5).tolist()}")
+            print(f"  • Robot model root ori (arm.get_orientation()):   {np.array(arm.get_orientation()).round(5).tolist()}")
+            print(f"  • Joint 1 world pos (arm.joints[0]):              {arm.joints[0].get_position().round(5).tolist()}")
+            print(f"  • Joint 1 world ori (arm.joints[0]):              {np.array(arm.joints[0].get_orientation()).round(5).tolist()}")
+            print(f"  • Joint 7 world pos (arm.joints[6]):              {arm.joints[6].get_position().round(5).tolist()}")
+            print(f"  • Joint 7 world ori (arm.joints[6]):              {np.array(arm.joints[6].get_orientation()).round(5).tolist()}")
+            print(f"  • Fingertip world pos (arm.get_tip()):           {arm.get_tip().get_position().round(5).tolist()}")
+            print(f"  • Fingertip world ori (arm.get_tip()):           {np.array(arm.get_tip().get_orientation()).round(5).tolist()}")
+            print(f"  • Fingertip offset relative to Joint 7:           {tip_rel_j7.round(5).tolist()}")
+            print(f"  • Fingertip offset relative to Arm Root:          {tip_rel_arm.round(5).tolist()}")
+            print("=" * 60 + "\n")
+        except Exception as e:
+            print(f"[KINEMATICS INSPECTION ERROR] {e}")
 
         # If server is already online at launch, perform initial scan if needed
         if self.server_connected and not self.initial_scan_done:
@@ -497,7 +538,7 @@ class CoppeliaSimulationClient:
                 self.step_counter += 1
 
                 # 1. Perception Step (f_cam ≈ 10 Hz): capture and push frames only when scene is initialized
-                robot_base_pos = list(arm.get_position()) if hasattr(arm, 'get_position') else [0.0, 0.0, 0.0]
+                robot_base_pos = self.get_calibrated_robot_base_pos()
                 q = list(arm.get_joint_positions()) if hasattr(arm, 'get_joint_positions') else []
                 is_cam_step = (self.step_counter % self.cam_decimation == 0)
                 if is_cam_step and self.server_connected and self.initial_scan_done:

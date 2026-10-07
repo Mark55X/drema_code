@@ -78,10 +78,11 @@ class FrankaKinematics:
 
     # -------------------------------------------------------------------------
     # End-Effector / Gripper TCP Offset from Joint 7 Flange [m]
-    # Source (Official franka_hand.xacro, tcp_xyz='0 0 0.1034'):
-    # https://github.com/frankaemika/franka_ros/blob/develop/franka_description/robots/common/franka_hand.xacro
+    # Calibrated to Panda_tip in CoppeliaSim: total offset from Joint 7 is 0.21703m.
+    # With d7 = 0.107m (Joint 7 to flange), the flange to tip offset is:
+    # 0.21703m - 0.10700m = 0.11003m (with [0.00139, 0.00144] lateral offsets).
     # -------------------------------------------------------------------------
-    EE_OFFSET = np.array([0.0, 0.0, 0.1034], dtype=np.float32)
+    EE_OFFSET = np.array([0.00139, 0.00144, 0.11003], dtype=np.float32)
 
     def __init__(self, base_position: Optional[np.ndarray] = None):
         """
