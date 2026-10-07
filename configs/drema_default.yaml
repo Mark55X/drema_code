@@ -141,9 +141,9 @@ controller:
   alpha_rot: 0.25                    # Cartesian orientation tracking weight (Zhou et al. Eq. 27)
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
   sigma_1: 0.02                      # Inscribed hard safety collision margin [m]
-  sigma_2: 0.08                      # Inflation radius [m] - calibrated for tabletop manipulation (was 0.15)
+  sigma_2: 0.05                      # Inflation radius [m] - calibrated for dense tabletop manipulation (was 0.08)
   kappa: 15.0                        # Descending potential slope (Zhou et al. Eq. 21)
-  adaptive_goal_margin: true         # Gracefully scale inflation bubble when reaching close to goal (<25cm)
+  adaptive_goal_margin: false        # Strict adherence to Zhou et al. Eq. 21 without ad-hoc tapering heuristics
   # Dynamic Collision Evasion Thresholds (TTC / Approach velocity aware)
   evade_min_distance: 0.01           # Min distance threshold to avoid numerical singularities [m]
   evade_max_distance: 0.35           # Max search radius for evasive obstacle tracking [m]

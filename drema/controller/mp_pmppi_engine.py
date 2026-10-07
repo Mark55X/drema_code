@@ -97,14 +97,14 @@ class MPPMPPIEngine:
         # ---------------------------------------------------------------------
         # Collision Potential Parameters (Zhou et al. Eq. 21):
         # - sigma_1: Inscribed hard safety collision margin (m)
-        # - sigma_2: Inflation potential radius (m, default 0.08m for manipulation)
+        # - sigma_2: Inflation potential radius (m, default 0.05m for dense tabletop manipulation)
         # - kappa: Exponential decay slope
-        # - adaptive_goal_margin: Dynamically narrows inflation near goal (<25cm)
+        # - adaptive_goal_margin: Optional adaptive margin flag (default False for strict Zhou et al. Eq. 21)
         # ---------------------------------------------------------------------
         sigma_1: float = 0.02,
-        sigma_2: float = 0.08,
+        sigma_2: float = 0.05,
         kappa: float = 15.0,
-        adaptive_goal_margin: bool = True,
+        adaptive_goal_margin: bool = False,
         # ---------------------------------------------------------------------
         # Dynamic Collision Evasion Thresholds (TTC / Approach velocity):
         # - evade_min_distance: Min distance threshold to avoid numerical singularities [m]
@@ -416,16 +416,14 @@ class MPPMPPIEngine:
             dist_cart = self.alpha_pos * err_pos + self.alpha_rot * err_rot
 
             if q_des_t is not None:
-                # Joint-space goal distance: ||q_{i,h} - q_{des,t}||_2 (Eq. 26)
+                # Joint-space posture regularizer (Eq. 26) combined with Cartesian tracking (Eq. 27):
+                # Preserves strong Cartesian position/orientation gradient to drive TCP directly to goal,
+                # while penalizing unnatural nullspace posture drift away from q_des_t.
                 diff = Q - q_des_t[None, None, :]
                 dist_joint = np.linalg.norm(diff, axis=-1)
-                # Augment joint-space tracking with direct Cartesian orientation cost
-                if target_quat is not None:
-                    dist_matrix = dist_joint + self.alpha_rot * err_rot
-                else:
-                    dist_matrix = dist_joint
+                dist_matrix = dist_cart + 0.2 * dist_joint
             else:
-                # Cartesian goal distance fallback (Eq. 27)
+                # Pure Cartesian goal distance fallback (Eq. 27)
                 dist_matrix = dist_cart
 
             goal_costs = dist_matrix.copy()

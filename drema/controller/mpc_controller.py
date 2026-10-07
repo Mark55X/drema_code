@@ -40,9 +40,9 @@ class MPCController:
         alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
         alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
         sigma_1: float = 0.02,                    # Inscribed hard safety collision margin (m)
-        sigma_2: float = 0.08,                    # Inflation potential radius (m)
+        sigma_2: float = 0.05,                    # Inflation potential radius (m)
         kappa: float = 15.0,                      # Descending potential slope
-        adaptive_goal_margin: bool = True,        # Adaptive inflation radius near goal (<25cm)
+        adaptive_goal_margin: bool = False,       # Strict Zhou et al. Eq. 21 without ad-hoc tapering
         evade_min_distance: float = 0.01,
         evade_max_distance: float = 0.35,
         evade_ttc_threshold: float = 2.0,
