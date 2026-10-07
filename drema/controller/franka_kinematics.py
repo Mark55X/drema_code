@@ -84,6 +84,21 @@ class FrankaKinematics:
     # -------------------------------------------------------------------------
     EE_OFFSET = np.array([0.00139, 0.00144, 0.11003], dtype=np.float32)
 
+    # -------------------------------------------------------------------------
+    # Precomputed Craig MDH screw transform along X_{i-1} [Rot_X(alpha) * Trans_X(a)]
+    # for exact geometric Jacobian calculation (each joint i rotates around the Z-axis
+    # of frame i-1 after the alpha_{i-1} twist and a_{i-1} offset).
+    # -------------------------------------------------------------------------
+    _MDH_RX_TX = [
+        np.array([
+            [1.0, 0.0, 0.0, a],
+            [0.0, np.cos(al), -np.sin(al), 0.0],
+            [0.0, np.sin(al), np.cos(al), 0.0],
+            [0.0, 0.0, 0.0, 1.0]
+        ], dtype=np.float32)
+        for a, al, d, th in MDH_PARAMS
+    ]
+
     def __init__(self, base_position: Optional[np.ndarray] = None):
         """
         :param base_position: 3D coordinates [x, y, z] of the robot base in world frame.
@@ -163,9 +178,10 @@ class FrankaKinematics:
         max_joint = 7 if link_idx == -1 or link_idx >= 7 else link_idx
 
         for i in range(max_joint):
-            T_prev = all_T[i]
-            z_i = T_prev[:3, 2]  # Z-axis of joint i
-            p_i = T_prev[:3, 3]  # Origin of joint i
+            # In Craig MDH, joint i rotation is about the Z-axis of frame i-1 after Rot_X(alpha_{i-1}) * Trans_X(a_{i-1}):
+            T_prime = all_T[i] @ self._MDH_RX_TX[i]
+            z_i = T_prime[:3, 2]  # Z-axis of joint i
+            p_i = T_prime[:3, 3]  # Origin of joint i
 
             # Linear velocity part: J_v = z_i x (p_target - p_i)
             J[:3, i] = np.cross(z_i, p_target - p_i)
