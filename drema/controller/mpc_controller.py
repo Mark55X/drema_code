@@ -39,9 +39,9 @@ class MPCController:
         max_joint_acc: float = 0.50,              # Joint acceleration saturation limit (rad/s^2)
         alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
         alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
-        sigma_1: float = 0.02,                    # Inscribed hard safety collision margin (m)
-        sigma_2: float = 0.05,                    # Inflation potential radius (m)
-        kappa: float = 15.0,                      # Descending potential slope
+        sigma_1: float = 0.015,                   # Inscribed hard safety collision margin (m)
+        sigma_2: float = 0.035,                   # Inflation potential radius (m)
+        kappa: float = 120.0,                     # Descending potential slope
         adaptive_goal_margin: bool = False,       # Strict Zhou et al. Eq. 21 without ad-hoc tapering
         evade_min_distance: float = 0.01,
         evade_max_distance: float = 0.35,

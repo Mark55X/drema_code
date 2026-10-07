@@ -688,6 +688,12 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                     total_contact_pts += len(closest_pts)
                     t_gvm_start = time.perf_counter()
 
+                    # Link-level aggregation (Zhou et al. IEEE T-RO 2025 Eq. 10, 21):
+                    # Collision potential is evaluated across robot kinematic links,
+                    # avoiding unnormalized summation over dense obstacle mesh vertices.
+                    link_phi_max: Dict[int, float] = {}
+                    link_gvm_max: Dict[int, float] = {}
+
                     for pt in closest_pts:
                         d = pt[8]
 
@@ -702,7 +708,9 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         if phi <= 1e-4:
                             continue
 
-                        step_coll_p += phi
+                        link_a = pt[3]
+                        if phi > link_phi_max.get(link_a, 0.0):
+                            link_phi_max[link_a] = phi
 
                         # 2. Distance Gradient Vector nabla Phi
                         normal_grad = np.array(pt[7], dtype=np.float32)
@@ -711,7 +719,6 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                             normal_grad = normal_grad / norm_mag
 
                         # 3. Relative Cartesian Velocity between closest robot link and moving obstacle
-                        link_a = pt[3]
                         fk_link_idx = -1 if (link_a < 0 or link_a >= 7) else (link_a + 1)
                         vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
 
@@ -734,8 +741,11 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         # 5. GVM-SDF Modulation Term
                         modulation = 1.0 - rho * cos_theta
                         gvm_term = phi * (1.0 + vel_mag * modulation)
-                        step_coll_gvm += gvm_term
+                        if gvm_term > link_gvm_max.get(link_a, 0.0):
+                            link_gvm_max[link_a] = gvm_term
 
+                    step_coll_p += sum(link_phi_max.values())
+                    step_coll_gvm += sum(link_gvm_max.values())
                     t_gvm_total += (time.perf_counter() - t_gvm_start)
 
                 coll_p[k, h] = step_coll_p

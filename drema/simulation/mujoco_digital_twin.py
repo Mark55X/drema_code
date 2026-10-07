@@ -995,8 +995,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 mujoco.mj_kinematics(self.model, eval_data)
                 t_mj_total += (time.perf_counter() - t_mj_s)
 
-                step_coll_p = 0.0
-                step_coll_gvm = 0.0
+                link_phi_max: Dict[int, float] = {}
+                link_gvm_max: Dict[int, float] = {}
 
                 for rg, fk_link_idx in robot_geom_link_map:
                     rg_pos = eval_data.geom_xpos[rg]
@@ -1036,7 +1036,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         total_contact_pts += 1
                         t_gvm_s = time.perf_counter()
 
-                        step_coll_p += phi
+                        if phi > link_phi_max.get(fk_link_idx, 0.0):
+                            link_phi_max[fk_link_idx] = phi
 
                         # 2. Distance Gradient Vector (from obstacle surface to robot link)
                         diff = fromto[0:3] - fromto[3:6]
@@ -1067,12 +1068,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         # 5. GVM-SDF Modulation Term
                         modulation = 1.0 - rho * cos_theta
                         gvm_term = phi * (1.0 + vel_mag * modulation)
-                        step_coll_gvm += gvm_term
+                        if gvm_term > link_gvm_max.get(fk_link_idx, 0.0):
+                            link_gvm_max[fk_link_idx] = gvm_term
 
                         t_gvm_total += (time.perf_counter() - t_gvm_s)
 
-                coll_p[k, h] = step_coll_p
-                coll_gvm[k, h] = step_coll_gvm
+                coll_p[k, h] = sum(link_phi_max.values())
+                coll_gvm[k, h] = sum(link_gvm_max.values())
 
         self.last_collision_timings = {
             'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',

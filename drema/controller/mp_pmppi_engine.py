@@ -101,9 +101,9 @@ class MPPMPPIEngine:
         # - kappa: Exponential decay slope
         # - adaptive_goal_margin: Optional adaptive margin flag (default False for strict Zhou et al. Eq. 21)
         # ---------------------------------------------------------------------
-        sigma_1: float = 0.02,
-        sigma_2: float = 0.05,
-        kappa: float = 15.0,
+        sigma_1: float = 0.015,
+        sigma_2: float = 0.035,
+        kappa: float = 120.0,
         adaptive_goal_margin: bool = False,
         # ---------------------------------------------------------------------
         # Dynamic Collision Evasion Thresholds (TTC / Approach velocity):
