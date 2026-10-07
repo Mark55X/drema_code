@@ -633,6 +633,33 @@ class MPPMPPIEngine:
             p_name = prim_names[p_i] if 0 <= p_i < len(prim_names) else f"#{p_i}"
             cand_desc = f"prim:{p_name}"
 
+        # Candidate cost breakdowns to diagnose why a primitive or sample is selected
+        st_dom = self.strategies[dom_planner]
+        coll_dom = coll_gvm_costs if st_dom['use_gvm'] else coll_p_costs
+
+        def _get_cand_costs(idx: int) -> dict:
+            if 0 <= idx < total_K:
+                c_tot = float(total_costs[dom_planner][idx])
+                c_goal = float(np.sum(st_dom['wg'] * goal_costs[idx]))
+                c_coll = float(np.sum(st_dom['wc'] * coll_dom[idx]))
+                c_safe = float(np.sum(st_dom['ws'] * safety_costs[idx]))
+                c_lim = float(np.sum(st_dom['ws'] * c_limits[idx]))
+                c_acc_val = float(np.sum(st_dom['ws'] * 0.01 * c_acc[idx]))
+                return {
+                    'total': c_tot, 'goal': c_goal, 'coll': c_coll,
+                    'safe': c_safe, 'limits': c_lim, 'acc': c_acc_val
+                }
+            return {}
+
+        top_costs = _get_cand_costs(best_cand_idx)
+
+        # Comparison with appr_slow if available and not winner
+        appr_costs = {}
+        if "appr_slow" in prim_names:
+            appr_idx = num_stoch + prim_names.index("appr_slow")
+            if appr_idx != best_cand_idx:
+                appr_costs = _get_cand_costs(appr_idx)
+
         diagnostics = {
             'calc_time_ms': calc_time_ms,
             'timings': timings_breakdown,
@@ -642,6 +669,8 @@ class MPPMPPIEngine:
             'best_sensitive_idx': int(topk_indices['sensitive'][0]),
             'top_candidate': cand_desc,
             'top_weight': best_cand_weight,
+            'top_costs': top_costs,
+            'appr_costs': appr_costs,
             'primitive_weight_sum': prim_weight_sum,
             'dominant_planner': dom_planner,
             'total_candidates': total_K,

@@ -697,6 +697,12 @@ class DremaDynamicSystem:
 
         if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
             print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
+            q_arr = list(robot_state.joint_positions)
+            qd_arr = list(action.joint_velocities)
+            q_str = "[" + ", ".join(f"{val:+.3f}" for val in q_arr) + "]" if q_arr else "[]"
+            qd_str = "[" + ", ".join(f"{val:+.3f}" for val in qd_arr) + "]" if qd_arr else "[]"
+            print(f"  └─ [TELEMETRY] q_pos  (J1..J7) [rad]:   {q_str}")
+            print(f"  └─ [TELEMETRY] qd_cmd (J1..J7) [rad/s]: {qd_str}")
             diag = getattr(self.mpc_controller, 'last_diagnostics', {})
             t_info = diag.get('timings', {})
             if t_info:

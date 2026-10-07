@@ -213,6 +213,14 @@ class MPCController:
         prim_w = diag.get('primitive_weight_sum', 0.0)
         mode_str = f" | top: {top_cand} ({top_w*100:.0f}%, prims: {prim_w*100:.0f}%)" if top_cand else ""
 
+        top_c = diag.get('top_costs', {})
+        appr_c = diag.get('appr_costs', {})
+        cost_str = ""
+        if top_c:
+            cost_str = f" | C[{top_cand}]={top_c.get('total', 0.0):.2f}(g:{top_c.get('goal', 0.0):.2f},s:{top_c.get('safe', 0.0):.2f},c:{top_c.get('coll', 0.0):.2f})"
+            if appr_c:
+                cost_str += f" vs C[appr]={appr_c.get('total', 0.0):.2f}(g:{appr_c.get('goal', 0.0):.2f},s:{appr_c.get('safe', 0.0):.2f})"
+
         timings = diag.get('timings', {})
         t_coll = timings.get('coll_ms', 0.0)
         t_samp = timings.get('samples_ms', 0.0)
@@ -220,7 +228,7 @@ class MPCController:
         time_breakdown_str = f" [Coll: {t_coll:.0f}ms, Roll: {t_samp:.0f}ms, Opt: {t_opt:.0f}ms]"
 
         status_msg = (
-            f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f}{mode_str} | "
+            f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f}{mode_str}{cost_str} | "
             f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{time_breakdown_str}{lim_str}{ik_str}"
         )
 

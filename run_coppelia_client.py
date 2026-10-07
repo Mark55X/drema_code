@@ -581,6 +581,23 @@ class CoppeliaSimulationClient:
                             f"[COPPELIA ENVIRONMENT] Step #{self.step_counter:04d} (Act #{self.active_actions_count:04d}) | "
                             f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s{d_tgt_str} | Status: '{action.status_message}'"
                         )
+                        q_str = "[" + ", ".join(f"{val:+.3f}" for val in q) + "]" if q else "[]"
+                        qd_str = "[" + ", ".join(f"{val:+.3f}" for val in action.joint_velocities) + "]" if action.joint_velocities else "[]"
+                        print(f"   ↳ q_pos  (J1..J7) [rad]:   {q_str}")
+                        print(f"   ↳ qd_cmd (J1..J7) [rad/s]: {qd_str}")
+                        if q and len(q) == 7:
+                            q_min = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
+                            q_max = np.array([ 2.8973,  1.7628,  2.8973, -0.0698,  2.8973,  3.7525,  2.8973])
+                            near_lims = []
+                            for j_i, val in enumerate(q):
+                                d_lo = val - q_min[j_i]
+                                d_hi = q_max[j_i] - val
+                                if d_lo < 0.10:
+                                    near_lims.append(f"J{j_i+1} near MIN ({d_lo:.3f} rad)")
+                                elif d_hi < 0.10:
+                                    near_lims.append(f"J{j_i+1} near MAX ({d_hi:.3f} rad)")
+                            if near_lims:
+                                print(f"   ↳ [LIMIT WARNING] {', '.join(near_lims)}")
                 else:
                     # Hold position: zero target velocities
                     arm.set_joint_target_velocities([0.0] * len(q))
