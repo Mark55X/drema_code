@@ -120,7 +120,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.robot_loaded = False
         self.robot_base_pos = np.array([0.0, 0.0, self.table_z], dtype=np.float64)
         self.robot_base_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64) # wxyz
-        self.robot_id = 1  # Standard ID for interface compatibility with PyBullet callers
+        self.robot_id = -1  # Negative ID until load_robot() is called
 
         # Scene components
         self.table_spawned = False
@@ -271,32 +271,17 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             qw, qx, qy, qz = obj["target_quat"]
 
             if self.tracking_mode == "mocap":
-                # Mocap Kinematic Anchor (Perception reference)
+                # Direct Kinematic Mocap Body (Perception-driven rigid obstacle)
+                # In MuJoCo, placing geoms directly on a mocap body guarantees zero constraint drift,
+                # instantaneous kinematic updates via eval_data/data mocap_pos, and exact collision distance queries.
                 mocap_body = (
-                    f'<body name="obs_{obj_id}_mocap" mocap="true" pos="{px:.6f} {py:.6f} {pz:.6f}" '
+                    f'<body name="obs_{obj_id}" mocap="true" pos="{px:.6f} {py:.6f} {pz:.6f}" '
                     f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">\n'
-                    f'  <geom type="sphere" size="0.005" rgba="1 1 1 0" contype="0" conaffinity="0"/>\n'
-                    f'</body>'
-                )
-                body_elements.append(mocap_body)
-
-                # Physical Dynamic Body
-                dyn_body = (
-                    f'<body name="obs_{obj_id}" pos="{px:.6f} {py:.6f} {pz:.6f}" '
-                    f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">\n'
-                    f'  <freejoint name="obs_{obj_id}_joint"/>\n'
                     f'  <geom name="obs_{obj_id}_geom" type="mesh" mesh="{mesh_name}" mass="{mass_val:.3f}" '
                     f'rgba="{rgba_str}" friction="0.5 0.005 0.0001"/>\n'
                     f'</body>'
                 )
-                body_elements.append(dyn_body)
-
-                # Weld Constraint linking dynamic body to mocap reference
-                # solref="0.02 1.0" provides critically damped 6-DoF constraint tracking
-                equality_constraints.append(
-                    f'<weld name="obs_{obj_id}_weld" body1="obs_{obj_id}_mocap" body2="obs_{obj_id}" '
-                    f'solref="0.015 1.0" solimp="0.9 0.95 0.001"/>'
-                )
+                body_elements.append(mocap_body)
             else:
                 # Direct Dynamic Body (for PD force or teleport mode)
                 dyn_body = (
@@ -364,8 +349,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         # Initialize mocap positions for obstacles
         if self.tracking_mode == "mocap":
             for obj_id, obj in self.tracked_objects.items():
-                mocap_name = f"obs_{obj_id}_mocap"
-                body_id = mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_BODY, mocap_name)
+                body_name = f"obs_{obj_id}"
+                body_id = mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                if body_id < 0:
+                    body_id = mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{obj_id}_mocap")
                 if body_id >= 0:
                     mocap_idx = new_model.body_mocapid[body_id]
                     if mocap_idx >= 0:
@@ -400,6 +387,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.robot_base_pos = np.array(base_position, dtype=np.float64)
         self.robot_base_quat = _xyzw_to_wxyz(base_orientation)
         self.robot_loaded = True
+        self.robot_id = 1
         self.kin = FrankaKinematics(base_position=self.robot_base_pos)
 
         self._rebuild_model()
@@ -554,13 +542,16 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             self.predictor.update_obstacle_pose(obj_id, position, orientation, timestamp=timestamp)
 
         if self.tracking_mode == "mocap":
-            mocap_name = f"obs_{obj_id}_mocap"
-            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, mocap_name)
+            body_name = f"obs_{obj_id}"
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            if body_id < 0:
+                body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{obj_id}_mocap")
             if body_id >= 0:
                 mocap_idx = self.model.body_mocapid[body_id]
                 if mocap_idx >= 0:
                     self.data.mocap_pos[mocap_idx] = pos_arr
                     self.data.mocap_quat[mocap_idx] = quat_wxyz
+                    mujoco.mj_forward(self.model, self.data)
         elif self.tracking_mode == "teleport":
             body_name = f"obs_{obj_id}"
             body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
@@ -583,6 +574,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         body_name = f"obs_{obj_id}"
         body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+        if body_id < 0:
+            body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{obj_id}_mocap")
         if body_id < 0:
             return None
 
@@ -962,8 +955,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         # Pre-cache mocap indices for tracked obstacles
         obj_mocap_map = {}
         for obj_id in predictions.keys():
-            m_name = f"obs_{obj_id}_mocap"
+            m_name = f"obs_{obj_id}"
             b_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, m_name)
+            if b_id < 0:
+                b_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{obj_id}_mocap")
             if b_id >= 0:
                 m_idx = self.model.body_mocapid[b_id]
                 if m_idx >= 0:

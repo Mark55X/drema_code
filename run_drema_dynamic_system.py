@@ -673,7 +673,11 @@ class DremaDynamicSystem:
             self.robot_base_pos = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
 
         # 1. Update Digital Twin robot configuration
-        if hasattr(self.digital_twin, 'robot_id') and self.digital_twin.robot_id < 0 and len(self.robot_base_pos) >= 3:
+        needs_robot_load = (
+            getattr(self.digital_twin, 'robot_id', -1) < 0
+            or not getattr(self.digital_twin, 'robot_loaded', False)
+        )
+        if needs_robot_load and len(self.robot_base_pos) >= 3:
             self.digital_twin.load_robot(
                 base_position=tuple(self.robot_base_pos.tolist()),
                 joint_positions=list(robot_state.joint_positions) if len(robot_state.joint_positions) > 0 else None
