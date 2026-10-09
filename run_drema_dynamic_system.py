@@ -201,6 +201,12 @@ class DremaDynamicSystem:
         # 2. Initialize Controller with Digital Twin reference
         ctrl_cfg = config.get_nested("controller", {})
         self.log_interval_actions = int(ctrl_cfg.get("log_interval_actions", 10))
+        self.max_action_age_s = float(ctrl_cfg.get("max_action_age_s", 0.20))
+        # Serializes MPC solves: gRPC runs RequestAction on a thread pool, and a client
+        # timeout does not cancel the server-side handler.
+        self._mpc_lock = threading.Lock()
+        self._last_action: Optional[drema_comm_pb2.ControlAction] = None
+        self._last_action_time = 0.0
         self.mpc_controller = MPCController(
             digital_twin=self.digital_twin,
             num_joints=7,
@@ -398,7 +404,10 @@ class DremaDynamicSystem:
         self.robot_joint_positions.clear()
         self.perception.reset()
         self.digital_twin.reset()
-        self.mpc_controller.reset()
+        with self._mpc_lock:
+            self.mpc_controller.reset()
+            self._last_action = None
+            self._last_action_time = 0.0
         if bool(self.config.get_nested("perception.cache.enabled", False)):
             self._try_startup_cache_restore()
         return True
@@ -605,9 +614,11 @@ class DremaDynamicSystem:
             if self.total_frames_processed % 10 == 0:
                 print(f"[DREMA DYNAMIC SYSTEM] [Dynamic Inference #{timestep:04d}] Active Gaussians: {res.active_gaussians_count:,} | Loop Latency: {res.latency_ms:.1f}ms | Tracked Objects: {len(res.tracked_object_poses)}")
                 if hasattr(self.digital_twin, 'predictor') and self.digital_twin.predictor is not None:
-                    preds = self.digital_twin.predictor.predict_all(horizon=15, dt=0.05)
+                    with self.digital_twin.state_lock:
+                        preds = self.digital_twin.predictor.predict_all(horizon=15, dt=0.05)
+                        states = {oid: self.digital_twin.predictor.get_estimated_state(oid) for oid in res.tracked_object_poses.keys()}
                     for oid in res.tracked_object_poses.keys():
-                        st = self.digital_twin.predictor.get_estimated_state(oid)
+                        st = states[oid]
                         if st is not None:
                             name_o = self.perception.tracked_objects.get(oid, {}).get('name', f"Obj #{oid}")
                             vel = st['velocity']
@@ -665,7 +676,39 @@ class DremaDynamicSystem:
                 pass
 
     def on_request_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
-        """gRPC callback triggered when the environment client requests joint velocity command."""
+        """
+        gRPC callback triggered when the environment client requests joint velocity command.
+        Only one MPC solve runs at a time; requests arriving during a solve get the latest action.
+        """
+        if not self._mpc_lock.acquire(blocking=False):
+            return self._busy_action(robot_state)
+        try:
+            action = self._solve_action(robot_state)
+            self._last_action = action
+            self._last_action_time = time.monotonic()
+            return action
+        finally:
+            self._mpc_lock.release()
+
+    def _busy_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
+        """Returns the last solved action while it is fresh, otherwise a zero-velocity hold."""
+        last = self._last_action
+        age = time.monotonic() - self._last_action_time
+        if robot_state.task_active and last is not None and age <= self.max_action_age_s:
+            busy = drema_comm_pb2.ControlAction()
+            busy.CopyFrom(last)
+            busy.status_message = f"MPC BUSY (replaying action from timestep {last.timestep}, age {age * 1000.0:.0f}ms) | {last.status_message}"
+            return busy
+        return drema_comm_pb2.ControlAction(
+            timestamp=time.time(),
+            timestep=robot_state.timestep,
+            joint_velocities=[0.0] * max(len(robot_state.joint_positions), 7),
+            gripper_action=robot_state.gripper_open,
+            safety_stop=False,
+            status_message="MPC BUSY: no fresh action available, holding position"
+        )
+
+    def _solve_action(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.ControlAction:
         self.total_actions_served += 1
 
         # Update robot base if provided
@@ -716,7 +759,7 @@ class DremaDynamicSystem:
                     b_name = cdet.get('backend', 'Sim')
                     b_ms = cdet.get('backend_ms', cdet.get('bullet_ms', 0.0))
                     cdet_str = f" [{b_name}: {b_ms:.1f}ms, GVM: {cdet.get('gvm_ms', 0.0):.1f}ms, Pts: {cdet.get('pts_count', 0)}]"
-                print(f"  └─ [MPC TIMINGS] Coll: {t_info.get('coll_ms', 0.0):.1f}ms{cdet_str} | Rollouts: {t_info.get('samples_ms', 0.0):.1f}ms | IK: {t_info.get('ik_ms', 0.0):.1f}ms | Opt: {t_info.get('opt_ms', 0.0):.1f}ms")
+                print(f"  └─ [MPC TIMINGS] Coll: {t_info.get('coll_ms', 0.0):.1f}ms{cdet_str} | Rollouts: {t_info.get('samples_ms', 0.0):.1f}ms | Costs(FK): {t_info.get('cost_ms', 0.0):.1f}ms | IK: {t_info.get('ik_ms', 0.0):.1f}ms | Opt: {t_info.get('opt_ms', 0.0):.1f}ms")
 
         return action
 

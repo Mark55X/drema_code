@@ -49,7 +49,7 @@ class CoppeliaSimulationClient:
         sync_mode: str = "realtime",
         headless: bool = False,
         cam_fps: float = 10.0,
-        ctrl_fps: float = 50.0,
+        ctrl_fps: Optional[float] = None,
         reachability_radius: float = 0.95,
         scan_resolution: Tuple[int, int] = (1280, 720),
         scan_steps: int = 50,
@@ -59,7 +59,8 @@ class CoppeliaSimulationClient:
         ping_max_retries: int = 3,
         force_scan: bool = False,
         cam_resolution: Tuple[int, int] = (256, 256),
-        log_interval_actions: int = 10
+        log_interval_actions: int = 10,
+        max_action_age: float = 0.20
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -78,14 +79,11 @@ class CoppeliaSimulationClient:
         self.cam_resolution = tuple(cam_resolution)
         self.log_interval_actions = max(0, int(log_interval_actions))
 
-        self.cam_period = 1.0 / max(1.0, cam_fps)
-        self.ctrl_period = 1.0 / max(1.0, ctrl_fps)
-        self.cam_decimation = max(1, int(round(self.ctrl_fps / self.cam_fps)))
-
         # Interactive state
         self.task_active = False
         self.running = True
         self.step_counter = 0
+        self.sim_steps = 0
         self.active_actions_count = 0
         self._reset_requested = False
         self.server_connected = False
@@ -95,7 +93,7 @@ class CoppeliaSimulationClient:
 
         # Initialize gRPC Client
         print(f"[CoppeliaClient] Connecting to DREMA suite at {self.server_address}...")
-        self.client = DremaGrpcClient(target_address=self.server_address)
+        self.client = DremaGrpcClient(target_address=self.server_address, max_action_age_s=max_action_age)
         is_alive, status = self.client.ping_status(timeout=self.ping_timeout)
         self.server_connected = is_alive
         if self.server_connected:
@@ -111,6 +109,20 @@ class CoppeliaSimulationClient:
 
         # Initialize RLBench Environment
         self._init_rlbench()
+
+        # Every loop iteration advances CoppeliaSim by exactly one physics step, so the
+        # simulated clock (not the wall clock) is the time base for commands and timestamps.
+        self.sim_dt = float(self.env._pyrep.get_simulation_timestep())
+        if self.ctrl_fps is None:
+            self.ctrl_fps = 1.0 / self.sim_dt
+        self.ctrl_period = 1.0 / self.ctrl_fps
+        # cam_fps is a simulated-time rate, consistent with the frame timestamps.
+        self.cam_decimation = max(1, int(round(1.0 / (self.sim_dt * self.cam_fps))))
+        print(f"[CoppeliaClient] Simulation timestep: {self.sim_dt * 1000.0:.1f}ms | Control loop: {self.ctrl_fps:.1f}Hz | "
+              f"Camera every {self.cam_decimation} steps ({1.0 / (self.cam_decimation * self.sim_dt):.1f}Hz sim time)")
+        if self.sync_mode == "realtime" and abs(self.ctrl_period - self.sim_dt) > 1e-6:
+            print(f"[CoppeliaClient] [Warning] realtime mode with ctrl period {self.ctrl_period * 1000.0:.1f}ms != sim timestep "
+                  f"{self.sim_dt * 1000.0:.1f}ms: simulation runs at {self.sim_dt / self.ctrl_period:.2f}x wall-clock speed.")
 
         if self.force_scan:
             self.initial_scan_done = False
@@ -501,6 +513,7 @@ class CoppeliaSimulationClient:
                     self._reset_requested = False
                     self.task_active = False
                     self.step_counter = 0
+                    self.sim_steps = 0
                     self.active_actions_count = 0
                     self.initial_scan_done = False
                     if self.server_connected:
@@ -545,7 +558,9 @@ class CoppeliaSimulationClient:
                     cam_data = self.capture_camera_data()
                     if cam_data:
                         blocking_send = (self.sync_mode == "stepped")
-                        sim_ts = (self.step_counter * self.ctrl_period) if self.sync_mode == "stepped" else time.time()
+                        # Shifted by one step because the server treats timestamp 0 as missing;
+                        # the Kalman predictor only uses timestamp differences.
+                        sim_ts = (self.sim_steps + 1) * self.sim_dt
                         self.client.push_frame_observation(
                             timestep=self.step_counter,
                             camera_dict=cam_data,
@@ -603,7 +618,8 @@ class CoppeliaSimulationClient:
                         target_available=target_available,
                         robot_base_pos=robot_base_pos,
                         reachability_radius=self.reachability_radius,
-                        timeout=0.05 if self.sync_mode == "realtime" else 2.0
+                        timeout=(2.0 if self.sync_mode == "stepped" else 0.5 * self.ctrl_period),
+                        blocking=(self.sync_mode == "stepped")
                     )
                     # 4. Actuate Robot
                     if not action.safety_stop and len(action.joint_velocities) == len(q):
@@ -646,6 +662,7 @@ class CoppeliaSimulationClient:
                 # 5. Advance Task and CoppeliaSim Physics Step
                 self.task._task.step()  # Moves oscillating tunnel obstacle
                 self.env._pyrep.step()
+                self.sim_steps += 1
 
                 # 6. Check Task Success Condition (only when robot is actively executing task)
                 if self.task_active:
@@ -686,7 +703,10 @@ def parse_args():
     parser.add_argument("--task", type=str, default="dynamic_drema_test_1", help="Task name (default: dynamic_drema_test_1)")
     parser.add_argument("--sync_mode", type=str, choices=["stepped", "realtime"], default="realtime", help="Simulation sync mode: 'stepped' or 'realtime' (default: realtime)")
     parser.add_argument("--cam_fps", type=float, default=10.0, help="Camera sensor capture and streaming frequency in Hz (default: 10)")
-    parser.add_argument("--ctrl_fps", type=float, default=50.0, help="Robot joint velocity control frequency in Hz (default: 50)")
+    parser.add_argument("--ctrl_fps", type=float, default=None,
+                        help="Wall-clock control loop frequency in Hz (default: 1 / simulation timestep, i.e. real-time pacing)")
+    parser.add_argument("--max_action_age", type=float, default=0.20,
+                        help="Max age in seconds of the last action replayed when a control request times out (default: 0.20)")
     parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--scan_resolution", type=int, nargs=2, default=[1280, 720], metavar=("WIDTH", "HEIGHT"),
                         help="Orbital scan camera resolution [width, height] (default: 1280 720)")
@@ -722,6 +742,7 @@ if __name__ == "__main__":
         ping_max_retries=args.ping_retries,
         force_scan=args.force_scan,
         cam_resolution=args.cam_resolution,
-        log_interval_actions=args.log_interval_actions
+        log_interval_actions=args.log_interval_actions,
+        max_action_age=args.max_action_age
     )
     client.run()

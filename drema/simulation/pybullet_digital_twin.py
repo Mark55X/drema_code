@@ -17,7 +17,7 @@ from typing import Optional, Tuple, List, Dict, Union, Any
 
 import pybullet as p
 import pybullet_data
-from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
+from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 from drema.controller.franka_kinematics import FrankaKinematics
 from scipy.spatial.transform import Rotation
@@ -42,6 +42,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         sim_substeps: int = 1,
         predictor: Optional[BaseObstaclePredictor] = None
     ):
+        super().__init__()
         self.visualize = visualize
         self.table_z = table_z
         self.tracking_mode = tracking_mode.lower()
@@ -90,6 +91,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             robot_urdf_path = "franka_panda/panda.urdf"
         self.robot_urdf_path = robot_urdf_path
 
+    @synchronized
     def load_robot(
         self,
         base_position: Tuple[float, float, float],
@@ -127,6 +129,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         return True
 
+    @synchronized
     def set_robot_base_pose(
         self,
         base_position: Tuple[float, float, float],
@@ -141,6 +144,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             except Exception as e:
                 print(f"[PYBULLET DIGITAL TWIN WARNING] Failed to reset robot base pose: {e}")
 
+    @synchronized
     def spawn_scanned_table(
         self,
         table_z: float,
@@ -210,6 +214,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     # Generic Dynamic Object Spawning (Called by Perception pipeline)
     # -------------------------------------------------------------------------
 
+    @synchronized
     def spawn_scanned_mesh_obstacle(
         self,
         mesh_path: str,
@@ -303,6 +308,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             kwargs['initial_quat'] = kwargs.pop('initial_orientation')
         return self.spawn_scanned_mesh_obstacle(*args, **kwargs)
 
+    @synchronized
     def remove_object(self, obj_id: int):
         """Removes an object from PyBullet and cleans up its tracking constraint if present."""
         if self.client_id < 0:
@@ -318,6 +324,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             p.removeBody(body_id)
             del self.tracked_objects[obj_id]
 
+    @synchronized
     def clear_dynamic_objects(self):
         """Removes all dynamically discovered objects upon reset."""
         for obj_id in list(self.tracked_objects.keys()):
@@ -328,6 +335,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     # State Synchronization & Physics Queries
     # -------------------------------------------------------------------------
 
+    @synchronized
     def sync_robot_state(self, joint_positions: List[float]):
         """Synchronizes robot joint angles in the Digital Twin from CoppeliaSim."""
         if self.robot_id < 0:
@@ -341,6 +349,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 p.resetJointState(self.robot_id, i, joint_positions[arm_j])
                 arm_j += 1
 
+    @synchronized
     def sync_object_pose(
         self,
         obj_id: int,
@@ -389,6 +398,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         elif self.tracking_mode == "teleport":
             p.resetBasePositionAndOrientation(body_id, list(pos), list(orn))
 
+    @synchronized
     def get_object_pose(
         self,
         obj_id: int
@@ -400,6 +410,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             return tuple(pos), tuple(orn)
         return None
 
+    @synchronized
     def get_min_obstacle_distance(self) -> float:
         """
         Calculates the minimum clearance distance between the Franka Panda arm and
@@ -426,6 +437,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         return float(min_distance)
 
+    @synchronized
     def step(self):
         """Advances physical simulation forward (with sub-stepping and PD tracking if active)."""
         if self.client_id < 0:
@@ -477,6 +489,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             torque = self.kp_rot * rot_error - self.kd_rot * ang_vel
             p.applyExternalTorque(body_id, -1, torque.tolist(), p.WORLD_FRAME)
 
+    @synchronized
     def get_tracked_obstacles_info(self) -> List[Dict[str, Any]]:
         """Retrieves list of tracked dynamic obstacle dictionaries."""
         obstacles = []
@@ -516,6 +529,45 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 })
         return obstacles
 
+    @synchronized
+    def get_obstacle_proximity(self, max_distance: float) -> List[Dict[str, Any]]:
+        """Closest robot/obstacle surface points per (obstacle, link) pair, via PyBullet getClosestPoints."""
+        if self.client_id < 0 or self.robot_id < 0:
+            return []
+
+        entries = []
+        for obj_id, obj in self.tracked_objects.items():
+            if obj.get('is_target', False) or obj.get('body_id', -1) < 0:
+                continue
+            velocity = (0.0, 0.0, 0.0)
+            if self.predictor is not None:
+                st = self.predictor.get_estimated_state(obj_id)
+                if st is not None:
+                    velocity = tuple(float(x) for x in st['velocity'])
+
+            closest_per_link: Dict[int, Any] = {}
+            for pt in p.getClosestPoints(bodyA=self.robot_id, bodyB=obj['body_id'], distance=float(max_distance)):
+                # PyBullet link -1 is the fixed base (link0); 0..6 are link1..link7; flange, hand,
+                # fingers and grasp target are rigidly attached to link7.
+                if pt[3] < 0:
+                    continue
+                link_idx = min(pt[3] + 1, 7)
+                if link_idx not in closest_per_link or pt[8] < closest_per_link[link_idx][8]:
+                    closest_per_link[link_idx] = pt
+
+            for link_idx, pt in closest_per_link.items():
+                normal = np.array(pt[7], dtype=np.float64)
+                entries.append({
+                    'obj_id': obj_id,
+                    'link_idx': link_idx,
+                    'point_world': np.array(pt[5], dtype=np.float64),
+                    'normal': normal / max(np.linalg.norm(normal), 1e-9),
+                    'distance': float(pt[8]),
+                    'velocity': velocity
+                })
+        return entries
+
+    @synchronized
     def calculate_inverse_kinematics(
         self,
         target_pos: Tuple[float, float, float],
@@ -571,6 +623,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         except Exception:
             return None
 
+    @synchronized
     def compute_trajectory_collision_costs(
         self,
         Q: np.ndarray,
@@ -646,6 +699,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             info = p.getJointInfo(robot_id, j_idx)
             if info[2] != p.JOINT_FIXED and len(arm_joint_indices) < 7:
                 arm_joint_indices.append(j_idx)
+        saved_arm_states = [p.getJointState(robot_id, j_idx)[:2] for j_idx in arm_joint_indices]
 
         t_bullet_total = 0.0
         t_gvm_total = 0.0
@@ -760,6 +814,9 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             'pts_count': total_contact_pts
         }
 
+        for j_idx, (q_saved, qd_saved) in zip(arm_joint_indices, saved_arm_states):
+            p.resetJointState(robot_id, j_idx, q_saved, qd_saved)
+
         # Restore all dynamic obstacles to their current instantaneous state (t=0)
         for b_id, o_id in body_to_obj_id.items():
             if 'target_pos' in self.tracked_objects[o_id]:
@@ -781,6 +838,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     def step_simulation(self):
         self.step()
 
+    @synchronized
     def reset(self):
         """Resets the Digital Twin for a new episode."""
         self.clear_dynamic_objects()
@@ -793,6 +851,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 pass
             self.table_id = -1
 
+    @synchronized
     def close(self):
         if self.client_id >= 0:
             p.disconnect(self.client_id)

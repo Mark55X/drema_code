@@ -313,16 +313,99 @@ class FrankaKinematics:
                      (ee_positions [K, H, 3], ee_quaternions [K, H, 4])
         """
         K, H, _ = q_batch.shape
-        ee_positions = np.zeros((K, H, 3), dtype=np.float32)
-        ee_quats = np.zeros((K, H, 4), dtype=np.float32) if return_orientations else None
+        T_all = self._batch_link_transforms(np.asarray(q_batch).reshape(-1, 7))
+        T = T_all[:, 7]
 
-        for k in range(K):
-            for h in range(H):
-                pos, rot = self.forward_kinematics_ee(q_batch[k, h])
-                ee_positions[k, h] = pos
-                if return_orientations:
-                    ee_quats[k, h] = self.rot_matrix_to_quat(rot)
+        rot = T[:, :3, :3]
+        base_offset = self.base_position if self.base_position is not None else np.zeros(3)
+        pos = T[:, :3, 3] + rot @ self.EE_OFFSET.astype(np.float64) + base_offset
+        ee_positions = pos.reshape(K, H, 3).astype(np.float32)
 
         if return_orientations:
+            ee_quats = Rotation.from_matrix(rot).as_quat().reshape(K, H, 4).astype(np.float32)
             return ee_positions, ee_quats
         return ee_positions
+
+    def _batch_link_transforms(self, q_flat: np.ndarray) -> np.ndarray:
+        """
+        Vectorized MDH chain for N configurations.
+
+        :param q_flat: Joint angles of shape [N, 7].
+        :return: Base-frame transforms of shape [N, 8, 4, 4]: [T_base, T_link1, ..., T_link7].
+        """
+        q_flat = np.asarray(q_flat, dtype=np.float64)
+        N = q_flat.shape[0]
+        T_all = np.empty((N, 8, 4, 4), dtype=np.float64)
+        T_all[:, 0] = np.eye(4)
+        T_i = np.zeros((N, 4, 4), dtype=np.float64)
+        T_i[:, 3, 3] = 1.0
+        for i, (a, alpha, d, th_offset) in enumerate(self.MDH_PARAMS):
+            cos_th = np.cos(q_flat[:, i] + th_offset)
+            sin_th = np.sin(q_flat[:, i] + th_offset)
+            cos_al, sin_al = np.cos(alpha), np.sin(alpha)
+            T_i[:, 0, 0] = cos_th
+            T_i[:, 0, 1] = -sin_th
+            T_i[:, 0, 3] = a
+            T_i[:, 1, 0] = sin_th * cos_al
+            T_i[:, 1, 1] = cos_th * cos_al
+            T_i[:, 1, 2] = -sin_al
+            T_i[:, 1, 3] = -sin_al * d
+            T_i[:, 2, 0] = sin_th * sin_al
+            T_i[:, 2, 1] = cos_th * sin_al
+            T_i[:, 2, 2] = cos_al
+            T_i[:, 2, 3] = cos_al * d
+            T_all[:, i + 1] = T_all[:, i] @ T_i
+        return T_all
+
+    def batch_geometric_jacobian_ee(self, q_flat: np.ndarray) -> np.ndarray:
+        """
+        End-effector geometric Jacobians [J_linear; J_angular] for N configurations,
+        identical to geometric_jacobian(q, link_idx=-1) applied to each row.
+
+        :param q_flat: Joint angles of shape [N, 7].
+        :return: Jacobians of shape [N, 6, 7].
+        """
+        N = np.asarray(q_flat).shape[0]
+        J, _ = self.batch_point_jacobian(
+            q_flat,
+            link_idx=np.full(N, 7, dtype=np.int64),
+            local_points=np.tile(self.EE_OFFSET.astype(np.float64), (N, 1))
+        )
+        return J
+
+    def batch_point_jacobian(
+        self,
+        q_flat: np.ndarray,
+        link_idx: np.ndarray,
+        local_points: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Geometric Jacobians of points rigidly attached to robot links, for N configurations.
+        Only joints 1..link_idx move a point on link `link_idx`; the other columns are zero.
+
+        :param q_flat: Joint angles of shape [N, 7].
+        :param link_idx: Link carrying each point, shape [N], values in 1..7 (7 includes flange and hand).
+        :param local_points: Point coordinates in the frame of their link, shape [N, 3].
+        :return: (Jacobians [N, 6, 7], point positions in the robot base frame [N, 3]).
+        """
+        T_all = self._batch_link_transforms(q_flat)
+        N = T_all.shape[0]
+        link_idx = np.asarray(link_idx, dtype=np.int64)
+        T_link = T_all[np.arange(N), link_idx]
+        p = T_link[:, :3, 3] + (T_link[:, :3, :3] @ np.asarray(local_points, dtype=np.float64)[..., None])[..., 0]
+
+        J = np.zeros((N, 6, 7), dtype=np.float64)
+        for i in range(7):
+            moves = i < link_idx
+            T_prime = T_all[:, i] @ self._MDH_RX_TX[i].astype(np.float64)
+            z_i = T_prime[:, :3, 2]
+            J[:, :3, i] = np.where(moves[:, None], np.cross(z_i, p - T_prime[:, :3, 3]), 0.0)
+            J[:, 3:, i] = np.where(moves[:, None], z_i, 0.0)
+        return J, p
+
+    def world_to_link_point(self, q: np.ndarray, link_idx: int, point_world: np.ndarray) -> np.ndarray:
+        """Expresses a world-frame point in the frame of link `link_idx` (1..7) at configuration q."""
+        T = self._batch_link_transforms(np.asarray(q, dtype=np.float64)[None, :])[0, link_idx]
+        base_offset = self.base_position if self.base_position is not None else np.zeros(3)
+        p_base = np.asarray(point_world, dtype=np.float64) - base_offset
+        return T[:3, :3].T @ (p_base - T[:3, 3])

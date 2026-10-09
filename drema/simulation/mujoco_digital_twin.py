@@ -24,7 +24,7 @@ try:
 except ImportError:
     MUJOCO_AVAILABLE = False
 
-from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR
+from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized
 from drema.controller.franka_kinematics import FrankaKinematics
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 
@@ -81,6 +81,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 "Please run: pip install mujoco glfw"
             )
 
+        super().__init__()
         self.visualize = visualize
         self.table_z = float(table_z)
         self.enable_mjx = bool(enable_mjx)
@@ -377,6 +378,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     # Robot Interface Implementation (BaseDigitalTwin contract)
     # -------------------------------------------------------------------------
 
+    @synchronized
     def load_robot(
         self,
         base_position: Tuple[float, float, float],
@@ -401,6 +403,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         )
         return True
 
+    @synchronized
     def sync_robot_state(
         self,
         joint_positions: List[float],
@@ -417,18 +420,21 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         mujoco.mj_forward(self.model, self.data)
 
+    @synchronized
     def get_joint_positions(self) -> List[float]:
         """Returns the current 7-DoF robot arm joint angles [rad]."""
         if not self.robot_loaded or self.data is None:
             return [0.0] * 7
         return [float(x) for x in self.data.qpos[:7]]
 
+    @synchronized
     def get_joint_velocities(self) -> List[float]:
         """Returns the current 7-DoF robot arm joint velocities [rad/s]."""
         if not self.robot_loaded or self.data is None:
             return [0.0] * 7
         return [float(x) for x in self.data.qvel[:7]]
 
+    @synchronized
     def get_ee_pose(self) -> Tuple[Tuple[float, float, float], Tuple[float, float, float, float]]:
         """Returns the current Cartesian pose of the end-effector (TCP site) in world coordinates."""
         if not self.robot_loaded or self.model is None or self.data is None:
@@ -447,6 +453,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         quat = _matrix_to_quat_xyzw(rot_mat)
         return (tuple(float(x) for x in pos), quat)
 
+    @synchronized
     def compute_inverse_kinematics(
         self,
         target_position: Tuple[float, float, float],
@@ -467,6 +474,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     # Environment & Object Spawning (BaseDigitalTwin contract)
     # -------------------------------------------------------------------------
 
+    @synchronized
     def spawn_scanned_table(
         self,
         table_z: float,
@@ -486,6 +494,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         print(f"[MUJOCO DIGITAL TWIN] Spawned scanned table structure (Z={self.table_z:.3f}m)")
         return self.table_id
 
+    @synchronized
     def spawn_scanned_mesh_obstacle(
         self,
         mesh_path: str,
@@ -520,6 +529,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         )
         return target_obj_id
 
+    @synchronized
     def sync_object_pose(
         self,
         obj_id: int,
@@ -564,6 +574,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 dof_adr = self.model.jnt_dofadr[jnt_id]
                 self.data.qvel[dof_adr:dof_adr+6] = 0.0
 
+    @synchronized
     def get_object_pose(
         self,
         obj_id: int
@@ -583,6 +594,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         quat = _wxyz_to_xyzw(self.data.xquat[body_id])
         return (pos, quat)
 
+    @synchronized
     def remove_object(self, obj_id: int) -> bool:
         """Removes the specified dynamic mesh object from the simulation."""
         if obj_id in self.tracked_objects:
@@ -595,6 +607,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     # Physics Stepping & Collision Checking
     # -------------------------------------------------------------------------
 
+    @synchronized
     def step_simulation(self) -> None:
         """Advances physical simulation step and synchronizes visualizer."""
         if self.model is None or self.data is None:
@@ -653,6 +666,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             self.data.xfrc_applied[b_id, :3] = f_total
             self.data.xfrc_applied[b_id, 3:6] = tau_pd
 
+    @synchronized
     def check_collision(self) -> bool:
         """Returns True if there is contact between the robot and any scene obstacle or table."""
         if self.model is None or self.data is None:
@@ -675,6 +689,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 return True
         return False
 
+    @synchronized
     def get_min_obstacle_distance(self) -> float:
         """Computes the signed minimum Euclidean distance between robot arm links and dynamic obstacles."""
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
@@ -704,6 +719,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     pass
         return float(min_d)
 
+    @synchronized
     def get_closest_points(self, distance: float = 0.5) -> List[Tuple[int, int, float, Tuple[float, float, float]]]:
         """
         Calculates closest points between robot and obstacles within specified distance limit.
@@ -746,6 +762,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         """Provides direct access to current MjData simulation state for cloning."""
         return self.data
 
+    @synchronized
     def get_tracked_obstacles_info(self) -> List[Dict[str, Any]]:
         """Retrieves list of tracked dynamic obstacle dictionaries."""
         obstacles = []
@@ -766,10 +783,73 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 'name': obj_data.get('name', f"obstacle_{obj_id}"),
                 'position': pos,
                 'orientation': orn,
+                'velocity': self._estimated_velocity(obj_id),
                 'is_target': bool(obj_data.get('is_target', False))
             })
         return obstacles
 
+    def _estimated_velocity(self, obj_id: int) -> Tuple[float, float, float]:
+        if self.predictor is not None:
+            st = self.predictor.get_estimated_state(obj_id)
+            if st is not None:
+                return tuple(float(x) for x in st['velocity'])
+        return (0.0, 0.0, 0.0)
+
+    @synchronized
+    def get_obstacle_proximity(self, max_distance: float) -> List[Dict[str, Any]]:
+        """Closest robot/obstacle surface points per (obstacle, link) pair, via mj_geomDistance."""
+        if self.model is None or self.data is None or not self.robot_loaded:
+            return []
+
+        robot_geoms = []
+        for i in range(self.model.ngeom):
+            g_name = self.model.geom(i).name
+            if "gripper" in g_name:
+                robot_geoms.append((i, 7))
+            for link_num in range(1, 8):
+                if g_name == f"link{link_num}_geom":
+                    robot_geoms.append((i, link_num))
+
+        closest: Dict[Tuple[int, int], Tuple[float, np.ndarray, np.ndarray]] = {}
+        fromto = np.zeros(6, dtype=np.float64)
+        for og in range(self.model.ngeom):
+            g_name = self.model.geom(og).name
+            if not (g_name.startswith("obs_") and g_name.endswith("_geom")):
+                continue
+            try:
+                obj_id = int(g_name.split("_")[1])
+            except ValueError:
+                continue
+            if self.tracked_objects.get(obj_id, {}).get("is_target", False):
+                continue
+            for rg, link_idx in robot_geoms:
+                d = mujoco.mj_geomDistance(self.model, self.data, rg, og, float(max_distance), fromto)
+                if d >= max_distance:
+                    continue
+                diff = fromto[0:3] - fromto[3:6]
+                norm = np.linalg.norm(diff)
+                if norm < 1e-9:
+                    continue
+                # fromto runs from the robot geom to the obstacle geom; when penetrating, the
+                # nearest-point pair crosses, so the direction must be flipped.
+                normal = diff / norm if d >= 0.0 else -diff / norm
+                key = (obj_id, link_idx)
+                if key not in closest or d < closest[key][0]:
+                    closest[key] = (float(d), fromto[0:3].copy(), normal)
+
+        return [
+            {
+                'obj_id': obj_id,
+                'link_idx': link_idx,
+                'point_world': point,
+                'normal': normal,
+                'distance': d,
+                'velocity': self._estimated_velocity(obj_id)
+            }
+            for (obj_id, link_idx), (d, point, normal) in closest.items()
+        ]
+
+    @synchronized
     def calculate_inverse_kinematics(
         self,
         target_pos: Tuple[float, float, float],
@@ -853,6 +933,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         return None
 
+    @synchronized
     def compute_trajectory_collision_costs(
         self,
         Q: np.ndarray,
@@ -1097,6 +1178,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     # Lifecycle Cleanup
     # -------------------------------------------------------------------------
 
+    @synchronized
     def reset(self) -> None:
         """Resets the simulation environment and cleans up dynamic bodies."""
         self.tracked_objects.clear()
@@ -1105,6 +1187,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self._rebuild_model()
         print("[MUJOCO DIGITAL TWIN] Environment reset.")
 
+    @synchronized
     def shutdown(self) -> None:
         """Cleans up physics server and closes visualizer."""
         if self.viewer is not None:

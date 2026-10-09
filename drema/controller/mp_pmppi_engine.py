@@ -325,31 +325,17 @@ class MPPMPPIEngine:
         sample_batches.append(u_mixed)
 
         # 2c. Motion Primitives Library U_p (Mathisen et al. 2026)
-        obs_list = []
-        if digital_twin is not None:
-            if hasattr(digital_twin, 'get_tracked_obstacles_info'):
-                obs_info_list = digital_twin.get_tracked_obstacles_info()
-                for obs in obs_info_list:
-                    if not obs.get('is_target', False):
-                        obs_list.append({
-                            'position': obs['position'],
-                            'velocity': obs.get('velocity', (0.0, 0.0, 0.0))
-                        })
-            elif hasattr(digital_twin, 'tracked_objects'):
-                for obj in digital_twin.tracked_objects.values():
-                    if not obj.get('is_target', False) and 'target_pos' in obj:
-                        obs_list.append({
-                            'position': tuple(obj['target_pos']),
-                            'velocity': tuple(obj.get('target_vel', (0.0, 0.0, 0.0)))
-                        })
-
+        # Evasion uses the closest robot/obstacle surface points at the current configuration.
+        proximity = []
+        if digital_twin is not None and hasattr(digital_twin, 'get_obstacle_proximity'):
+            proximity = digital_twin.get_obstacle_proximity(self.primitive_lib.evade_max_distance)
 
         U_p = self.primitive_lib.generate_primitives(
             q_current=q_curr,
             qd_current=qd_curr,
             target_pos=target_pos,
             target_rot=target_rot_mat,
-            obstacles=obs_list
+            proximity=proximity
         )
         sample_batches.append(U_p)
 
@@ -605,6 +591,7 @@ class MPPMPPIEngine:
             'total_ms': calc_time_ms,
             'ik_ms': t_ik_ms,
             'samples_ms': t_samples_ms,
+            'cost_ms': (t_coll_start - t_cost_start) * 1000.0,
             'coll_ms': t_coll_ms,
             'opt_ms': t_opt_ms,
             'coll_details': coll_diag

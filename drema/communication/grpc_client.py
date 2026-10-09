@@ -89,9 +89,22 @@ class DremaGrpcClient:
     gRPC Client attached to CoppeliaSim / PyRep simulation loop.
     """
 
-    def __init__(self, target_address: str = "localhost:50051", max_queue_size: int = 3):
+    def __init__(
+        self,
+        target_address: str = "localhost:50051",
+        max_queue_size: int = 3,
+        max_action_age_s: float = 0.20,
+        async_rpc_deadline_s: float = 2.0
+    ):
+        """
+        :param max_action_age_s: Maximum age of an action (measured from when its state was sent)
+                                 that may still be applied as a zero-order hold.
+        :param async_rpc_deadline_s: RPC deadline of in-flight requests in non-blocking mode.
+        """
         self.target_address = target_address
         self.max_queue_size = max_queue_size
+        self.max_action_age_s = float(max_action_age_s)
+        self.async_rpc_deadline_s = float(async_rpc_deadline_s)
 
         # Options for high-bandwidth RGB-D transfer (100 MB buffer limit)
         options = [
@@ -111,6 +124,8 @@ class DremaGrpcClient:
         self._stream_active = False
 
         self.last_action: Optional[drema_comm_pb2.ControlAction] = None
+        self._request_send_times: Dict[int, float] = {}
+        self._pending_action: Optional[grpc.Future] = None
         self.last_timestep: int = 0
 
     def ping(self, timeout: float = 0.2) -> bool:
@@ -315,10 +330,18 @@ class DremaGrpcClient:
         target_available: bool = False,
         robot_base_pos: Optional[List[float]] = None,
         reachability_radius: float = 0.95,
-        timeout: float = 0.5
+        timeout: float = 0.5,
+        blocking: bool = True
     ) -> drema_comm_pb2.ControlAction:
         """
         Queries the MPC controller for the next joint velocity command.
+
+        :param timeout: Blocking mode: RPC deadline. Non-blocking mode: how long to wait for a just-sent
+                        request before falling back to the most recent fresh action.
+        :param blocking: If True, waits up to `timeout` for the action solved on this state (lockstep).
+                         If False, keeps at most one request in flight and returns the most recent
+                         fresh action (or a hold), so a solve slower than the control period never
+                         stalls the simulation loop.
         """
         state = drema_comm_pb2.RobotState(
             timestamp=time.time(),
@@ -333,25 +356,88 @@ class DremaGrpcClient:
             robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
             reachability_radius=float(reachability_radius)
         )
+        if not blocking:
+            return self._request_action_async(state, timeout, len(joint_positions), gripper_open)
+
+        self._record_send_time(timestep)
         try:
             action = self.stub.RequestAction(state, timeout=timeout)
+            # An action solved for this very state is valid in lockstep however long the solve took;
+            # only actions replayed by a busy server are subject to the age bound.
+            if action.timestep != timestep and self._action_age(action) > self.max_action_age_s:
+                return self._hold_action(timestep, len(joint_positions), gripper_open,
+                                         f"Stale action from timestep {action.timestep} discarded")
             self.last_action = action
             return action
         except grpc.RpcError as e:
-            # Fallback on timeout or lag: return zero velocities to hold position safely
-            if self.last_action is not None:
+            # Fallback on timeout or lag: replay the last action only while it is fresh
+            # (bounded zero-order hold), otherwise stop the arm.
+            if self.last_action is not None and self._action_age(self.last_action) <= self.max_action_age_s:
                 return self.last_action
-            return drema_comm_pb2.ControlAction(
-                timestamp=time.time(),
-                timestep=timestep,
-                joint_velocities=[0.0] * len(joint_positions),
-                gripper_action=gripper_open,
-                safety_stop=True,
-                status_message=f"RPC Error fallback: {e.code()}"
-            )
+            return self._hold_action(timestep, len(joint_positions), gripper_open, f"RPC Error fallback: {e.code()}")
+
+    def _request_action_async(
+        self,
+        state: drema_comm_pb2.RobotState,
+        timeout: float,
+        num_joints: int,
+        gripper_open: float
+    ) -> drema_comm_pb2.ControlAction:
+        self._collect_pending_action()
+        if self._pending_action is None:
+            self._record_send_time(state.timestep)
+            self._pending_action = self.stub.RequestAction.future(state, timeout=self.async_rpc_deadline_s)
+            try:
+                self._pending_action.result(timeout=timeout)
+            except (grpc.FutureTimeoutError, grpc.RpcError):
+                pass
+            self._collect_pending_action()
+
+        if self.last_action is not None and self._action_age(self.last_action) <= self.max_action_age_s:
+            return self.last_action
+        return self._hold_action(state.timestep, num_joints, gripper_open, "Waiting for a fresh MPC action")
+
+    def _collect_pending_action(self) -> None:
+        if self._pending_action is None or not self._pending_action.done():
+            return
+        try:
+            action = self._pending_action.result()
+            if self._action_age(action) <= self.max_action_age_s:
+                self.last_action = action
+        except (grpc.RpcError, grpc.FutureCancelledError):
+            pass
+        self._pending_action = None
+
+    def _record_send_time(self, timestep: int) -> None:
+        # The age of an action is measured from when the state it was solved for was sent,
+        # so actions replayed by a busy server and by the client fallback share one bound.
+        self._request_send_times[timestep] = time.monotonic()
+        if len(self._request_send_times) > 256:
+            for old_step in sorted(self._request_send_times)[:-128]:
+                del self._request_send_times[old_step]
+
+    def _action_age(self, action: drema_comm_pb2.ControlAction) -> float:
+        send_time = self._request_send_times.get(action.timestep)
+        return float('inf') if send_time is None else time.monotonic() - send_time
+
+    @staticmethod
+    def _hold_action(timestep: int, num_joints: int, gripper_open: float, reason: str) -> drema_comm_pb2.ControlAction:
+        return drema_comm_pb2.ControlAction(
+            timestamp=time.time(),
+            timestep=timestep,
+            joint_velocities=[0.0] * num_joints,
+            gripper_action=gripper_open,
+            safety_stop=True,
+            status_message=reason
+        )
 
     def reset_episode(self, episode_index: int = 0, task_name: str = "dynamic_drema_test_1", timeout: float = 5.0) -> bool:
         """Notifies DREMA suite that a new episode has started."""
+        self.last_action = None
+        self._request_send_times.clear()
+        if self._pending_action is not None:
+            self._pending_action.cancel()
+            self._pending_action = None
         try:
             req = drema_comm_pb2.ResetRequest(episode_index=episode_index, task_name=task_name)
             res = self.stub.ResetEpisode(req, timeout=timeout)

@@ -4,6 +4,8 @@ Abstract Base Interface for Physics Digital Twins in DREMA Suite.
 Defines the required simulation contract for physics backends (e.g., PyBullet, Isaac Sim).
 """
 
+import functools
+import threading
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List, Dict, Any, Union
 import numpy as np
@@ -15,11 +17,28 @@ DEFAULT_TABLE_COLOR: Tuple[float, float, float, float] = (0.82, 0.82, 0.82, 1.0)
 DEFAULT_OBSTACLE_COLOR: Tuple[float, float, float, float] = (0.2, 0.45, 0.85, 1.0)
 
 
+def synchronized(method):
+    """
+    Runs a twin method under the twin's re-entrant state lock.
+    The perception worker and the gRPC control threads share one physics state; the MPC
+    collision rollout temporarily teleports robot and obstacles, so interleaved calls
+    would observe or overwrite those transient poses.
+    """
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self.state_lock:
+            return method(self, *args, **kwargs)
+    return wrapper
+
+
 class BaseDigitalTwin(ABC):
     """
     Abstract Base Class for Digital Twin simulation engines.
     Any concrete physics backend (PyBullet, Isaac Sim, MuJoCo) must implement this interface.
     """
+
+    def __init__(self):
+        self.state_lock = threading.RLock()
 
     @abstractmethod
     def load_robot(
@@ -101,6 +120,19 @@ class BaseDigitalTwin(ABC):
             - 'orientation': (x, y, z, w) tuple
             - 'name': str name
             - 'is_target': bool flag indicating if object is the target to manipulate
+        """
+        return []
+
+    def get_obstacle_proximity(self, max_distance: float) -> List[Dict[str, Any]]:
+        """
+        Closest surface points between each robot link and each non-target obstacle, at the
+        current robot configuration. One entry per (obstacle, link) pair closer than max_distance:
+            - 'obj_id': obstacle identifier
+            - 'link_idx': kinematic link carrying the robot point (1..7; flange and hand map to 7)
+            - 'point_world': closest point on the robot surface, world frame
+            - 'normal': unit vector from the obstacle surface towards the robot
+            - 'distance': signed distance in meters (negative when penetrating)
+            - 'velocity': estimated obstacle linear velocity from the predictor
         """
         return []
 

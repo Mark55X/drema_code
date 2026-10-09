@@ -140,6 +140,7 @@ controller:
   alpha_pos: 1.0                     # Cartesian position tracking weight (Zhou et al. Eq. 27)
   alpha_rot: 0.25                    # Cartesian orientation tracking weight (Zhou et al. Eq. 27)
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
+  max_action_age_s: 0.20             # Max age [s] of a solved action that may still be replayed as zero-order hold while the MPC is busy
   sigma_1: 0.015                     # Inscribed hard safety collision margin [m] (1.5cm physical buffer)
   sigma_2: 0.035                     # Inflation radius [m] - compact buffer calibrated for tabletop precision
   kappa: 120.0                       # Exponential decay slope (Zhou et al. Eq. 21, continuous decay to ~0.09 at sigma_2)
