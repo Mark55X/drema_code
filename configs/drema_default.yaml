@@ -107,6 +107,14 @@ perception:
     cache_dir: "cache/scene_init"    # Directory where scene_gaussians.pt, tsdf.pt, meshes are stored
 
 # ------------------------------------------------------------------------------
+# 3b. Robot Model Calibration (shared by MPC kinematics and Digital Twin robot)
+# ------------------------------------------------------------------------------
+robot:
+  # theta_DH = q_measured + offset [rad]. CoppeliaSim/RLBench Panda: joint 4 zero is 3.92 deg off
+  # the Franka DH zero (fitted on joint axes and Panda_tip, 0.6 mm residual). Real Franka: all zeros.
+  joint_angle_offsets: [0.0, 0.0, 0.0, 0.0683, 0.0, 0.0, 0.0]
+
+# ------------------------------------------------------------------------------
 # 4. Digital Twin Engine
 # ------------------------------------------------------------------------------
 digital_twin:

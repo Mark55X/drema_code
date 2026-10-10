@@ -73,7 +73,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         sim_substeps: int = 1,
         time_step: float = 0.002,
         enable_mjx: bool = False,
-        predictor: Optional[BaseObstaclePredictor] = None
+        predictor: Optional[BaseObstaclePredictor] = None,
+        joint_angle_offsets: Optional[List[float]] = None
     ):
         if not MUJOCO_AVAILABLE:
             raise ImportError(
@@ -81,7 +82,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 "Please run: pip install mujoco glfw"
             )
 
-        super().__init__()
+        super().__init__(joint_angle_offsets)
         self.visualize = visualize
         self.table_z = float(table_z)
         self.enable_mjx = bool(enable_mjx)
@@ -135,7 +136,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.last_collision_timings: Dict[str, Any] = {}
 
         # Kinematics analytical helper
-        self.kin = FrankaKinematics(base_position=self.robot_base_pos)
+        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets)
 
         # MuJoCo internal handles
         self.model: Optional[mujoco.MjModel] = None
@@ -390,7 +391,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.robot_base_quat = _xyzw_to_wxyz(base_orientation)
         self.robot_loaded = True
         self.robot_id = 1
-        self.kin = FrankaKinematics(base_position=self.robot_base_pos)
+        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets)
 
         self._rebuild_model()
 
@@ -414,7 +415,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             return
 
         num_j = min(len(joint_positions), 7, self.model.nq)
-        self.data.qpos[:num_j] = np.array(joint_positions[:num_j], dtype=np.float64)
+        self.data.qpos[:num_j] = np.array(joint_positions[:num_j], dtype=np.float64) + self.joint_angle_offsets[:num_j]
         if joint_velocities is not None:
             self.data.qvel[:num_j] = np.array(joint_velocities[:num_j], dtype=np.float64)
 
@@ -425,7 +426,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         """Returns the current 7-DoF robot arm joint angles [rad]."""
         if not self.robot_loaded or self.data is None:
             return [0.0] * 7
-        return [float(x) for x in self.data.qpos[:7]]
+        return [float(x) for x in self.data.qpos[:7] - self.joint_angle_offsets]
 
     @synchronized
     def get_joint_velocities(self) -> List[float]:
@@ -864,7 +865,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         eval_data = self._eval_data
         if np.all(np.abs(self.data.qpos[:7]) < 1e-2):
-            eval_data.qpos[:7] = np.array([0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785], dtype=np.float64)
+            eval_data.qpos[:7] = FrankaKinematics.Q_REST.astype(np.float64) + self.joint_angle_offsets
         else:
             eval_data.qpos[:7] = self.data.qpos[:7]
 
@@ -886,8 +887,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
         jacr = np.zeros((3, self.model.nv), dtype=np.float64) if rot_mat is not None else None
 
-        q_min = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973], dtype=np.float64)
-        q_max = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973], dtype=np.float64)
+        q_min = FrankaKinematics.Q_MIN.astype(np.float64) + self.joint_angle_offsets
+        q_max = FrankaKinematics.Q_MAX.astype(np.float64) + self.joint_angle_offsets
 
         for _ in range(40):
             mujoco.mj_fwdPosition(self.model, eval_data)
@@ -902,7 +903,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     np.cross(curr_mat[:, 2], rot_mat[:, 2])
                 )
                 if np.linalg.norm(pos_err) < 2e-3 and np.linalg.norm(rot_err) < 0.05:
-                    return eval_data.qpos[:7].astype(np.float32)
+                    return (eval_data.qpos[:7] - self.joint_angle_offsets).astype(np.float32)
 
                 if site_id >= 0:
                     mujoco.mj_jacSite(self.model, eval_data, jacp, jacr, site_id)
@@ -914,7 +915,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 step = J.T @ np.linalg.solve(J @ J.T + 1e-4 * np.eye(6), err)
             else:
                 if np.linalg.norm(pos_err) < 2e-3:
-                    return eval_data.qpos[:7].astype(np.float32)
+                    return (eval_data.qpos[:7] - self.joint_angle_offsets).astype(np.float32)
 
                 if site_id >= 0:
                     mujoco.mj_jacSite(self.model, eval_data, jacp, None, site_id)
@@ -929,7 +930,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         mujoco.mj_fwdPosition(self.model, eval_data)
         curr_pos = eval_data.site_xpos[site_id] if site_id >= 0 else eval_data.xpos[body_id]
         if np.linalg.norm(target_p - curr_pos) < 0.05:
-            return eval_data.qpos[:7].astype(np.float32)
+            return (eval_data.qpos[:7] - self.joint_angle_offsets).astype(np.float32)
 
         return None
 
@@ -1067,7 +1068,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
                 # Update Franka Panda joint positions in MuJoCo eval data
                 t_mj_s = time.perf_counter()
-                eval_data.qpos[:7] = q_step
+                eval_data.qpos[:7] = q_step + self.joint_angle_offsets
                 mujoco.mj_kinematics(self.model, eval_data)
                 t_mj_total += (time.perf_counter() - t_mj_s)
 

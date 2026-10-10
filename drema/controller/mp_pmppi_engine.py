@@ -269,25 +269,21 @@ class MPPMPPIEngine:
         # Step 1: Inverse Kinematics Guidance Target (q_des,t, Eq. 26)
         # ---------------------------------------------------------------------
         t_ik_start = time.perf_counter()
+        # The analytical IK shares the kinematic model (joint offsets, TCP, EE orientation convention)
+        # with the Cartesian goal cost; the twin backends' IK solve for their own TCP frames
+        # (e.g. PyBullet's grasptarget is rotated by -45 deg), which would make q_des and the
+        # Cartesian term pull towards different configurations.
         q_des_t = None
         if target_pos is not None:
-            # Primary IK query: Digital Twin backend IK (PyBullet, MuJoCo, etc.)
-            if digital_twin is not None and hasattr(digital_twin, 'calculate_inverse_kinematics'):
-                q_des_t = digital_twin.calculate_inverse_kinematics(target_pos, target_rot_mat)
-                if q_des_t is not None:
-                    # Validate physical joint limits on IK candidate
-                    if np.any(q_des_t < (self.kin.Q_MIN - 1e-3)) or np.any(q_des_t > (self.kin.Q_MAX + 1e-3)):
-                        q_des_t = None
-                    else:
-                        self.last_ik_solution = q_des_t.copy()
-
-            # Fallback IK query: Analytical DLS IK
-            if q_des_t is None:
-                q_init_ik = self.last_ik_solution if self.last_ik_solution is not None else q_curr
-                q_dls, success = self.kin.solve_dls_ik(q_init_ik, target_pos, target_rot_mat)
-                if success:
-                    q_des_t = q_dls
-                    self.last_ik_solution = q_des_t.copy()
+            q_init_ik = self.last_ik_solution if self.last_ik_solution is not None else q_curr
+            # Warm-started solves converge in a few iterations; the cap bounds the cost of
+            # unreachable targets, which exhaust the iterations on every control cycle.
+            q_dls, success = self.kin.solve_dls_ik(q_init_ik, target_pos, target_rot_mat, max_iters=50)
+            if not success and self.last_ik_solution is not None:
+                q_dls, success = self.kin.solve_dls_ik(q_curr, target_pos, target_rot_mat, max_iters=50)
+            if success:
+                q_des_t = q_dls
+                self.last_ik_solution = q_des_t.copy()
 
         t_ik_ms = (time.perf_counter() - t_ik_start) * 1000.0
 

@@ -77,12 +77,21 @@ class FrankaKinematics:
     ]
 
     # -------------------------------------------------------------------------
-    # End-Effector / Gripper TCP Offset from Joint 7 Flange [m]
-    # Calibrated to Panda_tip in CoppeliaSim: total offset from Joint 7 is 0.21703m.
-    # With d7 = 0.107m (Joint 7 to flange), the flange to tip offset is:
-    # 0.21703m - 0.10700m = 0.11003m (with [0.00139, 0.00144] lateral offsets).
+    # End-Effector / Gripper TCP Offset from Joint 7 Flange [m], in the flange frame.
+    # Fitted to CoppeliaSim Panda_tip over 41 random configurations (0.6 mm mean residual,
+    # once the joint-4 zero offset below is applied).
+    # The EE orientation is the flange orientation: target orientations are expressed in this
+    # convention. CoppeliaSim's Panda_tip frame is the flange frame rotated by 135 deg about z.
     # -------------------------------------------------------------------------
     EE_OFFSET = np.array([0.00139, 0.00144, 0.11003], dtype=np.float32)
+
+    # -------------------------------------------------------------------------
+    # Joint-angle zero offsets of the CoppeliaSim/RLBench Panda model [rad]:
+    # theta_DH = q_measured + offset. Panda_joint4 is 3.92 deg away from the Franka DH zero
+    # (fitted on joint axes, joint origins and Panda_tip; other joints < 0.05 deg).
+    # A real Franka arm uses zero offsets.
+    # -------------------------------------------------------------------------
+    COPPELIA_JOINT_ANGLE_OFFSETS = np.array([0.0, 0.0, 0.0, 0.0683, 0.0, 0.0, 0.0], dtype=np.float64)
 
     # -------------------------------------------------------------------------
     # Precomputed Craig MDH screw transform along X_{i-1} [Rot_X(alpha) * Trans_X(a)]
@@ -99,11 +108,22 @@ class FrankaKinematics:
         for a, al, d, th in MDH_PARAMS
     ]
 
-    def __init__(self, base_position: Optional[np.ndarray] = None):
+    def __init__(self, base_position: Optional[np.ndarray] = None, joint_angle_offsets: Optional[np.ndarray] = None):
         """
         :param base_position: 3D coordinates [x, y, z] of the robot base in world frame.
+        :param joint_angle_offsets: Per-joint zero offsets [rad] added to the measured joint angles
+                                    before the DH chain (theta_DH = q + offset). Joint limits,
+                                    commands and IK solutions stay in the measured joint space.
         """
         self.base_position = np.array(base_position, dtype=np.float32) if base_position is not None else None
+        self.joint_angle_offsets = (
+            np.asarray(joint_angle_offsets, dtype=np.float64).reshape(7)
+            if joint_angle_offsets is not None else np.zeros(7, dtype=np.float64)
+        )
+        self.MDH_PARAMS = [
+            (a, alpha, d, th + float(off))
+            for (a, alpha, d, th), off in zip(FrankaKinematics.MDH_PARAMS, self.joint_angle_offsets)
+        ]
 
     def _dh_transform(self, a: float, alpha: float, d: float, theta: float) -> np.ndarray:
         """Computes standard Modified DH 4x4 homogeneous transformation matrix."""
@@ -209,72 +229,71 @@ class FrankaKinematics:
         target_pos: np.ndarray,
         target_rot: Optional[np.ndarray] = None,
         damping: float = 0.05,
-        max_iters: int = 35,
-        pos_tolerance: float = 2e-3,
-        rot_weight: float = 0.2
+        max_iters: int = 100,
+        pos_tolerance: float = 1e-3,
+        rot_weight: float = 0.5,
+        rot_tolerance: float = np.radians(1.0),
+        nullspace_gain: float = 0.5,
+        max_step: float = 0.2,
+        accept_pos: float = 5e-3,
+        accept_rot: float = np.radians(3.0)
     ) -> Tuple[np.ndarray, bool]:
         """
-        Solves Inverse Kinematics using Damped Least-Squares (DLS):
-        dq = J^T * (J * J^T + lambda^2 * I)^(-1) * error (Nakamura & Hanafusa / Levenberg-Marquardt).
+        Solves Inverse Kinematics with Damped Least-Squares (Nakamura & Hanafusa / Levenberg-Marquardt):
+        dq = J^+ e + (I - J^+ J) k (Q_REST - q),  J^+ = J^T (J J^T + lambda^2 I)^(-1).
 
-        Note on MPPI IK Guidance:
-        This DLS solver acts as a lightweight, deterministic fallback when PyBullet's
-        native C++ IK is unavailable or encounters singularities. In MPPI, IK does not
-        need to be micro-accurate: it merely provides a joint-space guidance center
-        q_{des,t} (Zhou et al. Eq. 26) to attract the stochastic sample cloud.
-        Millimetric target convergence is guaranteed by the Cartesian Sparse Reward
-        attraction bubble R_s (Eq. 12 / 28).
+        It uses the same kinematic model as the MPPI costs, so the joint-space guidance center
+        q_{des,t} (Zhou et al. Eq. 26) is consistent with the Cartesian goal term. The null-space
+        posture term resolves the redundancy towards Q_REST, which keeps q_des continuous across
+        control cycles when the solver is warm-started.
 
         :param q_init: Initial joint configuration (shape: [7]).
         :param target_pos: Target 3D position [x, y, z] in world frame.
-        :param target_rot: Optional target 3x3 rotation matrix.
+        :param target_rot: Optional target 3x3 rotation matrix of the EE (flange orientation convention).
         :param damping: Damping factor lambda to prevent singularity instability.
         :param max_iters: Maximum iteration steps.
-        :param pos_tolerance: Target position error threshold in meters.
-        :param rot_weight: Weight of orientation error relative to position error.
+        :param pos_tolerance: Position error [m] at which iterations stop.
+        :param rot_weight: Weight [m/rad] of the orientation error rows relative to the position rows.
+        :param rot_tolerance: Orientation error [rad] at which iterations stop.
+        :param nullspace_gain: Gain of the null-space attraction towards Q_REST. The posture is projected
+                               with the exact (undamped) null-space projector: the damped one leaks into
+                               the task and would stall the solver centimeters away from the target.
+        :param max_step: Maximum joint change per iteration [rad].
+        :param accept_pos: Position error [m] below which the final solution is reported as successful.
+        :param accept_rot: Orientation error [rad] below which the final solution is reported as successful.
         :return: (q_sol, success_flag)
         """
-        q = np.array(q_init, dtype=np.float32).copy()
-        base_offset = self.base_position if self.base_position is not None else np.zeros(3, dtype=np.float32)
-        target_p_rel = target_pos - base_offset
+        q = np.clip(np.asarray(q_init, dtype=np.float64), self.Q_MIN, self.Q_MAX)
+        base_offset = self.base_position if self.base_position is not None else np.zeros(3)
+        target_p_rel = np.asarray(target_pos, dtype=np.float64) - base_offset
+        target_R = np.asarray(target_rot, dtype=np.float64) if target_rot is not None else None
+        local_ee = self.EE_OFFSET.astype(np.float64)[None]
+        q_rest = self.Q_REST.astype(np.float64)
+
+        def errors(q_eval):
+            T_all = self._batch_link_transforms(q_eval[None])
+            J, p = self._point_jacobian_from_transforms(T_all, np.array([7]), local_ee)
+            pos_err = target_p_rel - p[0]
+            if target_R is None:
+                return J[0, :3], pos_err, pos_err, 0.0
+            rot_err = Rotation.from_matrix(target_R @ T_all[0, 7, :3, :3].T).as_rotvec()
+            task_J = np.vstack([J[0, :3], rot_weight * J[0, 3:]])
+            return task_J, np.concatenate([pos_err, rot_weight * rot_err]), pos_err, float(np.linalg.norm(rot_err))
 
         for _ in range(max_iters):
-            all_T = self.forward_kinematics_all(q)
-            T_ee = all_T[-1]
-            current_p = T_ee[:3, 3]
-            pos_err = target_p_rel - current_p
+            J, e, pos_err, rot_err_norm = errors(q)
+            if np.linalg.norm(pos_err) < pos_tolerance and rot_err_norm < rot_tolerance:
+                return q.astype(np.float32), True
 
-            if np.linalg.norm(pos_err) < pos_tolerance:
-                return q, True
-
-            J = self.geometric_jacobian(q, link_idx=-1)
-
-            if target_rot is not None:
-                # Compute orientation error via matrix logarithm / skew-symmetric cross
-                current_R = T_ee[:3, :3]
-                rot_err = 0.5 * (
-                    np.cross(current_R[:, 0], target_rot[:, 0]) +
-                    np.cross(current_R[:, 1], target_rot[:, 1]) +
-                    np.cross(current_R[:, 2], target_rot[:, 2])
-                )
-                dx = np.concatenate([pos_err, rot_weight * rot_err])
-            else:
-                # Position-only IK (first 3 rows of J)
-                J = J[:3, :]
-                dx = pos_err
-
-            # DLS formula: J^T * (J * J^T + lambda^2 * I)^(-1) * dx
-            JJT = J @ J.T
-            damped_inv = np.linalg.inv(JJT + (damping ** 2) * np.eye(J.shape[0], dtype=np.float32))
-            dq = J.T @ (damped_inv @ dx)
-
-            # Step update with limit clipping
+            J_pinv = J.T @ np.linalg.inv(J @ J.T + (damping ** 2) * np.eye(J.shape[0]))
+            nullspace = np.eye(7) - np.linalg.pinv(J, rcond=1e-3) @ J
+            dq = J_pinv @ e + nullspace @ (nullspace_gain * (q_rest - q))
+            dq *= min(1.0, max_step / max(np.max(np.abs(dq)), 1e-12))
             q = np.clip(q + dq, self.Q_MIN, self.Q_MAX)
 
-        # Check final position error
-        curr_p, _ = self.forward_kinematics_ee(q)
-        success = np.linalg.norm(target_pos - curr_p) < pos_tolerance * 5.0
-        return q, success
+        _, _, pos_err, rot_err_norm = errors(q)
+        success = np.linalg.norm(pos_err) < accept_pos and rot_err_norm < accept_rot
+        return q.astype(np.float32), bool(success)
 
     @staticmethod
     def rot_matrix_to_quat(R: np.ndarray) -> np.ndarray:
@@ -388,7 +407,14 @@ class FrankaKinematics:
         :param local_points: Point coordinates in the frame of their link, shape [N, 3].
         :return: (Jacobians [N, 6, 7], point positions in the robot base frame [N, 3]).
         """
-        T_all = self._batch_link_transforms(q_flat)
+        return self._point_jacobian_from_transforms(self._batch_link_transforms(q_flat), link_idx, local_points)
+
+    def _point_jacobian_from_transforms(
+        self,
+        T_all: np.ndarray,
+        link_idx: np.ndarray,
+        local_points: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray]:
         N = T_all.shape[0]
         link_idx = np.asarray(link_idx, dtype=np.int64)
         T_link = T_all[np.arange(N), link_idx]

@@ -49,7 +49,8 @@ class MPCController:
         evade_min_speed: float = 0.03,
         evade_imminent_distance: float = 0.06,
         evade_retreat_speed: float = 0.15,
-        evade_lift_speed: float = 0.12
+        evade_lift_speed: float = 0.12,
+        joint_angle_offsets: Optional[List[float]] = None  # theta_DH = q_measured + offset (see FrankaKinematics)
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
@@ -59,7 +60,7 @@ class MPCController:
         self.alpha_rot = alpha_rot
 
         # Kinematics & MP-PMPPI engine
-        self.kinematics = FrankaKinematics(base_position=None)
+        self.kinematics = FrankaKinematics(base_position=None, joint_angle_offsets=joint_angle_offsets)
         self.engine = MPPMPPIEngine(
             kinematics=self.kinematics,
             horizon=horizon,

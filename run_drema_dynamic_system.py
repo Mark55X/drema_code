@@ -162,6 +162,9 @@ class DremaDynamicSystem:
         kp_rot = float(config.get_nested("digital_twin.kp_rot", 15.0))
         kd_rot = float(config.get_nested("digital_twin.kd_rot", 1.5))
         sim_substeps = int(config.get_nested("digital_twin.sim_substeps", 2))
+        # Shared by the controller kinematics and the twin robot model (theta_DH = q_measured + offset)
+        self.joint_angle_offsets = [float(x) for x in config.get_nested("robot.joint_angle_offsets", [0.0] * 7)]
+        print(f"[DREMA DYNAMIC SYSTEM] Robot joint angle offsets [rad]: {self.joint_angle_offsets}")
 
         if twin_engine == "pybullet":
             self.digital_twin: BaseDigitalTwin = PyBulletDigitalTwin(
@@ -174,7 +177,8 @@ class DremaDynamicSystem:
                 kd_pos=kd_pos,
                 kp_rot=kp_rot,
                 kd_rot=kd_rot,
-                sim_substeps=sim_substeps
+                sim_substeps=sim_substeps,
+                joint_angle_offsets=self.joint_angle_offsets
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
         elif twin_engine in ["mujoco", "mjx"]:
@@ -191,7 +195,8 @@ class DremaDynamicSystem:
                 kp_rot=kp_rot,
                 kd_rot=kd_rot,
                 sim_substeps=sim_substeps,
-                enable_mjx=enable_mjx
+                enable_mjx=enable_mjx,
+                joint_angle_offsets=self.joint_angle_offsets
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
 
@@ -228,7 +233,8 @@ class DremaDynamicSystem:
             evade_min_speed=float(ctrl_cfg.get("evade_min_speed", 0.03)),
             evade_imminent_distance=float(ctrl_cfg.get("evade_imminent_distance", 0.06)),
             evade_retreat_speed=float(ctrl_cfg.get("evade_retreat_speed", 0.15)),
-            evade_lift_speed=float(ctrl_cfg.get("evade_lift_speed", 0.12))
+            evade_lift_speed=float(ctrl_cfg.get("evade_lift_speed", 0.12)),
+            joint_angle_offsets=self.joint_angle_offsets
         )
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 

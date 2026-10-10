@@ -40,9 +40,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         kp_rot: float = 15.0,
         kd_rot: float = 1.5,
         sim_substeps: int = 1,
-        predictor: Optional[BaseObstaclePredictor] = None
+        predictor: Optional[BaseObstaclePredictor] = None,
+        joint_angle_offsets: Optional[List[float]] = None
     ):
-        super().__init__()
+        super().__init__(joint_angle_offsets)
         self.visualize = visualize
         self.table_z = table_z
         self.tracking_mode = tracking_mode.lower()
@@ -346,7 +347,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         for i in range(num_joints):
             info = p.getJointInfo(self.robot_id, i)
             if info[2] != p.JOINT_FIXED and arm_j < len(joint_positions):
-                p.resetJointState(self.robot_id, i, joint_positions[arm_j])
+                offset = self.joint_angle_offsets[arm_j] if arm_j < 7 else 0.0
+                p.resetJointState(self.robot_id, i, float(joint_positions[arm_j]) + offset)
                 arm_j += 1
 
     @synchronized
@@ -573,7 +575,11 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         target_pos: Tuple[float, float, float],
         target_quat: Optional[Tuple[float, float, float, float]] = None
     ) -> Optional[np.ndarray]:
-        """Calculates inverse kinematics solution using PyBullet C++ solver with Franka joint limits."""
+        """
+        Calculates inverse kinematics solution using PyBullet C++ solver with Franka joint limits.
+        The solved frame is the URDF panda_grasptarget, which is rotated by -45 deg about z with
+        respect to the FrankaKinematics EE frame; the MPC therefore uses FrankaKinematics.solve_dls_ik.
+        """
         if self.client_id < 0 or self.robot_id < 0:
             return None
         try:
@@ -592,14 +598,18 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             num_j = p.getNumJoints(self.robot_id)
             ee_idx = 11 if num_j > 11 else max(0, num_j - 1)
 
-            # Supply Franka Panda joint limits and rest poses from official kinematics specifications
-            q_min_7 = FrankaKinematics.Q_MIN.tolist()
-            q_max_7 = FrankaKinematics.Q_MAX.tolist()
-            rest_7 = FrankaKinematics.Q_REST.tolist()
-            extra_j = max(0, num_j - 7)
+            # Supply Franka Panda joint limits and rest poses (expressed in the twin's joint space).
+            # PyBullet only enables null-space IK when these lists have one entry per movable DoF
+            # (7 arm joints + 2 fingers); with any other length they are silently ignored.
+            offsets = self.joint_angle_offsets
+            q_min_7 = (FrankaKinematics.Q_MIN + offsets).tolist()
+            q_max_7 = (FrankaKinematics.Q_MAX + offsets).tolist()
+            rest_7 = (FrankaKinematics.Q_REST + offsets).tolist()
+            num_dofs = sum(1 for j in range(num_j) if p.getJointInfo(self.robot_id, j)[2] != p.JOINT_FIXED)
+            extra_j = max(0, num_dofs - 7)
 
             q_min = q_min_7 + [0.0] * extra_j
-            q_max = q_max_7 + [0.0] * extra_j
+            q_max = q_max_7 + [0.04] * extra_j
             q_range = [mx - mn for mn, mx in zip(q_min, q_max)]
             rest_poses = rest_7 + [0.0] * extra_j
 
@@ -614,7 +624,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 ik_target,
                 **kwargs
             )
-            q_cand = np.array(pb_ik[:7], dtype=np.float32)
+            q_cand = (np.array(pb_ik[:7], dtype=np.float64) - offsets).astype(np.float32)
 
             # Verify that candidate strictly satisfies physical joint limits
             if np.any(q_cand < (FrankaKinematics.Q_MIN - 1e-3)) or np.any(q_cand > (FrankaKinematics.Q_MAX + 1e-3)):
@@ -723,7 +733,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 t_b_start = time.perf_counter()
                 # Update Franka Panda joint positions in PyBullet
                 for arm_j, j_idx in enumerate(arm_joint_indices):
-                    p.resetJointState(robot_id, j_idx, float(q_step[arm_j]))
+                    p.resetJointState(robot_id, j_idx, float(q_step[arm_j]) + self.joint_angle_offsets[arm_j])
 
                 step_coll_p = 0.0
                 step_coll_gvm = 0.0
