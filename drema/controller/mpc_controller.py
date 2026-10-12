@@ -30,7 +30,7 @@ class MPCController:
         self,
         digital_twin: Optional[Any] = None,
         num_joints: int = 7,
-        max_joint_velocity: float = 0.50,         # rad/s execution limit
+        max_joint_velocity: float = 1.0,          # rad/s limit shared by rollouts, primitives and command
         safety_collision_distance: float = 0.0,   # Physical penetration limit (<= 0 is hard contact)
         horizon: int = 15,                        # MPPI prediction horizon H
         dt: float = 0.05,                         # Planning timestep dt (s)
@@ -57,6 +57,7 @@ class MPCController:
         self.digital_twin = digital_twin
         self.num_joints = num_joints
         self.max_joint_velocity = max_joint_velocity
+        self.velocity_clip_events = 0
         self.safety_collision_distance = safety_collision_distance
         self.alpha_pos = alpha_pos
         self.alpha_rot = alpha_rot
@@ -70,6 +71,7 @@ class MPCController:
             num_samples_per_planner=num_samples_per_planner,
             top_k=top_k,
             max_joint_acc=max_joint_acc,
+            max_joint_velocity=max_joint_velocity,
             lambda_param=1.0,
             beta_param=0.8,
             alpha_param=1.0,
@@ -201,8 +203,11 @@ class MPCController:
             digital_twin=digital_twin
         )
 
-        # 6. Project onto physical safety joint velocity limits
+        # 6. Safety net: the engine already plans within the same bound, so a clip here
+        #    signals an inconsistency and is counted in the telemetry.
         qd_clamped = np.clip(qd_optimal, -self.max_joint_velocity, self.max_joint_velocity)
+        clipped = bool(np.any(np.abs(qd_clamped - qd_optimal) > 1e-6))
+        self.velocity_clip_events += int(clipped)
 
         # 7. Format informative telemetry status message
         weights = diag.get('weights', {})
@@ -213,6 +218,7 @@ class MPCController:
         lim_warns = diag.get('joint_limit_warnings', [])
         lim_str = f" | lim_warn: {','.join(lim_warns)}" if lim_warns else ""
         ik_str = "" if diag.get('q_des_available', True) else " | IK: FAIL"
+        vclip_str = f" | VCLIP x{self.velocity_clip_events}" if clipped else ""
         top_cand = diag.get('top_candidate', '')
         top_w = diag.get('top_weight', 0.0)
         prim_w = diag.get('primitive_weight_sum', 0.0)
@@ -234,7 +240,7 @@ class MPCController:
 
         status_msg = (
             f"MP-PMPPI | w_grd: {w_greedy:.2f}, w_sns: {w_sensi:.2f}{mode_str}{cost_str} | "
-            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{time_breakdown_str}{lim_str}{ik_str}"
+            f"tgt: {tgt_str} | min_d: {min_dist:.3f}m | {calc_t:.1f}ms{time_breakdown_str}{lim_str}{ik_str}{vclip_str}"
         )
 
         self.last_diagnostics = diag

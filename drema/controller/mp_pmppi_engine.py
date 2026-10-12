@@ -71,6 +71,7 @@ class MPPMPPIEngine:
         num_samples_per_planner: int = 24,
         top_k: int = 12,
         max_joint_acc: float = 0.5,
+        max_joint_velocity: float = 1.0,
         # ---------------------------------------------------------------------
         # Temperature & GMR Parameters:
         # - lambda_param = 1.0, alpha_param = 1.0, beta_param = 0.8: Zhou et al. Sec. VI (Eq. 3, 11, 15)
@@ -129,6 +130,8 @@ class MPPMPPIEngine:
         self.M = num_samples_per_planner
         self.top_k = min(top_k, self.M)
         self.max_acc = max_joint_acc
+        # Per-joint velocity bound shared by rollouts, primitives and the issued command
+        self.qd_limit = np.minimum(self.kin.QD_MAX.astype(np.float64), float(max_joint_velocity))
 
         self.lambda_param = lambda_param
         self.beta = beta_param
@@ -154,6 +157,7 @@ class MPPMPPIEngine:
             horizon=self.H,
             dt=self.dt,
             max_joint_acc=self.max_acc,
+            max_joint_velocity=self.qd_limit,
             evade_min_distance=evade_min_distance,
             evade_max_distance=evade_max_distance,
             evade_ttc_threshold=evade_ttc_threshold,
@@ -346,6 +350,10 @@ class MPPMPPIEngine:
         # Step 3: Parallel Numerical Rollouts
         # qd_{k, h} = qd_{k, h-1} + u_{k, h} * dt
         # q_{k, h}  = q_{k, h-1}  + qd_{k, h} * dt
+        # The velocity bound is enforced by projecting the acceleration and writing the projected
+        # value back into U_t: costs, softmax weights and distribution updates then refer to the
+        # controls that are actually executable, so the means cannot wind up beyond the limit.
+        # If the measured velocity already exceeds the bound, the projection decelerates at max_acc.
         # ---------------------------------------------------------------------
         Q = np.zeros((total_K, self.H, 7), dtype=np.float32)
         QD = np.zeros((total_K, self.H, 7), dtype=np.float32)
@@ -354,10 +362,10 @@ class MPPMPPIEngine:
         qd_prev = np.tile(qd_curr, (total_K, 1))
 
         for h in range(self.H):
-            u_h = U_t[:, h, :]
+            u_h = np.clip(U_t[:, h, :], (-self.qd_limit - qd_prev) / self.dt, (self.qd_limit - qd_prev) / self.dt)
+            u_h = np.clip(u_h, -self.max_acc, self.max_acc)
+            U_t[:, h, :] = u_h
             qd_h = qd_prev + u_h * self.dt
-            # Clip joint velocities to physical limits
-            qd_h = np.clip(qd_h, -self.kin.QD_MAX, self.kin.QD_MAX)
             q_h = q_prev + qd_h * self.dt
             # Clip joint positions to physical limits
             q_h = np.clip(q_h, self.kin.Q_MIN, self.kin.Q_MAX)
@@ -558,8 +566,7 @@ class MPPMPPIEngine:
 
         # Integrated velocity command: qd_{cmd} = qd_{curr} + u_t^* * dt
         qd_optimal = qd_curr + u_optimal_acc * self.dt
-        # Project onto velocity limits (Algorithm from paper, Line 11)
-        qd_optimal = np.clip(qd_optimal, -self.kin.QD_MAX, self.kin.QD_MAX)
+        qd_optimal = np.clip(qd_optimal, -self.qd_limit, self.qd_limit)
 
         # Shift distributions forward across horizon (Warm Starting)
         self.mu_mixed[:-1] = self.mu_mixed[1:]

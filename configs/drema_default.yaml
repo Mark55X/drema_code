@@ -141,7 +141,7 @@ controller:
   frequency_hz: 20.0                 # Control execution and planning frequency (Hz)
   dt: 0.05                           # MPPI prediction time step dt (seconds)
   horizon: 15                        # MPPI prediction horizon H (15 * 0.05s = 0.75s)
-  max_joint_velocity: 0.50           # Maximum joint velocity execution limit (rad/s)
+  max_joint_velocity: 1.00           # Joint velocity bound [rad/s] shared by rollouts, primitives and the issued command
   max_joint_acc: 0.50                # Joint acceleration saturation limit (rad/s^2)
   num_samples_per_planner: 24        # Stochastic samples per MPPI strategy
   top_k: 12                          # Top candidates evaluated by the Judge

@@ -215,7 +215,7 @@ class DremaDynamicSystem:
         self.mpc_controller = MPCController(
             digital_twin=self.digital_twin,
             num_joints=7,
-            max_joint_velocity=float(ctrl_cfg.get("max_joint_velocity", 0.50)),
+            max_joint_velocity=float(ctrl_cfg.get("max_joint_velocity", 1.0)),
             horizon=int(ctrl_cfg.get("horizon", 15)),
             dt=float(ctrl_cfg.get("dt", 0.05)),
             num_samples_per_planner=int(ctrl_cfg.get("num_samples_per_planner", 24)),

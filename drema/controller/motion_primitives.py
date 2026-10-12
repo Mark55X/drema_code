@@ -8,7 +8,7 @@ Synthesizes concepts from:
 
 import numpy as np
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Union
 
 from .franka_kinematics import FrankaKinematics
 
@@ -43,6 +43,7 @@ class MotionPrimitiveLibrary:
         horizon: int = 20,
         dt: float = 0.05,
         max_joint_acc: float = 0.5,
+        max_joint_velocity: Union[float, np.ndarray] = 1.0,
         rot_tracking_gain: float = 2.0,
         align_rot_gain: float = 3.0,
         align_rot_min_error: float = 0.02,
@@ -62,13 +63,14 @@ class MotionPrimitiveLibrary:
         path_feedback_gain: float = 4.0,
         nullspace_gain: float = 0.3,
         joint_goal_gain: float = 1.5,
-        joint_goal_max_velocity: float = 0.5
+        joint_goal_max_velocity: Optional[float] = None
     ):
         """
         :param kinematics: FrankaKinematics instance for Jacobian and FK computations.
         :param horizon: Prediction horizon H steps.
         :param dt: Timestep delta (seconds).
         :param max_joint_acc: Maximum joint acceleration limit [rad/s^2].
+        :param max_joint_velocity: Joint velocity bound [rad/s] (scalar or per joint), the same used by the MPPI rollouts.
         :param rot_tracking_gain: Proportional gain converting orientation error to angular twist [rad/s per rad].
         :param align_rot_gain: Proportional gain for dedicated orientation alignment primitive [rad/s per rad].
         :param align_rot_min_error: Orientation error [rad] below which align_rot is not generated
@@ -89,12 +91,13 @@ class MotionPrimitiveLibrary:
         :param path_feedback_gain: Gain [1/s] pulling the controlled point back onto its planned path.
         :param nullspace_gain: Gain [1/s] of the null-space posture attraction towards Q_REST.
         :param joint_goal_gain: Gain [1/s] of the joint-space approach to the IK guidance q_des.
-        :param joint_goal_max_velocity: Joint speed cap [rad/s] of the joint-space approach (execution limit).
+        :param joint_goal_max_velocity: Joint speed cap [rad/s] of the joint-space approach (defaults to max_joint_velocity).
         """
         self.kin = kinematics
         self.H = horizon
         self.dt = dt
         self.max_acc = max_joint_acc
+        self.qd_limit = np.broadcast_to(np.asarray(max_joint_velocity, dtype=np.float64), (7,)).copy()
         self.rot_tracking_gain = rot_tracking_gain
         self.align_rot_gain = align_rot_gain
         self.align_rot_min_error = float(align_rot_min_error)
@@ -114,7 +117,9 @@ class MotionPrimitiveLibrary:
         self.path_feedback_gain = float(path_feedback_gain)
         self.nullspace_gain = float(nullspace_gain)
         self.joint_goal_gain = float(joint_goal_gain)
-        self.joint_goal_max_velocity = float(joint_goal_max_velocity)
+        self.joint_goal_max_velocity = (
+            float(joint_goal_max_velocity) if joint_goal_max_velocity is not None else float(np.min(self.qd_limit))
+        )
         self.last_primitive_names: List[str] = []
         self.last_evasion_threat: Optional[dict] = None
 
@@ -388,12 +393,20 @@ class MotionPrimitiveLibrary:
             ratio = np.where(np.abs(qdd_posture) > 1e-12, bound / np.where(np.abs(qdd_posture) > 1e-12, qdd_posture, 1.0), np.inf)
             alpha = np.clip(np.min(ratio, axis=1, keepdims=True), 0.0, 1.0)
             qdd = qdd_task + alpha * qdd_posture
+            qdd *= self._velocity_bound_scale(qd, qdd)
 
             u_seqs[:, h] = qdd
             qd = qd + qdd * self.dt
             q = np.clip(q + qd * self.dt, q_min, q_max)
 
         return u_seqs
+
+    def _velocity_bound_scale(self, qd: np.ndarray, qdd: np.ndarray) -> np.ndarray:
+        """Largest uniform factor in [0, 1] per row keeping |qd + s * qdd * dt| within the velocity bound."""
+        step = qdd * self.dt
+        room = np.where(step > 0.0, self.qd_limit - qd, -self.qd_limit - qd)
+        ratio = np.where(np.abs(step) > 1e-12, room / np.where(np.abs(step) > 1e-12, step, 1.0), np.inf)
+        return np.clip(np.min(ratio, axis=-1, keepdims=True), 0.0, 1.0)
 
     def _create_joint_goal_primitive(self, q_init: np.ndarray, qd_init: np.ndarray, q_des: np.ndarray) -> np.ndarray:
         """
