@@ -60,7 +60,9 @@ class MotionPrimitiveLibrary:
         lift_speed: float = 0.10,
         lateral_speed: float = 0.12,
         path_feedback_gain: float = 4.0,
-        nullspace_gain: float = 0.3
+        nullspace_gain: float = 0.3,
+        joint_goal_gain: float = 1.5,
+        joint_goal_max_velocity: float = 0.5
     ):
         """
         :param kinematics: FrankaKinematics instance for Jacobian and FK computations.
@@ -86,6 +88,8 @@ class MotionPrimitiveLibrary:
         :param lateral_speed: Speed limit for sideways evasion primitives [m/s].
         :param path_feedback_gain: Gain [1/s] pulling the controlled point back onto its planned path.
         :param nullspace_gain: Gain [1/s] of the null-space posture attraction towards Q_REST.
+        :param joint_goal_gain: Gain [1/s] of the joint-space approach to the IK guidance q_des.
+        :param joint_goal_max_velocity: Joint speed cap [rad/s] of the joint-space approach (execution limit).
         """
         self.kin = kinematics
         self.H = horizon
@@ -109,6 +113,8 @@ class MotionPrimitiveLibrary:
         self.lateral_speed = float(lateral_speed)
         self.path_feedback_gain = float(path_feedback_gain)
         self.nullspace_gain = float(nullspace_gain)
+        self.joint_goal_gain = float(joint_goal_gain)
+        self.joint_goal_max_velocity = float(joint_goal_max_velocity)
         self.last_primitive_names: List[str] = []
         self.last_evasion_threat: Optional[dict] = None
 
@@ -119,7 +125,8 @@ class MotionPrimitiveLibrary:
         target_pos: Optional[np.ndarray] = None,
         target_rot: Optional[np.ndarray] = None,
         obstacles: Optional[List[dict]] = None,
-        proximity: Optional[List[dict]] = None
+        proximity: Optional[List[dict]] = None,
+        q_des: Optional[np.ndarray] = None
     ) -> np.ndarray:
         """
         Generates the full library of N_p motion primitives:
@@ -133,6 +140,8 @@ class MotionPrimitiveLibrary:
                           against the end-effector only. Ignored when `proximity` is given.
         :param proximity: Closest robot/obstacle surface points from the Digital Twin
                           (see BaseDigitalTwin.get_obstacle_proximity).
+        :param q_des: Optional IK guidance configuration; adds a joint-space approach primitive,
+                      aligned with the joint-space goal cost (Zhou et al. Eq. 26).
         :return: Array of shape [N_p, H, 7] containing joint acceleration control sequences.
         """
         q_current = np.asarray(q_current, dtype=np.float64)
@@ -211,13 +220,20 @@ class MotionPrimitiveLibrary:
 
         U_cart = self._integrate_cartesian_primitives(q_current, qd_current, cartesian)
 
+        joint_space = []
+        joint_names = []
+        if q_des is not None:
+            joint_space.append(self._create_joint_goal_primitive(q_current, qd_current, np.asarray(q_des, dtype=np.float64)))
+            joint_names.append("joint_to_qdes")
+
         # ---------------------------------------------------------------------
         # 5. Deceleration / Brake Primitive (Safe Stop / Hold)
         # ---------------------------------------------------------------------
-        U_brake = self._create_braking_primitive(qd_current)[None]
+        joint_space.append(self._create_braking_primitive(qd_current))
+        joint_names.append("brake_hold")
 
-        self.last_primitive_names = [p.name for p in cartesian] + ["brake_hold"]
-        U_p = np.concatenate([U_cart, U_brake], axis=0).astype(np.float32)
+        self.last_primitive_names = [p.name for p in cartesian] + joint_names
+        U_p = np.concatenate([U_cart, np.stack(joint_space)], axis=0).astype(np.float32)
         return np.clip(U_p, -self.max_acc, self.max_acc)
 
     def _centroid_proximity(self, ee_pos: np.ndarray, obstacles: List[dict]) -> List[dict]:
@@ -378,6 +394,26 @@ class MotionPrimitiveLibrary:
             q = np.clip(q + qd * self.dt, q_min, q_max)
 
         return u_seqs
+
+    def _create_joint_goal_primitive(self, q_init: np.ndarray, qd_init: np.ndarray, q_des: np.ndarray) -> np.ndarray:
+        """
+        Straight joint-space approach to q_des: proportional velocity reference capped at the
+        execution speed, tracked with uniformly scaled accelerations (direction preserved).
+        """
+        u_seq = np.zeros((self.H, 7), dtype=np.float32)
+        q = np.asarray(q_init, dtype=np.float64).copy()
+        qd = np.asarray(qd_init, dtype=np.float64).copy()
+
+        for h in range(self.H):
+            qd_ref = self.joint_goal_gain * (q_des - q)
+            qd_ref *= min(1.0, self.joint_goal_max_velocity / max(float(np.max(np.abs(qd_ref))), 1e-12))
+            qdd = (qd_ref - qd) / self.dt
+            qdd *= min(1.0, self.max_acc / max(float(np.max(np.abs(qdd))), 1e-12))
+            u_seq[h] = qdd
+            qd = qd + qdd * self.dt
+            q = np.clip(q + qd * self.dt, self.kin.Q_MIN, self.kin.Q_MAX)
+
+        return u_seq
 
     def _create_braking_primitive(self, qd_init: np.ndarray) -> np.ndarray:
         """

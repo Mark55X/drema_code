@@ -72,11 +72,9 @@ class MPPMPPIEngine:
         top_k: int = 12,
         max_joint_acc: float = 0.5,
         # ---------------------------------------------------------------------
-        # Temperature & GMR Parameters (100% from Zhou et al. Section VI-2 & IV):
-        # - lambda_param = 1.0 (MPPI exploration temperature)
-        # - beta_param = 0.8 (Intramodal softmax temperature, Eq. 6, 15)
-        # - alpha_param = 1.0 (Judge strategy differentiation temperature, Eq. 5, 11)
-        # - alpha_mu = 0.8, alpha_sigma = 0.2 (GMR learning rates, Eq. 3, 4, 10)
+        # Temperature & GMR Parameters:
+        # - lambda_param = 1.0, alpha_param = 1.0, beta_param = 0.8: Zhou et al. Sec. VI (Eq. 3, 11, 15)
+        # - alpha_mu, alpha_sigma (Eq. 4, 10): values not reported in the paper
         # ---------------------------------------------------------------------
         lambda_param: float = 1.0,
         beta_param: float = 0.8,
@@ -85,12 +83,14 @@ class MPPMPPIEngine:
         alpha_sigma: float = 0.2,
         init_noise_std: float = 0.15,
         # ---------------------------------------------------------------------
-        # Task Cost Parameters (100% from Zhou et al. Section V & Table I):
-        # - convergence_radius_xi = 0.03m (3 cm attraction bubble for Sparse Reward, Eq. 12, 28)
-        # - rho_modulation = 0.8 (GVM-SDF velocity-gradient scaling factor in [0, 1], Eq. 10, 25)
-        # - alpha_pos = 1.0, alpha_rot = 0.25 (Eq. 27 weighting for position vs orientation)
+        # Task Cost Parameters (Zhou et al. Sec. V; values not reported in the paper):
+        # - convergence_radius_xi: sparse reward radius on dist_joint = ||q - q_des|| [rad] (Eq. 26, 28)
+        # - convergence_radius_xi_cart: radius on the Cartesian fallback dist_cart (Eq. 27), used when IK fails
+        # - rho_modulation: GVM-SDF velocity-gradient modulation in [0, 1] (Eq. 25)
+        # - alpha_pos, alpha_rot: position / orientation weights of dist_cart (Eq. 27)
         # ---------------------------------------------------------------------
-        convergence_radius_xi: float = 0.03,
+        convergence_radius_xi: float = 0.15,
+        convergence_radius_xi_cart: float = 0.03,
         rho_modulation: float = 0.8,
         alpha_pos: float = 1.0,
         alpha_rot: float = 0.25,
@@ -130,7 +130,6 @@ class MPPMPPIEngine:
         self.top_k = min(top_k, self.M)
         self.max_acc = max_joint_acc
 
-        # Hyperparameters verified against Zhou et al. (2025)
         self.lambda_param = lambda_param
         self.beta = beta_param
         self.alpha = alpha_param
@@ -138,6 +137,7 @@ class MPPMPPIEngine:
         self.alpha_sigma = alpha_sigma
         self.init_noise_std = init_noise_std
         self.xi = convergence_radius_xi
+        self.xi_cart = convergence_radius_xi_cart
         self.rho = rho_modulation
         self.alpha_pos = float(alpha_pos)
         self.alpha_rot = float(alpha_rot)
@@ -331,7 +331,8 @@ class MPPMPPIEngine:
             qd_current=qd_curr,
             target_pos=target_pos,
             target_rot=target_rot_mat,
-            proximity=proximity
+            proximity=proximity,
+            q_des=q_des_t
         )
         sample_batches.append(U_p)
 
@@ -378,41 +379,31 @@ class MPPMPPIEngine:
         sparse_rewards = np.zeros((total_K, self.H), dtype=np.float32)
 
         if target_pos is not None:
-            # Batch forward kinematics: positions and quaternions for 6-DoF tracking
-            ee_pos_batch, ee_quat_batch = self.kin.batch_forward_kinematics_ee(Q, return_orientations=True)
-
-            # Cartesian position error ||p_ee - p_g||_2
-            pos_diff = ee_pos_batch - target_pos[None, None, :]
-            err_pos = np.linalg.norm(pos_diff, axis=-1)
-
-            # Cartesian orientation error (Zhou et al. Eq. 27):
-            # dist_rot = arccos(2 * <q_ee, q_g>^2 - 1)
-            if target_quat is not None:
-                inner_prod = np.sum(ee_quat_batch * target_quat[None, None, :], axis=-1)
-                inner_prod = np.clip(inner_prod, -1.0, 1.0)
-                cos_theta = np.clip(2.0 * (inner_prod ** 2) - 1.0, -1.0, 1.0)
-                err_rot = np.arccos(cos_theta)  # [0, pi] rad
-            else:
-                err_rot = 0.0
-
-            dist_cart = self.alpha_pos * err_pos + self.alpha_rot * err_rot
-
+            # dist defaults to dist_joint = ||q - q_des|| (Eq. 26) and switches to dist_cart (Eq. 27)
+            # only when the IK has no solution; the same dist drives the goal term and the sparse
+            # reward (Eq. 28-29), so both vanish together once the arm settles in q_des.
             if q_des_t is not None:
-                # Joint-space posture regularizer (Eq. 26) combined with Cartesian tracking (Eq. 27):
-                # Preserves strong Cartesian position/orientation gradient to drive TCP directly to goal,
-                # while penalizing unnatural nullspace posture drift away from q_des_t.
-                diff = Q - q_des_t[None, None, :]
-                dist_joint = np.linalg.norm(diff, axis=-1)
-                dist_matrix = dist_cart + 0.2 * dist_joint
+                dist_matrix = np.linalg.norm(Q - q_des_t[None, None, :], axis=-1)
+                xi = self.xi
             else:
-                # Pure Cartesian goal distance fallback (Eq. 27)
-                dist_matrix = dist_cart
+                ee_pos_batch, ee_quat_batch = self.kin.batch_forward_kinematics_ee(Q, return_orientations=True)
+                err_pos = np.linalg.norm(ee_pos_batch - target_pos[None, None, :], axis=-1)
+
+                # Orientation error dist_rot = arccos(2 <q_ee, q_g>^2 - 1)
+                if target_quat is not None:
+                    inner_prod = np.clip(np.sum(ee_quat_batch * target_quat[None, None, :], axis=-1), -1.0, 1.0)
+                    err_rot = np.arccos(np.clip(2.0 * (inner_prod ** 2) - 1.0, -1.0, 1.0))
+                else:
+                    err_rot = 0.0
+
+                dist_matrix = self.alpha_pos * err_pos + self.alpha_rot * err_rot
+                xi = self.xi_cart
 
             goal_costs = dist_matrix.copy()
 
-            # Sparse Reward attraction bubble (Zhou et al. Eq. 12, 28):
-            # R_s(x_{i,h}) = 1 - exp(-dist^2 / (2 * xi^2))
-            sparse_rewards = 1.0 - np.exp(-(dist_matrix ** 2) / (2.0 * (self.xi ** 2)))
+            # Sparse reward: R_s = 1 - exp(-dist^2 / (2 xi^2)) (Eq. 28). It is ~1 outside the
+            # convergence radius by design and only shapes the final approach.
+            sparse_rewards = 1.0 - np.exp(-(dist_matrix ** 2) / (2.0 * (xi ** 2)))
 
         # 4b. Joint Limit & Dynamics Constraints: C_safe (Eq. 29)
         # Penalizes closeness to joint position and velocity boundaries
@@ -508,18 +499,22 @@ class MPPMPPIEngine:
             )
             V_n[name] = float(v_val)
 
-            # Update planner's own distribution using weighted top-K controls (Eq. 3, 4)
-            u_topk = U_t[idx_sorted] # [top_k, H, 7]
-            weighted_mu = np.sum(weights[:, None, None] * u_topk, axis=0) # [H, 7]
-            diff_u = u_topk - weighted_mu[None, :, :]
-            weighted_sigma = np.sum(weights[:, None, None] * (diff_u ** 2), axis=0) # [H, 7]
-
-            self.planner_distributions[name]['mu'] = (
-                (1.0 - self.alpha_mu) * self.planner_distributions[name]['mu'] + self.alpha_mu * weighted_mu
+            # Planner distribution update (Alg. 1 lines 16-17, Eq. 3-4): softmax with temperature
+            # lambda over ALL sampled sequences; the beta-weighted top-K only feeds the Judge.
+            # delta is taken w.r.t. the updated mean mu_t (Eq. 4): with near one-hot weights it keeps
+            # the covariance proportional to the mean shift instead of collapsing it to zero.
+            w_all = np.exp(-(c_n - np.min(c_n)) / max(self.lambda_param, 1e-4))
+            w_all = w_all / np.maximum(np.sum(w_all), 1e-8)
+            mu_new = (
+                (1.0 - self.alpha_mu) * self.planner_distributions[name]['mu']
+                + self.alpha_mu * np.sum(w_all[:, None, None] * U_t, axis=0)
             )
+            delta = U_t - mu_new[None, :, :]
             self.planner_distributions[name]['sigma'] = (
-                (1.0 - self.alpha_sigma) * self.planner_distributions[name]['sigma'] + self.alpha_sigma * weighted_sigma
+                (1.0 - self.alpha_sigma) * self.planner_distributions[name]['sigma']
+                + self.alpha_sigma * np.sum(w_all[:, None, None] * (delta ** 2), axis=0)
             )
+            self.planner_distributions[name]['mu'] = mu_new
 
         # ---------------------------------------------------------------------
         # Step 8: Global Strategy Dynamic Mixing Weights w^{(n)} (Eq. 5, 11)

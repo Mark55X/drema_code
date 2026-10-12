@@ -39,6 +39,8 @@ class MPCController:
         max_joint_acc: float = 0.50,              # Joint acceleration saturation limit (rad/s^2)
         alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
         alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
+        convergence_radius_xi: float = 0.15,      # Sparse reward radius on ||q - q_des|| [rad] (Eq. 28)
+        convergence_radius_xi_cart: float = 0.03, # Sparse reward radius on the Cartesian fallback (Eq. 27)
         sigma_1: float = 0.015,                   # Inscribed hard safety collision margin (m)
         sigma_2: float = 0.035,                   # Inflation potential radius (m)
         kappa: float = 120.0,                     # Descending potential slope
@@ -75,6 +77,8 @@ class MPCController:
             alpha_sigma=0.2,
             alpha_pos=alpha_pos,
             alpha_rot=alpha_rot,
+            convergence_radius_xi=convergence_radius_xi,
+            convergence_radius_xi_cart=convergence_radius_xi_cart,
             sigma_1=sigma_1,
             sigma_2=sigma_2,
             kappa=kappa,

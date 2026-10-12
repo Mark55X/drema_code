@@ -223,6 +223,8 @@ class DremaDynamicSystem:
             max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 0.50)),
             alpha_pos=float(ctrl_cfg.get("alpha_pos", 1.0)),
             alpha_rot=float(ctrl_cfg.get("alpha_rot", 0.25)),
+            convergence_radius_xi=float(ctrl_cfg.get("convergence_radius_xi", 0.15)),
+            convergence_radius_xi_cart=float(ctrl_cfg.get("convergence_radius_xi_cart", 0.03)),
             sigma_1=float(ctrl_cfg.get("sigma_1", 0.02)),
             sigma_2=float(ctrl_cfg.get("sigma_2", 0.05)),
             kappa=float(ctrl_cfg.get("kappa", 15.0)),
