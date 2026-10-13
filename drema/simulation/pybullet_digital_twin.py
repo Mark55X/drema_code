@@ -41,9 +41,11 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         kd_rot: float = 1.5,
         sim_substeps: int = 1,
         predictor: Optional[BaseObstaclePredictor] = None,
-        joint_angle_offsets: Optional[List[float]] = None
+        joint_angle_offsets: Optional[List[float]] = None,
+        table_in_collision_costs: bool = True
     ):
         super().__init__(joint_angle_offsets)
+        self.table_in_collision_costs = bool(table_in_collision_costs)
         self.visualize = visualize
         self.table_z = table_z
         self.tracking_mode = tracking_mode.lower()
@@ -654,7 +656,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         coll_p = np.zeros((K, H), dtype=np.float32)
         coll_gvm = np.zeros((K, H), dtype=np.float32)
 
-        if self.client_id < 0 or self.robot_id < 0 or len(self.tracked_objects) == 0:
+        if self.client_id < 0 or self.robot_id < 0:
             self.last_collision_timings = {
                 'backend': 'PyBullet',
                 'pred_ms': 0.0,
@@ -673,6 +675,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 b_id = obj['body_id']
                 obstacle_body_ids.append(b_id)
                 body_to_obj_id[b_id] = obj_id
+        # The table is static (no prediction, zero velocity); only the moving links can be penalized
+        # against it, since the fixed base link rests on its surface.
+        if self.table_in_collision_costs and self.table_id >= 0:
+            obstacle_body_ids.append(self.table_id)
 
         if not obstacle_body_ids:
             self.last_collision_timings = {
@@ -759,6 +765,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                     link_gvm_max: Dict[int, float] = {}
 
                     for pt in closest_pts:
+                        if pt[3] < 0:
+                            continue  # fixed base link (link0): its distance cannot be changed by any control
                         d = pt[8]
 
                         # 1. SDF Potential Phi(d)

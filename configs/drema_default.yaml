@@ -149,6 +149,10 @@ controller:
   alpha_rot: 0.25                    # Cartesian orientation tracking weight (Zhou et al. Eq. 27)
   convergence_radius_xi: 0.15        # Sparse reward radius xi on dist_joint = ||q - q_des|| [rad] (Eq. 26, 28; not reported in the paper)
   convergence_radius_xi_cart: 0.03   # Sparse reward radius on the Cartesian fallback dist_cart, used when IK fails (Eq. 27)
+  approach_funnel_weight: 300.0      # Approach cone cost (extension): straight final descent along the target z-axis (0 disables)
+  approach_funnel_activation_radius: 0.15  # Gaussian activation radius of the approach cone around the goal [m]
+  approach_cone_half_angle_deg: 30.0 # Approach cone half-angle [deg]
+  approach_cone_base_radius: 0.01    # Approach cone radius at the goal [m]
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
   max_action_age_s: 0.20             # Max age [s] of a solved action that may still be replayed as zero-order hold while the MPC is busy
   sigma_1: 0.015                     # Inscribed hard safety collision margin [m] (1.5cm physical buffer)

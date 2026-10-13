@@ -93,6 +93,19 @@ class MPPMPPIEngine:
         convergence_radius_xi: float = 0.15,
         convergence_radius_xi_cart: float = 0.03,
         rho_modulation: float = 0.8,
+        # ---------------------------------------------------------------------
+        # Approach funnel (extension, not in Zhou et al.): near the goal the TCP must stay inside a cone
+        # around the approach axis (target z-axis) and not go below the goal along that axis, so the final
+        # approach is a straight descent along the gripper axis even if the target object and its
+        # surroundings are not in the collision model.
+        # - approach_funnel_weight: weight of the violation [m] per step (0 disables the term)
+        # - approach_funnel_activation_radius: Gaussian activation radius around the goal [m]
+        # - approach_cone_half_angle_deg, approach_cone_base_radius: cone aperture and radius at the goal [m]
+        # ---------------------------------------------------------------------
+        approach_funnel_weight: float = 300.0,
+        approach_funnel_activation_radius: float = 0.15,
+        approach_cone_half_angle_deg: float = 30.0,
+        approach_cone_base_radius: float = 0.01,
         alpha_pos: float = 1.0,
         alpha_rot: float = 0.25,
         # ---------------------------------------------------------------------
@@ -141,6 +154,10 @@ class MPPMPPIEngine:
         self.init_noise_std = init_noise_std
         self.xi = convergence_radius_xi
         self.xi_cart = convergence_radius_xi_cart
+        self.funnel_weight = float(approach_funnel_weight)
+        self.funnel_radius = float(approach_funnel_activation_radius)
+        self.cone_tan = float(np.tan(np.radians(approach_cone_half_angle_deg)))
+        self.cone_base_radius = float(approach_cone_base_radius)
         self.rho = rho_modulation
         self.alpha_pos = float(alpha_pos)
         self.alpha_rot = float(alpha_rot)
@@ -413,6 +430,10 @@ class MPPMPPIEngine:
             # convergence radius by design and only shapes the final approach.
             sparse_rewards = 1.0 - np.exp(-(dist_matrix ** 2) / (2.0 * (xi ** 2)))
 
+        funnel_costs = np.zeros((total_K, self.H), dtype=np.float32)
+        if self.funnel_weight > 0.0 and target_pos is not None and target_rot_mat is not None:
+            funnel_costs = self._approach_funnel_costs(Q, np.asarray(target_pos, dtype=np.float64), target_rot_mat)
+
         # 4b. Joint Limit & Dynamics Constraints: C_safe (Eq. 29)
         # Penalizes closeness to joint position and velocity boundaries
         limit_margins_min = np.maximum(0.0, (self.kin.Q_MIN + 0.05)[None, None, :] - Q)
@@ -448,7 +469,8 @@ class MPPMPPIEngine:
                 st['wg'] * goal_costs +
                 st['wc'] * coll_term +
                 st['wr'] * sparse_rewards +
-                st['ws'] * safety_costs
+                st['ws'] * safety_costs +
+                self.funnel_weight * funnel_costs
             )
             total_costs[name] = np.sum(step_cost, axis=1) # Shape: [total_K]
 
@@ -459,7 +481,8 @@ class MPPMPPIEngine:
             st_judge['wg'] * goal_costs +
             st_judge['wc'] * coll_judge +
             st_judge['wr'] * sparse_rewards +
-            st_judge['ws'] * safety_costs
+            st_judge['ws'] * safety_costs +
+            self.funnel_weight * funnel_costs
         )
         judge_costs = np.sum(step_cost_judge, axis=1) # Shape: [total_K]
 
@@ -630,9 +653,10 @@ class MPPMPPIEngine:
                 c_safe = float(np.sum(st_dom['ws'] * safety_costs[idx]))
                 c_lim = float(np.sum(st_dom['ws'] * c_limits[idx]))
                 c_acc_val = float(np.sum(st_dom['ws'] * 0.01 * c_acc[idx]))
+                c_funnel = float(np.sum(self.funnel_weight * funnel_costs[idx]))
                 return {
                     'total': c_tot, 'goal': c_goal, 'coll': c_coll,
-                    'safe': c_safe, 'limits': c_lim, 'acc': c_acc_val
+                    'safe': c_safe, 'limits': c_lim, 'acc': c_acc_val, 'funnel': c_funnel
                 }
             return {}
 
@@ -664,6 +688,21 @@ class MPPMPPIEngine:
         }
 
         return qd_optimal, diagnostics
+
+    def _approach_funnel_costs(self, Q: np.ndarray, target_pos: np.ndarray, target_rot: np.ndarray) -> np.ndarray:
+        """
+        Per-step approach funnel violation [m], weighted by a Gaussian activation around the goal.
+        With u = -z_target (pointing back along the approach), s = (p - p_g) . u is the height along
+        the approach axis and the lateral offset must stay below base_radius + tan(half_angle) * s.
+        """
+        rel = self.kin.batch_forward_kinematics_ee(Q).astype(np.float64) - target_pos[None, None, :]
+        u = -np.asarray(target_rot, dtype=np.float64)[:, 2]
+        s = rel @ u
+        lateral = np.linalg.norm(rel - s[..., None] * u, axis=-1)
+        allowed = self.cone_base_radius + self.cone_tan * np.maximum(s, 0.0)
+        violation = np.maximum(lateral - allowed, 0.0) + np.maximum(-s, 0.0)
+        activation = np.exp(-(np.linalg.norm(rel, axis=-1) / self.funnel_radius) ** 2)
+        return (activation * violation).astype(np.float32)
 
     def _evaluate_collision_costs(
         self,

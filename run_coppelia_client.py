@@ -85,6 +85,8 @@ class CoppeliaSimulationClient:
         self.step_counter = 0
         self.sim_steps = 0
         self.active_actions_count = 0
+        self.keyframe_idx = 0
+        self.keyframe_label = ""
         self._reset_requested = False
         self.server_connected = False
         self.initial_scan_done = False
@@ -449,6 +451,34 @@ class CoppeliaSimulationClient:
                 continue
         return cam_dict
 
+    @staticmethod
+    def _quat_z_axis(quat_xyzw) -> np.ndarray:
+        x, y, z, w = quat_xyzw
+        return np.array([2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)])
+
+    def _active_keyframe_pose(self, keyframes: List[dict], ee_pose: List[float]) -> List[float]:
+        """
+        Keyframe sequencing (next-best-pose scheme, as a keyframe policy like PerAct would drive it):
+        the MPC tracks the active keyframe; once the tip is within its position tolerance and the gripper
+        axis within its approach tolerance, the next keyframe becomes active. The last one is held.
+        Panda_tip shares its z-axis with the flange, so the axis check needs no frame conversion.
+        """
+        self.keyframe_idx = min(self.keyframe_idx, len(keyframes) - 1)
+        active = keyframes[self.keyframe_idx]
+        if self.keyframe_idx < len(keyframes) - 1 and len(ee_pose) >= 7:
+            pos_err = float(np.linalg.norm(np.asarray(ee_pose[:3]) - np.asarray(active['pose'][:3])))
+            axis_err = 0.0
+            if len(active['pose']) >= 7:
+                cos_axis = float(np.dot(self._quat_z_axis(ee_pose[3:7]), self._quat_z_axis(active['pose'][3:7])))
+                axis_err = float(np.degrees(np.arccos(np.clip(cos_axis, -1.0, 1.0))))
+            if pos_err <= active.get('position_tolerance', 0.02) and axis_err <= active.get('approach_tolerance_deg', 10.0):
+                print(f"[COPPELIA ENVIRONMENT] >>> Keyframe '{active.get('name', self.keyframe_idx)}' reached "
+                      f"(pos err {pos_err*100:.1f} cm, axis err {axis_err:.1f} deg) -> next keyframe")
+                self.keyframe_idx += 1
+                active = keyframes[self.keyframe_idx]
+        self.keyframe_label = f"{active.get('name', self.keyframe_idx)} ({self.keyframe_idx + 1}/{len(keyframes)})"
+        return list(active['pose'])
+
     def get_calibrated_robot_base_pos(self) -> List[float]:
         """
         Computes true world origin coordinates of panda_link0 base frame [x, y, z].
@@ -515,6 +545,7 @@ class CoppeliaSimulationClient:
                     self.step_counter = 0
                     self.sim_steps = 0
                     self.active_actions_count = 0
+                    self.keyframe_idx = 0
                     self.initial_scan_done = False
                     if self.server_connected:
                         try:
@@ -586,7 +617,14 @@ class CoppeliaSimulationClient:
                 target_pose = []
                 target_available = False
                 task_inst = getattr(self.task, '_task', self.task)
-                if hasattr(task_inst, 'get_target_ee_pose'):
+                if hasattr(task_inst, 'get_keyframes'):
+                    try:
+                        target_pose = self._active_keyframe_pose(task_inst.get_keyframes(), ee_pose)
+                        target_available = True
+                    except Exception as e:
+                        print(f"[CoppeliaClient] [Warning] Keyframe sequencing failed: {e}")
+                        target_available = False
+                elif hasattr(task_inst, 'get_target_ee_pose'):
                     try:
                         target_pose = list(task_inst.get_target_ee_pose())
                         target_available = True
@@ -634,9 +672,10 @@ class CoppeliaSimulationClient:
                         if target_available and len(target_pose) >= 3 and len(ee_pose) >= 3:
                             d_tgt = float(np.linalg.norm(np.array(ee_pose[:3]) - np.array(target_pose[:3])))
                             d_tgt_str = f" | d_tgt: {d_tgt:.3f}m"
+                        kf_str = f" | kf: {self.keyframe_label}" if self.keyframe_label else ""
                         print(
                             f"[COPPELIA ENVIRONMENT] Step #{self.step_counter:04d} (Act #{self.active_actions_count:04d}) | "
-                            f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s{d_tgt_str} | Status: '{action.status_message}'"
+                            f"Stop: {action.safety_stop} | v_max: {v_max:.3f} rad/s{d_tgt_str}{kf_str} | Status: '{action.status_message}'"
                         )
                         q_str = "[" + ", ".join(f"{val:+.3f}" for val in q) + "]" if q else "[]"
                         qd_str = "[" + ", ".join(f"{val:+.3f}" for val in action.joint_velocities) + "]" if action.joint_velocities else "[]"

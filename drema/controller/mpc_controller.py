@@ -41,6 +41,10 @@ class MPCController:
         alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
         convergence_radius_xi: float = 0.15,      # Sparse reward radius on ||q - q_des|| [rad] (Eq. 28)
         convergence_radius_xi_cart: float = 0.03, # Sparse reward radius on the Cartesian fallback (Eq. 27)
+        approach_funnel_weight: float = 300.0,    # Approach cone cost weight (0 disables)
+        approach_funnel_activation_radius: float = 0.15,
+        approach_cone_half_angle_deg: float = 30.0,
+        approach_cone_base_radius: float = 0.01,
         sigma_1: float = 0.015,                   # Inscribed hard safety collision margin (m)
         sigma_2: float = 0.035,                   # Inflation potential radius (m)
         kappa: float = 120.0,                     # Descending potential slope
@@ -81,6 +85,10 @@ class MPCController:
             alpha_rot=alpha_rot,
             convergence_radius_xi=convergence_radius_xi,
             convergence_radius_xi_cart=convergence_radius_xi_cart,
+            approach_funnel_weight=approach_funnel_weight,
+            approach_funnel_activation_radius=approach_funnel_activation_radius,
+            approach_cone_half_angle_deg=approach_cone_half_angle_deg,
+            approach_cone_base_radius=approach_cone_base_radius,
             sigma_1=sigma_1,
             sigma_2=sigma_2,
             kappa=kappa,
@@ -228,7 +236,7 @@ class MPCController:
         appr_c = diag.get('appr_costs', {})
         cost_str = ""
         if top_c:
-            cost_str = f" | C[{top_cand}]={top_c.get('total', 0.0):.2f}(g:{top_c.get('goal', 0.0):.2f},s:{top_c.get('safe', 0.0):.2f},c:{top_c.get('coll', 0.0):.2f})"
+            cost_str = f" | C[{top_cand}]={top_c.get('total', 0.0):.2f}(g:{top_c.get('goal', 0.0):.2f},s:{top_c.get('safe', 0.0):.2f},c:{top_c.get('coll', 0.0):.2f},f:{top_c.get('funnel', 0.0):.2f})"
             if appr_c:
                 cost_str += f" vs C[appr]={appr_c.get('total', 0.0):.2f}(g:{appr_c.get('goal', 0.0):.2f},s:{appr_c.get('safe', 0.0):.2f})"
 

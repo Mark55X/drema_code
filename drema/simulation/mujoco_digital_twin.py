@@ -74,7 +74,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         time_step: float = 0.002,
         enable_mjx: bool = False,
         predictor: Optional[BaseObstaclePredictor] = None,
-        joint_angle_offsets: Optional[List[float]] = None
+        joint_angle_offsets: Optional[List[float]] = None,
+        table_in_collision_costs: bool = True
     ):
         if not MUJOCO_AVAILABLE:
             raise ImportError(
@@ -83,6 +84,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             )
 
         super().__init__(joint_angle_offsets)
+        self.table_in_collision_costs = bool(table_in_collision_costs)
         self.visualize = visualize
         self.table_z = float(table_z)
         self.enable_mjx = bool(enable_mjx)
@@ -955,7 +957,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         coll_p = np.zeros((K, H), dtype=np.float32)
         coll_gvm = np.zeros((K, H), dtype=np.float32)
 
-        if self.model is None or self.data is None or len(self.tracked_objects) == 0:
+        if self.model is None or self.data is None:
             self.last_collision_timings = {
                 'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
                 'pred_ms': 0.0,
@@ -979,6 +981,12 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     geom_to_obj_id[i] = obj_id
                 except Exception:
                     pass
+        # The table is static (no prediction, zero velocity); the robot base geom is not in the
+        # robot link map, so only the moving links are penalized against it.
+        if self.table_in_collision_costs:
+            table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
+            if table_geom_id >= 0:
+                obstacle_geoms.append(table_geom_id)
 
         if not obstacle_geoms:
             self.last_collision_timings = {
