@@ -31,6 +31,61 @@ def synchronized(method):
     return wrapper
 
 
+def aggregate_gvm_costs(
+    Q_eval: np.ndarray,
+    QD_eval: np.ndarray,
+    rec_k: List[int],
+    rec_e: List[int],
+    rec_group: List[int],
+    rec_vel_slot: List[int],
+    rec_d: List[float],
+    rec_normal: List[Any],
+    rec_v_obs: List[Any],
+    n_groups: int,
+    sigma_1: float,
+    sigma_2: float,
+    kappa: float,
+    rho: float,
+    kin_helper: Any
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Vectorized C_P and GVM-SDF costs (Zhou et al. Eq. 10, 21, 25) from the closest-point records of a
+    batch of configurations Q_eval / QD_eval [K, E, 7]. Each record carries its configuration (k, e),
+    an aggregation group (max over the points of a group, then sum over groups), the velocity slot of
+    kin_helper.batch_link_linear_velocities, the distance, the obstacle-to-robot normal and the obstacle velocity.
+
+    :return: (coll_p, coll_gvm) of shape [K, E].
+    """
+    K, E, _ = Q_eval.shape
+    coll_p = np.zeros((K * E, n_groups), dtype=np.float64)
+    coll_gvm = np.zeros((K * E, n_groups), dtype=np.float64)
+    if rec_d:
+        d = np.asarray(rec_d, dtype=np.float64)
+        phi = np.where(d < sigma_1, 1.0, np.where(d <= sigma_2, np.exp(-kappa * (d - sigma_1)), 0.0))
+        keep = phi > 1e-4
+        if np.any(keep):
+            phi = phi[keep]
+            ke = (np.asarray(rec_k)[keep] * E + np.asarray(rec_e)[keep])
+            group = np.asarray(rec_group)[keep]
+            normal = np.asarray(rec_normal, dtype=np.float64).reshape(-1, 3)[keep]
+            v_obs = np.asarray(rec_v_obs, dtype=np.float64).reshape(-1, 3)[keep]
+
+            V = kin_helper.batch_link_linear_velocities(Q_eval.reshape(-1, 7), QD_eval.reshape(-1, 7))
+            v_rel = V[ke, np.asarray(rec_vel_slot)[keep]] - v_obs
+            vel_mag = np.linalg.norm(v_rel, axis=-1)
+            norm_mag = np.linalg.norm(normal, axis=-1)
+            valid = (vel_mag > 1e-4) & (norm_mag > 1e-6)
+            cos_theta = np.where(
+                valid, np.sum(normal * v_rel, axis=-1) / np.maximum(norm_mag * vel_mag, 1e-12), 0.0
+            )
+            gvm = phi * (1.0 + vel_mag * (1.0 - rho * cos_theta))
+
+            np.maximum.at(coll_p, (ke, group), phi)
+            np.maximum.at(coll_gvm, (ke, group), gvm)
+    return (coll_p.sum(axis=1).reshape(K, E).astype(np.float32),
+            coll_gvm.sum(axis=1).reshape(K, E).astype(np.float32))
+
+
 class BaseDigitalTwin(ABC):
     """
     Abstract Base Class for Digital Twin simulation engines.

@@ -36,7 +36,7 @@ class MPCController:
         dt: float = 0.05,                         # Planning timestep dt (s)
         num_samples_per_planner: int = 24,        # Stochastic samples per strategy
         top_k: int = 12,                          # Candidates evaluated by the Judge
-        max_joint_acc: float = 0.50,              # Joint acceleration saturation limit (rad/s^2)
+        max_joint_acc: float = 2.0,               # Joint acceleration saturation limit (rad/s^2)
         alpha_pos: float = 1.0,                   # Position error weight (Zhou et al. Eq. 27)
         alpha_rot: float = 0.25,                  # Orientation error weight (Zhou et al. Eq. 27)
         convergence_radius_xi: float = 0.15,      # Sparse reward radius on ||q - q_des|| [rad] (Eq. 28)
@@ -201,6 +201,7 @@ class MPCController:
             # Quaternion [x, y, z, w] to rotation matrix
             qx, qy, qz, qw = robot_state.target_pose[3:7]
             active_target_rot = self._quat_to_rot_matrix(qx, qy, qz, qw)
+        approach_funnel = (not robot_state.HasField('approach_funnel')) or robot_state.approach_funnel
 
         # 5. Execute MP-PMPPI Real-Time Optimization (Algorithm 1)
         qd_optimal, diag = self.engine.solve(
@@ -208,7 +209,8 @@ class MPCController:
             qd_current=curr_qd,
             target_pos=active_target_pos,
             target_rot=active_target_rot,
-            digital_twin=digital_twin
+            digital_twin=digital_twin,
+            approach_funnel=approach_funnel
         )
 
         # 6. Safety net: the engine already plans within the same bound, so a clip here

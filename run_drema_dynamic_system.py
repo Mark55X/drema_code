@@ -220,7 +220,7 @@ class DremaDynamicSystem:
             dt=float(ctrl_cfg.get("dt", 0.05)),
             num_samples_per_planner=int(ctrl_cfg.get("num_samples_per_planner", 24)),
             top_k=int(ctrl_cfg.get("top_k", 12)),
-            max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 0.50)),
+            max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 2.0)),
             alpha_pos=float(ctrl_cfg.get("alpha_pos", 1.0)),
             alpha_rot=float(ctrl_cfg.get("alpha_rot", 0.25)),
             convergence_radius_xi=float(ctrl_cfg.get("convergence_radius_xi", 0.15)),

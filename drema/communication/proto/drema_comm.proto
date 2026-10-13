@@ -51,6 +51,7 @@ message RobotState {
   bool target_available = 9;            // True if target pose is active/tracked
   repeated double robot_base_pos = 10;  // Robot base position [x, y, z] in world coordinates
   double reachability_radius = 11;      // Robot maximum kinematic reach radius in meters
+  optional bool approach_funnel = 12;   // Approach cone cost on the active target; unset = enabled
 }
 
 // Action returned by MPC controller to the robot

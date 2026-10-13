@@ -17,7 +17,7 @@ from typing import Optional, Tuple, List, Dict, Union, Any
 
 import pybullet as p
 import pybullet_data
-from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized
+from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized, aggregate_gvm_costs
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 from drema.controller.franka_kinematics import FrankaKinematics
 from scipy.spatial.transform import Rotation
@@ -718,10 +718,21 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         saved_arm_states = [p.getJointState(robot_id, j_idx)[:2] for j_idx in arm_joint_indices]
 
         t_bullet_total = 0.0
-        t_gvm_total = 0.0
         total_contact_pts = 0
 
-        for h in eval_steps:
+        # Closest-point records, aggregated per (obstacle, robot link) as in Zhou et al. Eq. 10, 21:
+        # the potential is evaluated per kinematic link instead of summing over dense mesh vertices.
+        n_links = num_j
+        rec_k: List[int] = []
+        rec_e: List[int] = []
+        rec_group: List[int] = []
+        rec_slot: List[int] = []
+        rec_d: List[float] = []
+        rec_normal: List[Any] = []
+        rec_v_obs: List[Any] = []
+        zero_vel = (0.0, 0.0, 0.0)
+
+        for e, h in enumerate(eval_steps):
             # Advance all tracked dynamic obstacles to their forecasted future pose at lookahead step h
             for b_id, o_id in body_to_obj_id.items():
                 if o_id in predictions:
@@ -731,97 +742,42 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         pred.positions[h].tolist(),
                         pred.orientations[h].tolist()
                     )
+            obs_vel = []
+            for obs_id in obstacle_body_ids:
+                o_id = body_to_obj_id.get(obs_id)
+                obs_vel.append(predictions[o_id].velocities[h] if o_id is not None and o_id in predictions else zero_vel)
 
+            t_b_start = time.perf_counter()
             for k in range(K):
                 q_step = Q[k, h]
-                qd_step = QD[k, h]
-
-                t_b_start = time.perf_counter()
-                # Update Franka Panda joint positions in PyBullet
                 for arm_j, j_idx in enumerate(arm_joint_indices):
                     p.resetJointState(robot_id, j_idx, float(q_step[arm_j]) + self.joint_angle_offsets[arm_j])
 
-                step_coll_p = 0.0
-                step_coll_gvm = 0.0
-
-                for obs_id in obstacle_body_ids:
-                    closest_pts = p.getClosestPoints(
-                        bodyA=robot_id,
-                        bodyB=obs_id,
-                        distance=float(sigma_2)
-                    )
-                    t_bullet_total += (time.perf_counter() - t_b_start)
-
-                    if not closest_pts:
-                        continue
-
+                for slot, obs_id in enumerate(obstacle_body_ids):
+                    closest_pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs_id, distance=float(sigma_2))
                     total_contact_pts += len(closest_pts)
-                    t_gvm_start = time.perf_counter()
-
-                    # Link-level aggregation (Zhou et al. IEEE T-RO 2025 Eq. 10, 21):
-                    # Collision potential is evaluated across robot kinematic links,
-                    # avoiding unnormalized summation over dense obstacle mesh vertices.
-                    link_phi_max: Dict[int, float] = {}
-                    link_gvm_max: Dict[int, float] = {}
-
                     for pt in closest_pts:
-                        if pt[3] < 0:
-                            continue  # fixed base link (link0): its distance cannot be changed by any control
-                        d = pt[8]
-
-                        # 1. SDF Potential Phi(d)
-                        if d < sigma_1:
-                            phi = 1.0
-                        elif d <= sigma_2:
-                            phi = float(np.exp(-kappa * (d - sigma_1)))
-                        else:
-                            phi = 0.0
-
-                        if phi <= 1e-4:
-                            continue
-
                         link_a = pt[3]
-                        if phi > link_phi_max.get(link_a, 0.0):
-                            link_phi_max[link_a] = phi
+                        if link_a < 0:
+                            continue  # fixed base link (link0): its distance cannot be changed by any control
+                        rec_k.append(k)
+                        rec_e.append(e)
+                        rec_group.append(slot * n_links + link_a)
+                        rec_slot.append(link_a if link_a < 7 else 7)
+                        rec_d.append(pt[8])
+                        rec_normal.append(pt[7])
+                        rec_v_obs.append(obs_vel[slot])
+            t_bullet_total += time.perf_counter() - t_b_start
 
-                        # 2. Distance Gradient Vector nabla Phi
-                        normal_grad = np.array(pt[7], dtype=np.float32)
-                        norm_mag = np.linalg.norm(normal_grad)
-                        if norm_mag > 1e-6:
-                            normal_grad = normal_grad / norm_mag
-
-                        # 3. Relative Cartesian Velocity between closest robot link and moving obstacle
-                        fk_link_idx = -1 if (link_a < 0 or link_a >= 7) else (link_a + 1)
-                        vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
-
-                        o_id = body_to_obj_id.get(obs_id)
-                        if o_id is not None and o_id in predictions:
-                            v_obs = predictions[o_id].velocities[h]
-                        else:
-                            v_obs = np.zeros(3, dtype=np.float32)
-
-                        # True relative approach velocity (Zhou et al. IEEE T-RO 2025)
-                        v_rel = vel_cart - v_obs
-                        vel_mag = np.linalg.norm(v_rel)
-
-                        # 4. Cosine Alignment theta with relative velocity
-                        if vel_mag > 1e-4:
-                            cos_theta = float(np.dot(normal_grad, v_rel) / (norm_mag * vel_mag))
-                        else:
-                            cos_theta = 0.0
-
-                        # 5. GVM-SDF Modulation Term
-                        modulation = 1.0 - rho * cos_theta
-                        gvm_term = phi * (1.0 + vel_mag * modulation)
-                        if gvm_term > link_gvm_max.get(link_a, 0.0):
-                            link_gvm_max[link_a] = gvm_term
-
-                    step_coll_p += sum(link_phi_max.values())
-                    step_coll_gvm += sum(link_gvm_max.values())
-                    t_gvm_total += (time.perf_counter() - t_gvm_start)
-
-                coll_p[k, h] = step_coll_p
-                coll_gvm[k, h] = step_coll_gvm
+        t_gvm_start = time.perf_counter()
+        coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(
+            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_group, rec_slot, rec_d, rec_normal, rec_v_obs,
+            n_groups=len(obstacle_body_ids) * n_links, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho,
+            kin_helper=kin_helper
+        )
+        coll_p[:, eval_steps] = coll_p_eval
+        coll_gvm[:, eval_steps] = coll_gvm_eval
+        t_gvm_total = time.perf_counter() - t_gvm_start
 
         self.last_collision_timings = {
             'backend': 'PyBullet',

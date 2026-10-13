@@ -24,7 +24,7 @@ try:
 except ImportError:
     MUJOCO_AVAILABLE = False
 
-from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized
+from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized, aggregate_gvm_costs
 from drema.controller.franka_kinematics import FrankaKinematics
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 
@@ -1062,26 +1062,35 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         fromto = np.zeros(6, dtype=np.float64)
 
-        for h in eval_steps:
+        # Closest-point records, aggregated per robot link across all obstacles.
+        rec_k: List[int] = []
+        rec_e: List[int] = []
+        rec_slot: List[int] = []
+        rec_d: List[float] = []
+        rec_normal: List[Any] = []
+        rec_v_obs: List[Any] = []
+        zero_vel = np.zeros(3, dtype=np.float64)
+
+        for e, h in enumerate(eval_steps):
             # Advance all tracked dynamic obstacles to forecasted pose at step h
             for obj_id, m_idx in obj_mocap_map.items():
                 if obj_id in predictions:
                     pred = predictions[obj_id]
                     eval_data.mocap_pos[m_idx] = pred.positions[h].astype(np.float64)
                     eval_data.mocap_quat[m_idx] = _xyzw_to_wxyz(pred.orientations[h])
+            obs_vel = {}
+            for og in obstacle_geoms:
+                o_id = geom_to_obj_id.get(og)
+                obs_vel[og] = predictions[o_id].velocities[h] if o_id is not None and o_id in predictions else zero_vel
 
             for k in range(K):
                 q_step = Q[k, h]
-                qd_step = QD[k, h]
 
                 # Update Franka Panda joint positions in MuJoCo eval data
                 t_mj_s = time.perf_counter()
                 eval_data.qpos[:7] = q_step + self.joint_angle_offsets
                 mujoco.mj_kinematics(self.model, eval_data)
                 t_mj_total += (time.perf_counter() - t_mj_s)
-
-                link_phi_max: Dict[int, float] = {}
-                link_gvm_max: Dict[int, float] = {}
 
                 for rg, fk_link_idx in robot_geom_link_map:
                     rg_pos = eval_data.geom_xpos[rg]
@@ -1107,59 +1116,22 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         if d > sigma_2:
                             continue
 
-                        # 1. SDF Potential Phi(d)
-                        if d < sigma_1:
-                            phi = 1.0
-                        elif d <= sigma_2:
-                            phi = float(np.exp(-kappa * (d - sigma_1)))
-                        else:
-                            phi = 0.0
-
-                        if phi <= 1e-4:
-                            continue
-
                         total_contact_pts += 1
-                        t_gvm_s = time.perf_counter()
+                        rec_k.append(k)
+                        rec_e.append(e)
+                        rec_slot.append(7 if fk_link_idx < 1 else fk_link_idx - 1)
+                        rec_d.append(d)
+                        rec_normal.append(fromto[0:3] - fromto[3:6])
+                        rec_v_obs.append(obs_vel[og])
 
-                        if phi > link_phi_max.get(fk_link_idx, 0.0):
-                            link_phi_max[fk_link_idx] = phi
-
-                        # 2. Distance Gradient Vector (from obstacle surface to robot link)
-                        diff = fromto[0:3] - fromto[3:6]
-                        norm_mag = np.linalg.norm(diff)
-                        if norm_mag > 1e-6:
-                            normal_grad = (diff / norm_mag).astype(np.float32)
-                        else:
-                            normal_grad = np.zeros(3, dtype=np.float32)
-
-                        # 3. Relative Cartesian Velocity between closest robot link and moving obstacle
-                        vel_cart = kin_helper.compute_cartesian_velocity(q_step, qd_step, link_idx=fk_link_idx)
-                        
-                        o_id = geom_to_obj_id.get(og)
-                        if o_id is not None and o_id in predictions:
-                            v_obs = predictions[o_id].velocities[h]
-                        else:
-                            v_obs = np.zeros(3, dtype=np.float32)
-
-                        v_rel = vel_cart - v_obs
-                        vel_mag = np.linalg.norm(v_rel)
-
-                        # 4. Cosine Alignment theta
-                        if vel_mag > 1e-4 and norm_mag > 1e-6:
-                            cos_theta = float(np.dot(normal_grad, v_rel) / vel_mag)
-                        else:
-                            cos_theta = 0.0
-
-                        # 5. GVM-SDF Modulation Term
-                        modulation = 1.0 - rho * cos_theta
-                        gvm_term = phi * (1.0 + vel_mag * modulation)
-                        if gvm_term > link_gvm_max.get(fk_link_idx, 0.0):
-                            link_gvm_max[fk_link_idx] = gvm_term
-
-                        t_gvm_total += (time.perf_counter() - t_gvm_s)
-
-                coll_p[k, h] = sum(link_phi_max.values())
-                coll_gvm[k, h] = sum(link_gvm_max.values())
+        t_gvm_s = time.perf_counter()
+        coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(
+            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_slot, rec_slot, rec_d, rec_normal, rec_v_obs,
+            n_groups=8, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho, kin_helper=kin_helper
+        )
+        coll_p[:, eval_steps] = coll_p_eval
+        coll_gvm[:, eval_steps] = coll_gvm_eval
+        t_gvm_total = time.perf_counter() - t_gvm_s
 
         self.last_collision_timings = {
             'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',

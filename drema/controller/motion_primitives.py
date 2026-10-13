@@ -42,7 +42,7 @@ class MotionPrimitiveLibrary:
         kinematics: FrankaKinematics,
         horizon: int = 20,
         dt: float = 0.05,
-        max_joint_acc: float = 0.5,
+        max_joint_acc: float = 2.0,
         max_joint_velocity: Union[float, np.ndarray] = 1.0,
         rot_tracking_gain: float = 2.0,
         align_rot_gain: float = 3.0,

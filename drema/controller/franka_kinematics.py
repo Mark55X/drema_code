@@ -392,6 +392,30 @@ class FrankaKinematics:
         )
         return J
 
+    def batch_link_linear_velocities(self, q_flat: np.ndarray, qd_flat: np.ndarray) -> np.ndarray:
+        """
+        Linear velocities of the link 1..7 frame origins and of the end-effector for N configurations,
+        identical to compute_cartesian_velocity(q, qd, link_idx) for link_idx = 1..7 and -1.
+
+        :param q_flat: Joint angles of shape [N, 7].
+        :param qd_flat: Joint velocities of shape [N, 7].
+        :return: Velocities of shape [N, 8, 3]; slot l-1 is link l, slot 7 is the end-effector.
+        """
+        q_flat = np.asarray(q_flat, dtype=np.float64)
+        qd_flat = np.asarray(qd_flat, dtype=np.float64)
+        N = q_flat.shape[0]
+        T_all = self._batch_link_transforms(q_flat)
+        origin = np.zeros((N, 3), dtype=np.float64)
+        ee_offset = np.tile(self.EE_OFFSET.astype(np.float64), (N, 1))
+        V = np.empty((N, 8, 3), dtype=np.float64)
+        for slot in range(8):
+            link = min(slot + 1, 7)
+            J, _ = self._point_jacobian_from_transforms(
+                T_all, np.full(N, link, dtype=np.int64), ee_offset if slot == 7 else origin
+            )
+            V[:, slot] = (J[:, :3, :] @ qd_flat[..., None])[..., 0]
+        return V
+
     def batch_point_jacobian(
         self,
         q_flat: np.ndarray,

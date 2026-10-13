@@ -331,11 +331,13 @@ class DremaGrpcClient:
         robot_base_pos: Optional[List[float]] = None,
         reachability_radius: float = 0.95,
         timeout: float = 0.5,
-        blocking: bool = True
+        blocking: bool = True,
+        approach_funnel: Optional[bool] = None
     ) -> drema_comm_pb2.ControlAction:
         """
         Queries the MPC controller for the next joint velocity command.
 
+        :param approach_funnel: Enables / disables the approach cone on this target; None leaves the server default (enabled).
         :param timeout: Blocking mode: RPC deadline. Non-blocking mode: how long to wait for a just-sent
                         request before falling back to the most recent fresh action.
         :param blocking: If True, waits up to `timeout` for the action solved on this state (lockstep).
@@ -356,6 +358,8 @@ class DremaGrpcClient:
             robot_base_pos=robot_base_pos or [0.0, 0.0, 0.0],
             reachability_radius=float(reachability_radius)
         )
+        if approach_funnel is not None:
+            state.approach_funnel = bool(approach_funnel)
         if not blocking:
             return self._request_action_async(state, timeout, len(joint_positions), gripper_open)
 

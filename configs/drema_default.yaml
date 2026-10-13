@@ -142,7 +142,7 @@ controller:
   dt: 0.05                           # MPPI prediction time step dt (seconds)
   horizon: 15                        # MPPI prediction horizon H (15 * 0.05s = 0.75s)
   max_joint_velocity: 1.00           # Joint velocity bound [rad/s] shared by rollouts, primitives and the issued command
-  max_joint_acc: 0.50                # Joint acceleration saturation limit (rad/s^2)
+  max_joint_acc: 2.00                # Joint acceleration saturation limit (rad/s^2); keep >= max_joint_velocity / (horizon * dt) so a full-speed rollout can stop within the horizon
   num_samples_per_planner: 24        # Stochastic samples per MPPI strategy
   top_k: 12                          # Top candidates evaluated by the Judge
   alpha_pos: 1.0                     # Cartesian position tracking weight (Zhou et al. Eq. 27)

@@ -87,6 +87,7 @@ class CoppeliaSimulationClient:
         self.active_actions_count = 0
         self.keyframe_idx = 0
         self.keyframe_label = ""
+        self.keyframe_funnel = None
         self._reset_requested = False
         self.server_connected = False
         self.initial_scan_done = False
@@ -462,6 +463,7 @@ class CoppeliaSimulationClient:
         the MPC tracks the active keyframe; once the tip is within its position tolerance and the gripper
         axis within its approach tolerance, the next keyframe becomes active. The last one is held.
         Panda_tip shares its z-axis with the flange, so the axis check needs no frame conversion.
+        The keyframe's optional 'approach_funnel' flag is exposed in self.keyframe_funnel (None = server default).
         """
         self.keyframe_idx = min(self.keyframe_idx, len(keyframes) - 1)
         active = keyframes[self.keyframe_idx]
@@ -477,6 +479,7 @@ class CoppeliaSimulationClient:
                 self.keyframe_idx += 1
                 active = keyframes[self.keyframe_idx]
         self.keyframe_label = f"{active.get('name', self.keyframe_idx)} ({self.keyframe_idx + 1}/{len(keyframes)})"
+        self.keyframe_funnel = active.get('approach_funnel')
         return list(active['pose'])
 
     def get_calibrated_robot_base_pos(self) -> List[float]:
@@ -616,10 +619,12 @@ class CoppeliaSimulationClient:
 
                 target_pose = []
                 target_available = False
+                approach_funnel = None
                 task_inst = getattr(self.task, '_task', self.task)
                 if hasattr(task_inst, 'get_keyframes'):
                     try:
                         target_pose = self._active_keyframe_pose(task_inst.get_keyframes(), ee_pose)
+                        approach_funnel = self.keyframe_funnel
                         target_available = True
                     except Exception as e:
                         print(f"[CoppeliaClient] [Warning] Keyframe sequencing failed: {e}")
@@ -657,7 +662,8 @@ class CoppeliaSimulationClient:
                         robot_base_pos=robot_base_pos,
                         reachability_radius=self.reachability_radius,
                         timeout=(2.0 if self.sync_mode == "stepped" else 0.5 * self.ctrl_period),
-                        blocking=(self.sync_mode == "stepped")
+                        blocking=(self.sync_mode == "stepped"),
+                        approach_funnel=approach_funnel
                     )
                     # 4. Actuate Robot
                     if not action.safety_stop and len(action.joint_velocities) == len(q):

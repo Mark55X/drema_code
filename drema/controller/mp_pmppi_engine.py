@@ -70,7 +70,7 @@ class MPPMPPIEngine:
         # ---------------------------------------------------------------------
         num_samples_per_planner: int = 24,
         top_k: int = 12,
-        max_joint_acc: float = 0.5,
+        max_joint_acc: float = 2.0,
         max_joint_velocity: float = 1.0,
         # ---------------------------------------------------------------------
         # Temperature & GMR Parameters:
@@ -253,7 +253,8 @@ class MPPMPPIEngine:
         qd_current: np.ndarray,
         target_pos: Optional[np.ndarray],
         target_rot: Optional[np.ndarray] = None,
-        digital_twin: Optional[Any] = None
+        digital_twin: Optional[Any] = None,
+        approach_funnel: bool = True
     ) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Executes one full iteration of MP-PMPPI.
@@ -263,6 +264,7 @@ class MPPMPPIEngine:
         :param target_pos: Target 3D position [x, y, z] in world frame.
         :param target_rot: Optional target 3x3 orientation matrix.
         :param digital_twin: PyBulletDigitalTwin instance for exact mesh collision checks.
+        :param approach_funnel: False skips the approach cone for this target (e.g. a pre-grasp in free space).
         :return: (optimal_joint_velocity_cmd [shape: 7], diagnostics_dict)
         """
         t0 = time.time()
@@ -431,7 +433,7 @@ class MPPMPPIEngine:
             sparse_rewards = 1.0 - np.exp(-(dist_matrix ** 2) / (2.0 * (xi ** 2)))
 
         funnel_costs = np.zeros((total_K, self.H), dtype=np.float32)
-        if self.funnel_weight > 0.0 and target_pos is not None and target_rot_mat is not None:
+        if approach_funnel and self.funnel_weight > 0.0 and target_pos is not None and target_rot_mat is not None:
             funnel_costs = self._approach_funnel_costs(Q, np.asarray(target_pos, dtype=np.float64), target_rot_mat)
 
         # 4b. Joint Limit & Dynamics Constraints: C_safe (Eq. 29)
