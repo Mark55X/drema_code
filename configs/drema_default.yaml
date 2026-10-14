@@ -155,6 +155,8 @@ controller:
   approach_cone_base_radius: 0.01    # Approach cone radius at the goal [m]
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
   max_action_age_s: 0.20             # Max age [s] of a solved action that may still be replayed as zero-order hold while the MPC is busy
+  debug_dump_dir: "logs/mpc_dumps"   # Saves the MPC solve inputs (robot state, goal, obstacle poses and forecasts) as .npz per action, in a timestamped subfolder ("" disables)
+  debug_dump_interval: 1             # Dump every N served actions
   sigma_1: 0.015                     # Inscribed hard safety collision margin [m] (1.5cm physical buffer)
   sigma_2: 0.035                     # Inflation radius [m] - compact buffer calibrated for tabletop precision
   kappa: 120.0                       # Exponential decay slope (Zhou et al. Eq. 21, continuous decay to ~0.09 at sigma_2)

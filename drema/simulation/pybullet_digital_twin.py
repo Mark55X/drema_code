@@ -63,6 +63,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         self.client_id = -1
         self.robot_id = -1
+        self.robot_loaded = False
         self.table_id = -1
 
         # Dynamic registry of objects spawned by perception (obj_id -> object metadata)
@@ -110,7 +111,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         if self.robot_id >= 0:
             try:
-                p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
+                self._reset_robot_base(base_position, base_orientation)
                 if joint_positions is not None:
                     self.sync_robot_state(joint_positions)
                 return True
@@ -121,16 +122,28 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         # Load URDF at the exact base position received dynamically
         try:
             self.robot_id = p.loadURDF(self.robot_urdf_path, list(base_position), list(base_orientation), useFixedBase=True)
+            self.robot_loaded = True
             print(f"[PYBULLET DIGITAL TWIN] Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
         except Exception as e:
             print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to load Franka Panda URDF: {e}")
             self.robot_id = -1
+            self.robot_loaded = False
             return False
 
         if joint_positions is not None:
             self.sync_robot_state(joint_positions)
 
         return True
+
+    def _reset_robot_base(self, base_position, base_orientation) -> None:
+        """
+        Places the base link frame at the given pose. loadURDF takes the link frame, whereas
+        resetBasePositionAndOrientation takes the base inertial frame, which for panda_link0 sits 5 cm
+        above the link frame: passing the link pose directly would sink the whole robot by that offset.
+        """
+        local_pos, local_orn = p.getDynamicsInfo(self.robot_id, -1)[3:5]
+        com_pos, com_orn = p.multiplyTransforms(list(base_position), list(base_orientation), local_pos, local_orn)
+        p.resetBasePositionAndOrientation(self.robot_id, com_pos, com_orn)
 
     @synchronized
     def set_robot_base_pose(
@@ -143,7 +156,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             self.load_robot(base_position, base_orientation)
         else:
             try:
-                p.resetBasePositionAndOrientation(self.robot_id, list(base_position), list(base_orientation))
+                self._reset_robot_base(base_position, base_orientation)
             except Exception as e:
                 print(f"[PYBULLET DIGITAL TWIN WARNING] Failed to reset robot base pose: {e}")
 

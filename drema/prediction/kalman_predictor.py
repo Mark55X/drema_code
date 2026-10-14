@@ -17,17 +17,15 @@ class SingleObjectKinematicFilter:
         Equipped with Mahalanobis distance gating to reject perceptual outliers.
 
     Rotational Dynamics:
-        State on SO(3) parameterized by unit quaternions q in H.
-        Angular velocity omega in R^3 estimated via Lie algebra tangent space difference:
-            omega = 2 * Log(q_t (x) q_{t-1}^*) / dt
-        with exponential smoothing and forward Lie group integration.
+        Multiplicative (error-state) Kalman filter on SO(3) with a constant angular velocity model:
+        filtered orientation q, error state [delta_phi, omega] in the tangent space, measurement
+        residual Log(q_meas q^-1).
 
     Static-object detection:
-        The reported velocity (used for prediction) is the filtered one only when it is
-        statistically distinguishable from zero (v^T P_vv^-1 v above a chi-square threshold)
-        and above a minimum speed; otherwise the object is reported as static. Without this,
-        perception jitter on a static object is extrapolated into spurious motion over the
-        whole MPC horizon.
+        The reported linear / angular velocity (used for prediction) is the filtered one only when
+        it is statistically distinguishable from zero (v^T P_vv^-1 v above a chi-square threshold)
+        and above a minimum magnitude; otherwise it is reported as zero. Without this, perception
+        jitter on a static object is extrapolated into spurious motion over the whole MPC horizon.
     """
 
     def __init__(
@@ -41,7 +39,8 @@ class SingleObjectKinematicFilter:
         nis_smoothing: float = 0.5,             # EMA factor of the normalized innovation squared
         noise_adaptation_gain: float = 0.3,     # log-variance step per unit of log(NIS / 3)
         mahalanobis_thresh: float = 50.0,       # ~7-sigma outlier rejection threshold
-        angular_smooth_alpha: float = 0.4,      # Exponential filter factor on angular velocity
+        rot_meas_noise: float = 0.05,           # [rad] standard deviation of the perceived orientation
+        proc_ang_acc_noise: float = 0.05,       # white-noise angular acceleration intensity [rad/s^2 / sqrt(Hz)]
         static_chi2_thresh: float = 11.34,      # chi-square 3 DoF, 99%: velocity not distinguishable from zero
         min_moving_speed: float = 0.02,         # [m/s] slower objects are reported as static
         min_moving_omega: float = 0.15          # [rad/s] slower rotations are reported as zero
@@ -60,17 +59,18 @@ class SingleObjectKinematicFilter:
         self.nis_smoothing = float(nis_smoothing)
         self.noise_adaptation_gain = float(noise_adaptation_gain)
         self.mahalanobis_thresh = float(mahalanobis_thresh)
-        self.angular_smooth_alpha = float(angular_smooth_alpha)
+        self.rot_meas_noise = float(rot_meas_noise)
+        self.proc_ang_acc_noise = float(proc_ang_acc_noise)
         self.static_chi2_thresh = float(static_chi2_thresh)
         self.min_moving_speed = float(min_moving_speed)
         self.min_moving_omega = float(min_moving_omega)
 
-        # Measurement matrix H: maps 6D state -> 3D position
+        # Measurement matrix H: maps 6D state -> 3D position (same structure for the rotation error state)
         self.H_mat = np.zeros((3, 6), dtype=np.float64)
         self.H_mat[0, 0] = self.H_mat[1, 1] = self.H_mat[2, 2] = 1.0
 
-        # Measurement noise covariance R
         self.R_mat = (self.pos_meas_noise ** 2) * np.eye(3, dtype=np.float64)
+        self.R_rot = (self.rot_meas_noise ** 2) * np.eye(3, dtype=np.float64)
 
         self._anchor(initial_pos, initial_quat, initial_time)
 
@@ -85,6 +85,9 @@ class SingleObjectKinematicFilter:
         self.P[3:6, 3:6] = 1.0 * np.eye(3)
         self.current_quat = self._normalize_quat(quat)
         self.current_omega = np.zeros(3, dtype=np.float64)
+        self.P_rot = np.zeros((6, 6), dtype=np.float64)
+        self.P_rot[0:3, 0:3] = self.R_rot.copy()
+        self.P_rot[3:6, 3:6] = 1.0 * np.eye(3)
         self.updates_count = 1
         self.nis_ema = 3.0
         self.log_variance_scale = 0.0
@@ -108,13 +111,14 @@ class SingleObjectKinematicFilter:
             return q_arr / norm
         return np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float64)
 
-    def _build_discrete_matrices(self, dt: float) -> Tuple[np.ndarray, np.ndarray]:
-        """Constructs state transition matrix F(dt) and process noise covariance Q(dt)."""
+    @staticmethod
+    def _build_discrete_matrices(dt: float, acc_noise: float) -> Tuple[np.ndarray, np.ndarray]:
+        """Constant-velocity transition F(dt) and process noise Q(dt) for a [value, rate] state in 3D."""
         dt = max(dt, 1e-4)
         F = np.eye(6, dtype=np.float64)
         F[0:3, 3:6] = dt * np.eye(3)
 
-        q_var = self.adapted_acc_noise ** 2
+        q_var = acc_noise ** 2
         Q = np.zeros((6, 6), dtype=np.float64)
         Q[0:3, 0:3] = (dt ** 3 / 3.0) * q_var * np.eye(3)
         Q[0:3, 3:6] = Q[3:6, 0:3] = (dt ** 2 / 2.0) * q_var * np.eye(3)
@@ -135,10 +139,35 @@ class SingleObjectKinematicFilter:
     def effective_velocity(self) -> np.ndarray:
         return self.x[3:6].copy() if self.is_moving() else np.zeros(3, dtype=np.float64)
 
+    def is_rotating(self) -> bool:
+        """True when the filtered angular velocity is statistically and physically distinguishable from zero."""
+        w = self.current_omega
+        if float(np.linalg.norm(w)) < self.min_moving_omega:
+            return False
+        try:
+            significance = float(w @ np.linalg.solve(self.P_rot[3:6, 3:6], w))
+        except np.linalg.LinAlgError:
+            return True
+        return significance > self.static_chi2_thresh
+
     def effective_omega(self) -> np.ndarray:
-        if float(np.linalg.norm(self.current_omega)) < self.min_moving_omega:
-            return np.zeros(3, dtype=np.float64)
-        return self.current_omega.copy()
+        return self.current_omega.copy() if self.is_rotating() else np.zeros(3, dtype=np.float64)
+
+    def _update_rotation(self, measured_quat, dt: float) -> None:
+        """Error-state update: predict q <- Exp(omega dt) q, correct with the residual Log(q_meas q^-1)."""
+        F, Q = self._build_discrete_matrices(dt, self.proc_ang_acc_noise)
+        q_pred = R.from_rotvec(self.current_omega * dt) * R.from_quat(self.current_quat)
+        P_pred = F @ self.P_rot @ F.T + Q
+
+        residual = (R.from_quat(self._normalize_quat(measured_quat)) * q_pred.inv()).as_rotvec()
+        S = self.H_mat @ P_pred @ self.H_mat.T + self.R_rot
+        K = P_pred @ self.H_mat.T @ np.linalg.inv(S)
+        delta = K @ residual
+        I_KH = np.eye(6, dtype=np.float64) - K @ self.H_mat
+        self.P_rot = I_KH @ P_pred @ I_KH.T + K @ self.R_rot @ K.T
+
+        self.current_quat = (R.from_rotvec(delta[0:3]) * q_pred).as_quat()
+        self.current_omega = self.current_omega + delta[3:6]
 
     def update(
         self,
@@ -169,7 +198,7 @@ class SingleObjectKinematicFilter:
             return True
 
         # 1. Prediction Step for Translation
-        F, Q = self._build_discrete_matrices(dt)
+        F, Q = self._build_discrete_matrices(dt, self.adapted_acc_noise)
         x_pred = F @ self.x
         P_pred = F @ self.P @ F.T + Q
 
@@ -211,25 +240,8 @@ class SingleObjectKinematicFilter:
         I_KH = np.eye(6, dtype=np.float64) - K @ self.H_mat
         self.P = I_KH @ P_pred @ I_KH.T + K @ self.R_mat @ K.T
 
-        # 4. Rotation Update via SO(3) Tangent Space
-        norm_meas_quat = self._normalize_quat(measured_quat)
-        if np.dot(norm_meas_quat, self.current_quat) < 0.0:
-            norm_meas_quat = -norm_meas_quat
-
-        try:
-            r_prev = R.from_quat(self.current_quat)
-            r_meas = R.from_quat(norm_meas_quat)
-            r_diff = r_meas * r_prev.inv()
-            rotvec = r_diff.as_rotvec()
-            meas_omega = rotvec / dt
-            self.current_omega = (
-                self.angular_smooth_alpha * meas_omega +
-                (1.0 - self.angular_smooth_alpha) * self.current_omega
-            )
-        except Exception:
-            pass
-
-        self.current_quat = norm_meas_quat
+        # 4. Rotation Update on SO(3)
+        self._update_rotation(measured_quat, dt)
         self.last_timestamp = now
         self.updates_count += 1
         return True
@@ -286,7 +298,8 @@ class KalmanObstaclePredictor(BaseObstaclePredictor):
         default_acc_noise: float = 0.02,
         maneuver_acc_noise: float = 2.0,
         mahalanobis_thresh: float = 50.0,
-        angular_smooth_alpha: float = 0.4,
+        rot_meas_noise: float = 0.05,
+        proc_ang_acc_noise: float = 0.05,
         stale_timeout_sec: float = 2.0,
         static_chi2_thresh: float = 11.34,
         min_moving_speed: float = 0.02,
@@ -296,7 +309,8 @@ class KalmanObstaclePredictor(BaseObstaclePredictor):
         self.default_acc_noise = float(default_acc_noise)
         self.maneuver_acc_noise = float(maneuver_acc_noise)
         self.mahalanobis_thresh = float(mahalanobis_thresh)
-        self.angular_smooth_alpha = float(angular_smooth_alpha)
+        self.rot_meas_noise = float(rot_meas_noise)
+        self.proc_ang_acc_noise = float(proc_ang_acc_noise)
         self.stale_timeout_sec = float(stale_timeout_sec)
         self.static_chi2_thresh = float(static_chi2_thresh)
         self.min_moving_speed = float(min_moving_speed)
@@ -321,7 +335,8 @@ class KalmanObstaclePredictor(BaseObstaclePredictor):
                 proc_acc_noise=self.default_acc_noise,
                 maneuver_acc_noise=self.maneuver_acc_noise,
                 mahalanobis_thresh=self.mahalanobis_thresh,
-                angular_smooth_alpha=self.angular_smooth_alpha,
+                rot_meas_noise=self.rot_meas_noise,
+                proc_ang_acc_noise=self.proc_ang_acc_noise,
                 static_chi2_thresh=self.static_chi2_thresh,
                 min_moving_speed=self.min_moving_speed,
                 min_moving_omega=self.min_moving_omega
@@ -368,7 +383,9 @@ class KalmanObstaclePredictor(BaseObstaclePredictor):
             'acceleration': np.zeros(3, dtype=np.float64),
             'orientation': flt.current_quat.copy(),
             'angular_velocity': flt.effective_omega(),
+            'raw_angular_velocity': flt.current_omega.copy(),
             'is_static': not flt.is_moving(),
+            'is_rotating': flt.is_rotating(),
             'last_timestamp': flt.last_timestamp
         }
 
