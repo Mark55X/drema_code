@@ -39,6 +39,7 @@ from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
 from drema.perception.base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
+from drema.visualization import build_visualization_hub
 
 
 def pointcloud_from_depth_and_camera_params(depth: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
@@ -208,14 +209,6 @@ class DremaDynamicSystem:
         ctrl_cfg = config.get_nested("controller", {})
         self.log_interval_actions = int(ctrl_cfg.get("log_interval_actions", 10))
         self.max_action_age_s = float(ctrl_cfg.get("max_action_age_s", 0.20))
-        self.ctrl_horizon = int(ctrl_cfg.get("horizon", 15))
-        self.ctrl_dt = float(ctrl_cfg.get("dt", 0.05))
-        dump_root = str(ctrl_cfg.get("debug_dump_dir", "") or "")
-        self.debug_dump_interval = max(1, int(ctrl_cfg.get("debug_dump_interval", 1)))
-        self.debug_dump_dir = os.path.join(dump_root, time.strftime("%Y%m%d_%H%M%S")) if dump_root else None
-        if self.debug_dump_dir:
-            os.makedirs(self.debug_dump_dir, exist_ok=True)
-            print(f"[DREMA DYNAMIC SYSTEM] MPC input dump active: '{self.debug_dump_dir}' (every {self.debug_dump_interval} actions)")
         # Serializes MPC solves: gRPC runs RequestAction on a thread pool, and a client
         # timeout does not cancel the server-side handler.
         self._mpc_lock = threading.Lock()
@@ -260,6 +253,13 @@ class DremaDynamicSystem:
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 1 (Perception: VG-Mapping + RecurGS) successfully initialized on {self.device.upper()}.")
         else:
             raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported perception module: '{perc_mod_name}' (expected 'vg_mapping_recurgs')")
+
+        # 4. Visualization / recording hooks (MPC input dump, imagination overlay and recording): no-op unless configured
+        self.visualization = build_visualization_hub(
+            config, self.mpc_controller, self.digital_twin, viser_server=self.viser_server,
+            scene_info=lambda: {'table_z': getattr(self.perception, 'z_table', None),
+                                'table_bounds': getattr(self.perception, 'table_bounds', None)}
+        )
 
         # Frame queue & perception worker thread
         queue_size = int(config.get_nested("perception.queue_max_size", 5))
@@ -763,17 +763,16 @@ class DremaDynamicSystem:
         if robot_state.target_available and len(robot_state.target_pose) >= 3:
             target_goal = np.array(robot_state.target_pose[:3], dtype=np.float32)
 
-        dump = self._snapshot_mpc_inputs(robot_state) if (
-            self.debug_dump_dir and self.total_actions_served % self.debug_dump_interval == 0
-        ) else None
+        if self.visualization.active:
+            self.visualization.before_solve(robot_state)
 
         # 4. Compute control action via MPC Controller (Digital Twin accessed internally)
         action = self.mpc_controller.compute_action(
             robot_state=robot_state,
             target_goal=target_goal
         )
-        if dump is not None:
-            self._write_mpc_dump(dump, action)
+        if self.visualization.active:
+            self.visualization.after_solve(robot_state, action)
 
         if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
             print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
@@ -795,78 +794,6 @@ class DremaDynamicSystem:
                 print(f"  └─ [MPC TIMINGS] Coll: {t_info.get('coll_ms', 0.0):.1f}ms{cdet_str} | Rollouts: {t_info.get('samples_ms', 0.0):.1f}ms | Costs(FK): {t_info.get('cost_ms', 0.0):.1f}ms | IK: {t_info.get('ik_ms', 0.0):.1f}ms | Opt: {t_info.get('opt_ms', 0.0):.1f}ms")
 
         return action
-
-    def _snapshot_mpc_inputs(self, robot_state: drema_comm_pb2.RobotState) -> Dict[str, Any]:
-        """
-        Everything the MPC solve reads besides the static scene: robot state, goal, and per obstacle the
-        measured pose, the twin body pose, the filter state and the forecast over the horizon.
-        """
-        dump: Dict[str, Any] = {
-            'timestep': int(robot_state.timestep),
-            'q': np.asarray(robot_state.joint_positions, dtype=np.float64),
-            'qd': np.asarray(robot_state.joint_velocities, dtype=np.float64),
-            'target_pose': np.asarray(robot_state.target_pose, dtype=np.float64),
-            'approach_funnel': int(robot_state.approach_funnel) if robot_state.HasField('approach_funnel') else -1,
-            'robot_base_pos': np.asarray(robot_state.robot_base_pos, dtype=np.float64),
-        }
-        twin = self.digital_twin
-        with twin.state_lock:
-            predictor = getattr(twin, 'predictor', None)
-            preds = predictor.predict_all(horizon=self.ctrl_horizon, dt=self.ctrl_dt) if predictor is not None else {}
-            obstacle_ids = []
-            for oid, obj in twin.tracked_objects.items():
-                if obj.get('is_target', False):
-                    continue
-                obstacle_ids.append(int(oid))
-                key = f"obs{oid}"
-                dump[f"{key}_measured_pos"] = np.asarray(obj.get('target_pos', (np.nan,) * 3), dtype=np.float64)
-                dump[f"{key}_measured_quat"] = np.asarray(obj.get('target_quat', (np.nan,) * 4), dtype=np.float64)
-                body_pose = twin.get_object_pose(oid)
-                if body_pose is not None:
-                    dump[f"{key}_body_pos"] = np.asarray(body_pose[0], dtype=np.float64)
-                    dump[f"{key}_body_quat"] = np.asarray(body_pose[1], dtype=np.float64)
-                st = predictor.get_estimated_state(oid) if predictor is not None else None
-                if st is not None:
-                    for name, value in st.items():
-                        dump[f"{key}_filter_{name}"] = np.asarray(value, dtype=np.float64)
-                if oid in preds:
-                    dump[f"{key}_pred_positions"] = np.asarray(preds[oid].positions, dtype=np.float64)
-                    dump[f"{key}_pred_orientations"] = np.asarray(preds[oid].orientations, dtype=np.float64)
-                    dump[f"{key}_pred_velocities"] = np.asarray(preds[oid].velocities, dtype=np.float64)
-                dump[f"{key}_mesh_path"] = str(obj.get('mesh_path', obj.get('name', '')))
-            dump['obstacle_ids'] = np.asarray(obstacle_ids, dtype=np.int64)
-            dump['min_obstacle_distance'] = float(twin.get_min_obstacle_distance())
-
-        # The solve also depends on the planner distributions carried over from previous cycles and on the
-        # global sampling RNG: both are needed to replay a cycle exactly.
-        engine = self.mpc_controller.engine
-        for name, dist in engine.planner_distributions.items():
-            dump[f"engine_{name}_mu"] = np.array(dist['mu'], dtype=np.float64)
-            dump[f"engine_{name}_sigma"] = np.array(dist['sigma'], dtype=np.float64)
-        dump['engine_mu_mixed'] = np.array(engine.mu_mixed, dtype=np.float64)
-        dump['engine_sigma_mixed'] = np.array(engine.sigma_mixed, dtype=np.float64)
-        dump['engine_mixing_weights'] = np.array([engine.mixing_weights[n] for n in engine.planner_names], dtype=np.float64)
-        dump['engine_planner_names'] = np.array(engine.planner_names)
-        if engine.last_ik_solution is not None:
-            dump['engine_last_ik_solution'] = np.array(engine.last_ik_solution, dtype=np.float64)
-        rng_name, rng_keys, rng_pos, rng_has_gauss, rng_cached = np.random.get_state()
-        dump['rng_keys'] = rng_keys
-        dump['rng_pos_gauss'] = np.array([rng_pos, rng_has_gauss, rng_cached], dtype=np.float64)
-        return dump
-
-    def _write_mpc_dump(self, dump: Dict[str, Any], action: drema_comm_pb2.ControlAction) -> None:
-        dump['qd_cmd'] = np.asarray(action.joint_velocities, dtype=np.float64)
-        dump['safety_stop'] = bool(action.safety_stop)
-        dump['status_message'] = str(action.status_message)
-        diag = getattr(self.mpc_controller, 'last_diagnostics', {}) or {}
-        for name, value in (diag.get('top_costs', {}) or {}).items():
-            dump[f"top_cost_{name}"] = float(value)
-        dump['top_candidate'] = str(diag.get('top_candidate', ''))
-        try:
-            path = os.path.join(self.debug_dump_dir, f"action_{self.total_actions_served:05d}_t{dump['timestep']:04d}.npz")
-            np.savez_compressed(path, **dump)
-        except Exception as e:
-            print(f"[DREMA DYNAMIC SYSTEM WARNING] MPC dump failed: {e}")
 
     def _try_startup_cache_restore(self) -> bool:
         """
@@ -937,6 +864,8 @@ class DremaDynamicSystem:
         self.server.stop()
         if hasattr(self, 'worker_thread') and self.worker_thread.is_alive():
             self.worker_thread.join(timeout=1.0)
+        if hasattr(self, 'visualization'):
+            self.visualization.close()
         if hasattr(self, 'perception') and self.perception is not None:
             self.perception.shutdown()
         if hasattr(self, 'digital_twin') and self.digital_twin is not None:

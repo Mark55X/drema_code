@@ -23,6 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../RLBench")))
 
 from drema.communication.grpc_client import DremaGrpcClient
+from drema.visualization.sim_recorder import SimVideoRecorder
 
 try:
     from rlbench.environment import Environment
@@ -60,7 +61,11 @@ class CoppeliaSimulationClient:
         force_scan: bool = False,
         cam_resolution: Tuple[int, int] = (256, 256),
         log_interval_actions: int = 10,
-        max_action_age: float = 0.20
+        max_action_age: float = 0.20,
+        record_dir: Optional[str] = None,
+        record_camera: str = "front",
+        record_resolution: Tuple[int, int] = (960, 540),
+        record_every: int = 1
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -112,6 +117,13 @@ class CoppeliaSimulationClient:
 
         # Initialize RLBench Environment
         self._init_rlbench()
+
+        self.video_recorder = None
+        if record_dir:
+            self.video_recorder = SimVideoRecorder(
+                os.path.join(record_dir, time.strftime("%Y%m%d_%H%M%S")), self.cameras[record_camera],
+                resolution=tuple(record_resolution), every_n=record_every
+            )
 
         # Every loop iteration advances CoppeliaSim by exactly one physics step, so the
         # simulated clock (not the wall clock) is the time base for commands and timestamps.
@@ -708,6 +720,8 @@ class CoppeliaSimulationClient:
                 self.task._task.step()  # Moves oscillating tunnel obstacle
                 self.env._pyrep.step()
                 self.sim_steps += 1
+                if self.video_recorder is not None:
+                    self.video_recorder.capture(self.step_counter, self.sim_steps * self.sim_dt, self.task_active)
 
                 # 6. Check Task Success Condition (only when robot is actively executing task)
                 if self.task_active:
@@ -730,6 +744,8 @@ class CoppeliaSimulationClient:
 
     def shutdown(self):
         self.running = False
+        if getattr(self, 'video_recorder', None) is not None:
+            self.video_recorder.close()
         try:
             self.client.close()
         except Exception:
@@ -766,6 +782,13 @@ def parse_args():
                         help="Streaming camera resolution [width, height] (default: 256 256)")
     parser.add_argument("--log_interval_actions", type=int, default=10,
                         help="Print control action telemetry every N steps (default: 10)")
+    parser.add_argument("--record_dir", type=str, default=None,
+                        help="Record simulation video frames (for render_imagination_video.py) into a timestamped subfolder")
+    parser.add_argument("--record_camera", type=str, default="front", choices=["front", "wrist", "overhead"],
+                        help="Camera pose used by the recording sensor (default: front)")
+    parser.add_argument("--record_resolution", type=int, nargs=2, default=[960, 540], metavar=("WIDTH", "HEIGHT"),
+                        help="Recording resolution (default: 960 540)")
+    parser.add_argument("--record_every", type=int, default=1, help="Record every N simulation steps (default: 1)")
     return parser.parse_args()
 
 
@@ -788,6 +811,10 @@ if __name__ == "__main__":
         force_scan=args.force_scan,
         cam_resolution=args.cam_resolution,
         log_interval_actions=args.log_interval_actions,
-        max_action_age=args.max_action_age
+        max_action_age=args.max_action_age,
+        record_dir=args.record_dir,
+        record_camera=args.record_camera,
+        record_resolution=args.record_resolution,
+        record_every=args.record_every
     )
     client.run()

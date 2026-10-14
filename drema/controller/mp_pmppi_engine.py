@@ -25,7 +25,7 @@ Core Algorithm Flow:
 
 import time
 import numpy as np
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Callable, Dict, List, Optional, Tuple, Any
 
 # Top-level physics engine import (PEP 8 compliant, avoided inline imports)
 try:
@@ -236,6 +236,10 @@ class MPPMPPIEngine:
 
         # Cached last IK solution (initialized to None, eliminating redundant boolean flags)
         self.last_ik_solution: Optional[np.ndarray] = None
+
+        # Optional read-only hook (e.g. drema.visualization): called once per solve with references to the
+        # sampled rollouts and their costs. Must not modify the arrays; None disables it at no cost.
+        self.rollout_observer: Optional[Callable[[Dict[str, Any]], None]] = None
 
     def reset(self):
         """Resets the MPC internal policy distributions and cached solutions."""
@@ -592,6 +596,7 @@ class MPPMPPIEngine:
         # Integrated velocity command: qd_{cmd} = qd_{curr} + u_t^* * dt
         qd_optimal = qd_curr + u_optimal_acc * self.dt
         qd_optimal = np.clip(qd_optimal, -self.qd_limit, self.qd_limit)
+        planned_acc = self.mu_mixed.copy() if self.rollout_observer is not None else None
 
         # Shift distributions forward across horizon (Warm Starting)
         self.mu_mixed[:-1] = self.mu_mixed[1:]
@@ -688,6 +693,20 @@ class MPPMPPIEngine:
             'q_des_available': (q_des_t is not None),
             'joint_limit_warnings': joint_limit_warnings
         }
+
+        if self.rollout_observer is not None:
+            try:
+                self.rollout_observer({
+                    'q_current': q_curr, 'qd_current': qd_curr, 'Q': Q, 'samples_per_planner': self.M,
+                    'primitive_names': list(prim_names), 'planner_costs': total_costs, 'judge_costs': judge_costs,
+                    'coll_p_costs': coll_p_costs, 'coll_gvm_costs': coll_gvm_costs, 'funnel_costs': funnel_costs,
+                    'mixing_weights': self.mixing_weights.copy(), 'lambda': self.lambda_param,
+                    'best_index': best_cand_idx, 'planned_acc': planned_acc, 'q_des': q_des_t,
+                    'target_pos': target_pos, 'target_rot': target_rot_mat, 'diagnostics': diagnostics,
+                    'dt': self.dt, 'qd_limit': self.qd_limit, 'max_acc': self.max_acc
+                })
+            except Exception as e:
+                print(f"[MP-PMPPI WARNING] rollout observer failed: {e}")
 
         return qd_optimal, diagnostics
 

@@ -170,3 +170,14 @@ controller:
   evade_retreat_speed: 0.15          # Linear retreat speed for evasive maneuvers [m/s]
   evade_lift_speed: 0.12             # Upward vertical lift component for evade_over [m/s]
 
+# ------------------------------------------------------------------------------
+# 5b. Visualization of the MPC imagination (drema/visualization), off by default
+# ------------------------------------------------------------------------------
+visualization:
+  imagination:
+    live_overlay: false              # Draws rollouts, plan, ghost arms and forecast obstacles in viser (needs system.viser.enabled)
+    live_every_n: 2                  # Redraw the overlay every N served actions
+    record_dir: ""                   # Saves imagination frames for the offline video (render_imagination_video.py); "" disables
+    record_every_n: 1                # Record every N served actions
+    max_rollouts: 40                 # Rollouts kept per frame, spread over greedy / sensitive / mixed / primitives
+    ghost_count: 3                   # Ghost arms drawn along the executed plan
