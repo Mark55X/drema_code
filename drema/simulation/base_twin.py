@@ -104,6 +104,10 @@ class BaseDigitalTwin(ABC):
             np.asarray(joint_angle_offsets, dtype=np.float64).reshape(7)
             if joint_angle_offsets is not None else np.zeros(7, dtype=np.float64)
         )
+        # Diagnostics only (e.g. drema.visualization): when True, compute_trajectory_collision_costs keeps the
+        # robot-side closest points of its last call in last_collision_points.
+        self.record_collision_points = False
+        self.last_collision_points: Optional[Dict[str, np.ndarray]] = None
 
     @abstractmethod
     def load_robot(

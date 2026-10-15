@@ -1,6 +1,6 @@
 """
 Live overlay of the MPC imagination in the existing viser scene: sampled TCP rollouts colored by planner,
-the executed plan with ghost arms, the IK guidance posture, collision markers on the rollouts, the forecast
+the executed plan with ghost arms, the IK guidance posture, the arm points inside the collision margin, the forecast
 obstacle poses along the horizon and the active goal with its approach cone.
 """
 
@@ -139,9 +139,11 @@ class ViserImaginationOverlay(_WorkerSink):
         seg_colors = np.repeat(colors, tcp.shape[1] - 1, axis=0)[:, None, :].repeat(2, axis=1)
         self._lines(f"{ROOT}/rollouts", segments, seg_colors, 1.5)
 
-        hit = np.asarray(frame['rollout_collision'], dtype=np.float64) > 0.0
-        if np.any(hit):
-            pts = tcp[hit].reshape(-1, 3)
+        if 'contact_position' in frame:
+            pts = np.asarray(frame['contact_position'], dtype=np.float64).reshape(-1, 3)
+        else:
+            pts = tcp[np.asarray(frame['rollout_collision'], dtype=np.float64) > 0.0].reshape(-1, 3)
+        if len(pts):
             self._keep(f"{ROOT}/collisions", self.server.scene.add_point_cloud(
                 f"{ROOT}/collisions", pts.astype(np.float32),
                 np.tile([[230, 30, 30]], (len(pts), 1)).astype(np.uint8), point_size=0.008))

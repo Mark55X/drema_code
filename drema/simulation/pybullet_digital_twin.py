@@ -743,6 +743,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         rec_d: List[float] = []
         rec_normal: List[Any] = []
         rec_v_obs: List[Any] = []
+        rec_point: List[Any] = []
+        record_points = self.record_collision_points
         zero_vel = (0.0, 0.0, 0.0)
 
         for e, h in enumerate(eval_steps):
@@ -780,7 +782,19 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         rec_d.append(pt[8])
                         rec_normal.append(pt[7])
                         rec_v_obs.append(obs_vel[slot])
+                        if record_points:
+                            rec_point.append(pt[5])
             t_bullet_total += time.perf_counter() - t_b_start
+
+        if record_points:
+            slot_obj = np.array([body_to_obj_id.get(b, -1) for b in obstacle_body_ids], dtype=np.int64)
+            self.last_collision_points = {
+                'rollout': np.asarray(rec_k, dtype=np.int64),
+                'step': np.asarray(eval_steps, dtype=np.int64)[np.asarray(rec_e, dtype=np.int64)],
+                'position': np.asarray(rec_point, dtype=np.float64).reshape(-1, 3),
+                'distance': np.asarray(rec_d, dtype=np.float64),
+                'obstacle': slot_obj[np.asarray(rec_group, dtype=np.int64) // n_links] if rec_group else np.zeros(0, np.int64),
+            }
 
         t_gvm_start = time.perf_counter()
         coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(

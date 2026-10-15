@@ -1069,6 +1069,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         rec_d: List[float] = []
         rec_normal: List[Any] = []
         rec_v_obs: List[Any] = []
+        rec_point: List[Any] = []
+        rec_obj: List[int] = []
+        record_points = self.record_collision_points
         zero_vel = np.zeros(3, dtype=np.float64)
 
         for e, h in enumerate(eval_steps):
@@ -1123,6 +1126,18 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         rec_d.append(d)
                         rec_normal.append(fromto[0:3] - fromto[3:6])
                         rec_v_obs.append(obs_vel[og])
+                        if record_points:
+                            rec_point.append(fromto[0:3].copy())
+                            rec_obj.append(geom_to_obj_id.get(og, -1))
+
+        if record_points:
+            self.last_collision_points = {
+                'rollout': np.asarray(rec_k, dtype=np.int64),
+                'step': np.asarray(eval_steps, dtype=np.int64)[np.asarray(rec_e, dtype=np.int64)],
+                'position': np.asarray(rec_point, dtype=np.float64).reshape(-1, 3),
+                'distance': np.asarray(rec_d, dtype=np.float64),
+                'obstacle': np.asarray(rec_obj, dtype=np.int64),
+            }
 
         t_gvm_s = time.perf_counter()
         coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(

@@ -2,11 +2,12 @@
 Offline video of the MPC imagination, composed from the server recording (visualization.imagination.record_dir)
 and, optionally, the client simulation frames (run_coppelia_client.py --record_dir):
 
+    title       : DREMA Dynamic System, time, chosen candidate, Judge weights
     left top    : simulated scene (client camera)
     right       : 3D imagination - current arm, sampled TCP rollouts colored by planner and weighted by the
                   softmax, executed plan with ghost arms, IK guidance posture, collision hits, current and
                   forecast obstacle, goal and approach cone
-    left bottom : telemetry up to the current time (distances, cost terms, Judge weights, obstacle speed)
+    left bottom : telemetry up to the current time (distances, cost terms, Judge weights, closest-obstacle speed)
 
 Usage:
     python -m drema.visualization.render_imagination_video --frames <record_dir/run> [--sim <sim_dir/run>]
@@ -24,6 +25,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 from matplotlib.gridspec import GridSpec, GridSpecFromSubplotSpec  # noqa: E402
+from matplotlib.patches import Patch  # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
@@ -112,8 +114,24 @@ class ImaginationRenderer:
         self.center, self.half = self._scene_limits(zoom)
         self.lo, self.hi = self.center - self.half, self.center + self.half
 
+    def _closest_obstacle(self, fr) -> Tuple[Optional[int], float]:
+        """Obstacle nearest to the arm (mesh vertices vs link origins) and its forecast speed."""
+        best, best_d = None, np.inf
+        for oid in fr.get('obstacle_ids', np.zeros(0, dtype=int)):
+            if f"obs{oid}_pos" not in fr:
+                continue
+            verts = self.scene.get(f"obs{oid}_vertices")
+            pts = (_pose(verts, fr[f"obs{oid}_pos"], fr[f"obs{oid}_quat"]) if verts is not None
+                   else np.asarray(fr[f"obs{oid}_pos"])[None])
+            d = float(np.min(np.linalg.norm(pts[:, None, :] - fr['skeleton'][None, :, :], axis=-1)))
+            if d < best_d:
+                best, best_d = int(oid), d
+        if best is None or f"obs{best}_pred_vel" not in fr:
+            return best, 0.0
+        return best, float(np.linalg.norm(fr[f"obs{best}_pred_vel"][0]))
+
     def _collect_telemetry(self) -> Dict[str, np.ndarray]:
-        t, d_goal, min_d, goal, coll, funnel, w_grd, w_sns, v_obs = ([] for _ in range(9))
+        t, d_goal, min_d, goal, coll, funnel, w_grd, w_sns, v_obs, obs_id = ([] for _ in range(10))
         for fr in self.frames:
             t.append(float(fr['timestep']) * self.dt)
             tcp = fr['skeleton'][-1]
@@ -124,11 +142,15 @@ class ImaginationRenderer:
             funnel.append(float(fr.get('top_cost_funnel', np.nan)))
             w_grd.append(float(fr['mixing_weights'][0]))
             w_sns.append(float(fr['mixing_weights'][1]))
-            ids = fr.get('obstacle_ids', np.zeros(0, dtype=int))
-            v_obs.append(max((float(np.linalg.norm(fr[f"obs{o}_pred_vel"][0])) for o in ids if f"obs{o}_pred_vel" in fr),
-                             default=0.0))
+            oid, speed = self._closest_obstacle(fr)
+            v_obs.append(speed)
+            obs_id.append(-1 if oid is None else oid)
         return {k: np.asarray(v) for k, v in dict(t=t, d_goal=d_goal, min_d=min_d, goal=goal, coll=coll, funnel=funnel,
-                                                   w_grd=w_grd, w_sns=w_sns, v_obs=v_obs).items()}
+                                                   w_grd=w_grd, w_sns=w_sns, v_obs=v_obs, obs_id=obs_id).items()}
+
+    def _obstacle_name(self, oid: int) -> str:
+        name = self.scene.get(f"obs{oid}_name")
+        return str(name) if name is not None else f"obstacle {oid}"
 
     def _scene_limits(self, zoom: Optional[float]) -> Tuple[np.ndarray, float]:
         """Close-up cube around the lowest goal (the grasp) or, without zoom, a cube enclosing the whole arm."""
@@ -220,12 +242,21 @@ class ImaginationRenderer:
         alpha = 0.15 + 0.8 * np.clip(w / max(w.max(), 1e-12), 0.0, 1.0) ** 0.5
         order = np.argsort(alpha)
         self._polylines(ax, tcp[order], [(*GROUP_COLORS[int(groups[i])], float(alpha[i])) for i in order], lw=1.3)
-        hit = fr['rollout_collision'] > 0.0
-        if np.any(hit):
-            pts = tcp[hit].reshape(-1, 3)
-            pts = pts[self._inside(pts)]
-            if len(pts):
-                ax.scatter(*pts.T, color=(0.9, 0.1, 0.1), s=4, alpha=0.5, depthshade=False)
+        if 'contact_position' in fr:
+            pts, dist = fr['contact_position'].astype(np.float64), fr['contact_distance'].astype(np.float64)
+            inside = self._inside(pts)
+            if np.any(inside):
+                # darker and larger the deeper the point is in the collision margin
+                closeness = np.clip(1.0 - dist[inside] / max(float(dist.max()), 1e-6), 0.0, 1.0)
+                ax.scatter(*pts[inside].T, c=[(0.85, 0.05, 0.05, 0.25 + 0.7 * c) for c in closeness],
+                           s=4 + 14 * closeness, depthshade=False)
+        else:
+            hit = fr['rollout_collision'] > 0.0
+            if np.any(hit):
+                pts = tcp[hit].reshape(-1, 3)
+                pts = pts[self._inside(pts)]
+                if len(pts):
+                    ax.scatter(*pts.T, color=(0.9, 0.1, 0.1), s=4, alpha=0.5, depthshade=False)
         if 'plan_tcp' in fr:
             self._polylines(ax, [fr['plan_tcp']], [(0.0, 0.0, 0.0, 1.0)], lw=3.2, zorder=6)
 
@@ -242,14 +273,20 @@ class ImaginationRenderer:
         self._draw_goal(ax, fr)
         self._draw_rollouts(ax, fr)
         self._draw_robot(ax, fr)
-        handles = [plt.Line2D([], [], color=c, lw=2) for c in GROUP_COLORS]
+        handles = [plt.Line2D([], [], color=(0.12, 0.12, 0.12), lw=5, marker='o', markersize=4),
+                   Patch(facecolor=(0.25, 0.45, 0.85, 0.35), edgecolor=(0.2, 0.35, 0.7)),
+                   plt.Line2D([], [], color=(0.9, 0.1, 0.1), marker='*', ls='', markersize=12, markeredgecolor='k'),
+                   plt.Line2D([], [], color=(0.9, 0.3, 0.3), lw=1)]
+        handles += [plt.Line2D([], [], color=c, lw=2) for c in GROUP_COLORS]
         handles += [plt.Line2D([], [], color='k', lw=3), plt.Line2D([], [], color=(0.4, 0.4, 0.4), lw=5, alpha=0.4),
                     plt.Line2D([], [], color=(0.15, 0.7, 0.3), lw=2, ls='--'),
                     plt.Line2D([], [], color=(0.85, 0.2, 0.2), lw=1, ls='--'),
-                    plt.Line2D([], [], color=(0.9, 0.1, 0.1), marker='o', ls='', markersize=3)]
-        ax.legend(handles, [f"rollouts: {g}" for g in GROUP_LABELS] +
-                  ['executed plan (TCP)', 'imagined arm along the plan', 'IK guidance q_des', 'forecast obstacle',
-                   'rollout steps in collision margin'], loc='upper left', fontsize=9, framealpha=0.85)
+                    plt.Line2D([], [], color=(0.85, 0.05, 0.05), marker='o', ls='', markersize=4)]
+        labels = ['arm (current configuration)', 'obstacle (perceived pose)', 'active goal', 'approach cone']
+        labels += [f"rollouts: {g}" for g in GROUP_LABELS]
+        labels += ['executed plan (TCP path)', 'imagined arm along the plan', 'IK guidance posture q_des',
+                   'forecast obstacle (+0.25 / 0.5 / 0.7 s)', 'arm points inside the collision margin']
+        ax.legend(handles, labels, loc='upper left', fontsize=8.5, framealpha=0.85)
 
     def _draw_sim(self, ax, fr) -> None:
         ax.axis('off')
@@ -273,16 +310,23 @@ class ImaginationRenderer:
         a2.plot(t, T['w_grd'][:k + 1], color=GROUP_COLORS[0], label='w greedy')
         a2.plot(t, T['w_sns'][:k + 1], color=GROUP_COLORS[1], label='w sensitive')
         a2b = a2.twinx()
-        a2b.plot(t, T['v_obs'][:k + 1], color=(0.4, 0.4, 0.4), lw=1, ls=':', label='|v| obstacle (forecast)')
+        current = int(T['obs_id'][k])
+        label = f"|v| closest obstacle ({self._obstacle_name(current)})" if current >= 0 else '|v| closest obstacle'
+        a2b.plot(t, T['v_obs'][:k + 1], color=(0.4, 0.4, 0.4), lw=1, ls=':', label=label)
         a2b.set_ylim(0, max(0.05, float(np.nanmax(T['v_obs'])) * 1.2))
         a2b.set_ylabel('m/s', fontsize=8)
         a2b.tick_params(labelsize=7)
         a2b.legend(fontsize=7, loc='lower right')
         dist = np.r_[T['d_goal'], T['min_d']]
         a0.set_ylim(0, max(10.0, float(np.nanmax(dist[np.isfinite(dist)])) * 100 * 1.05))
-        a1.set_ylim(0, max(1.0, float(np.nanpercentile(np.r_[T['goal'], T['coll'], T['funnel']], 98)) * 1.1))
+        # Cost terms span 0 to several thousands: symlog keeps the small terms readable and every peak in range.
+        costs = np.r_[T['goal'], T['coll'], T['funnel']]
+        costs = costs[np.isfinite(costs)]
+        a1.set_yscale('symlog', linthresh=10.0)
+        a1.set_ylim(0, max(10.0, float(costs.max()) * 1.5) if costs.size else 10.0)
         a2.set_ylim(-0.05, 1.05)
-        for a, title in zip(axes, ('distances', 'cost terms of the chosen candidate', 'Judge weights and obstacle speed')):
+        for a, title in zip(axes, ('distances', 'cost terms of the chosen candidate (symlog)',
+                                   'Judge weights and closest-obstacle speed')):
             a.set_xlim(*span)
             a.axvline(now, color=(0.5, 0.5, 0.5), lw=0.8)
             a.set_title(title, fontsize=9, loc='left')
@@ -298,10 +342,14 @@ class ImaginationRenderer:
         fr = self.frames[k]
         self._draw_sim(fig.add_subplot(gs[0, 0]), fr)
         self._draw_3d(fig.add_subplot(gs[:, 1:], projection='3d'), fr)
+        fig.text(0.665, 0.012,
+                 "Rollouts: TCP paths (gripper centre point) sampled by the MPC over the next 0.75 s; opacity = softmax "
+                 "weight. Each cycle only the first step of the executed plan is applied, then the MPC replans.",
+                 ha='center', va='bottom', fontsize=9, color=(0.3, 0.3, 0.3))
         sub = GridSpecFromSubplotSpec(3, 1, subplot_spec=gs[1, 0], hspace=0.55)
         self._draw_telemetry([fig.add_subplot(sub[i]) for i in range(3)], k)
         funnel = {1: 'on', 0: 'off'}.get(int(fr.get('approach_funnel', -1)), 'default')
-        fig.suptitle(f"MP-PMPPI imagination  |  t = {float(fr['timestep']) * self.dt:5.2f} s (step {int(fr['timestep'])})"
+        fig.suptitle(f"DREMA Dynamic System  |  t = {float(fr['timestep']) * self.dt:5.2f} s (step {int(fr['timestep'])})"
                      f"  |  chosen: {fr.get('best_label', '')}  |  w_greedy {fr['mixing_weights'][0]:.2f}"
                      f" / w_sensitive {fr['mixing_weights'][1]:.2f}  |  approach cone {funnel}", fontsize=13)
         fig.canvas.draw()

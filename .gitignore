@@ -175,3 +175,5 @@ assets/scanned_meshes/
 cache/
 scratch/test_cache/
 scratch/*_cache/
+
+logs/

@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../RLBench")))
 
 from drema.communication.grpc_client import DremaGrpcClient
-from drema.visualization.sim_recorder import SimVideoRecorder
+from drema.visualization.sim_recorder import SimVideoRecorder, showcase_view
 
 try:
     from rlbench.environment import Environment
@@ -63,9 +63,12 @@ class CoppeliaSimulationClient:
         log_interval_actions: int = 10,
         max_action_age: float = 0.20,
         record_dir: Optional[str] = None,
-        record_camera: str = "front",
+        record_camera: str = "showcase",
         record_resolution: Tuple[int, int] = (960, 540),
-        record_every: int = 1
+        record_every: int = 1,
+        record_fov: Optional[float] = None,
+        record_eye: Optional[List[float]] = None,
+        record_look_at: Optional[List[float]] = None
     ):
         self.server_address = server_address
         self.task_name = task_name
@@ -120,9 +123,18 @@ class CoppeliaSimulationClient:
 
         self.video_recorder = None
         if record_dir:
+            eye, look_at, reference = record_eye, record_look_at, self.cameras.get(record_camera)
+            if record_camera == "showcase" and (eye is None or look_at is None):
+                task_inst = getattr(self.task, '_task', self.task)
+                target = task_inst.target.get_position() if hasattr(task_inst, 'target') else [0.4, 0.0, 0.8]
+                default_eye, default_look = showcase_view(self.task._robot.arm.joints[0].get_position(), target)
+                eye = default_eye if eye is None else eye
+                look_at = default_look if look_at is None else look_at
             self.video_recorder = SimVideoRecorder(
-                os.path.join(record_dir, time.strftime("%Y%m%d_%H%M%S")), self.cameras[record_camera],
-                resolution=tuple(record_resolution), every_n=record_every
+                os.path.join(record_dir, time.strftime("%Y%m%d_%H%M%S")), reference,
+                resolution=tuple(record_resolution), every_n=record_every,
+                view_angle_deg=record_fov if record_fov is not None else (60.0 if eye is not None else None),
+                eye=eye, look_at=look_at
             )
 
         # Every loop iteration advances CoppeliaSim by exactly one physics step, so the
@@ -784,8 +796,14 @@ def parse_args():
                         help="Print control action telemetry every N steps (default: 10)")
     parser.add_argument("--record_dir", type=str, default=None,
                         help="Record simulation video frames (for render_imagination_video.py) into a timestamped subfolder")
-    parser.add_argument("--record_camera", type=str, default="front", choices=["front", "wrist", "overhead"],
-                        help="Camera pose used by the recording sensor (default: front)")
+    parser.add_argument("--record_camera", type=str, default="showcase", choices=["showcase", "front", "wrist", "overhead"],
+                        help="Recording viewpoint: 'showcase' (three-quarter view of arm, table and target) or the pose "
+                             "of a streaming camera (default: showcase)")
+    parser.add_argument("--record_fov", type=float, default=None, help="Recording field of view [deg] (default: 60)")
+    parser.add_argument("--record_eye", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                        help="Recording camera position in world frame (overrides the viewpoint)")
+    parser.add_argument("--record_look_at", type=float, nargs=3, default=None, metavar=("X", "Y", "Z"),
+                        help="Point the recording camera looks at (with --record_eye)")
     parser.add_argument("--record_resolution", type=int, nargs=2, default=[960, 540], metavar=("WIDTH", "HEIGHT"),
                         help="Recording resolution (default: 960 540)")
     parser.add_argument("--record_every", type=int, default=1, help="Record every N simulation steps (default: 1)")
@@ -815,6 +833,9 @@ if __name__ == "__main__":
         record_dir=args.record_dir,
         record_camera=args.record_camera,
         record_resolution=args.record_resolution,
-        record_every=args.record_every
+        record_every=args.record_every,
+        record_fov=args.record_fov,
+        record_eye=args.record_eye,
+        record_look_at=args.record_look_at
     )
     client.run()

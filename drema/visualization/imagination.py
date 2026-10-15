@@ -70,13 +70,19 @@ class ImaginationRecorder:
 
     def attach(self) -> None:
         self.engine.rollout_observer = self._on_rollouts
+        if self.twin is not None:
+            self.twin.record_collision_points = True
 
     def detach(self) -> None:
         if self.engine.rollout_observer == self._on_rollouts:
             self.engine.rollout_observer = None
+        if self.twin is not None:
+            self.twin.record_collision_points = False
 
     def begin_action(self, robot_state: Any) -> None:
         """Context of the next solve that the engine does not know (timestep, keyframe flag)."""
+        if self.twin is not None:
+            self.twin.last_collision_points = None  # a solve that skips the collision query must not show stale points
         self._context = {
             'timestep': int(robot_state.timestep),
             'target_pose': np.asarray(robot_state.target_pose, dtype=np.float64),
@@ -98,6 +104,8 @@ class ImaginationRecorder:
         copied['diagnostics'] = {'top_costs': dict(snap['diagnostics'].get('top_costs', {}) or {}),
                                  'calc_time_ms': snap['diagnostics'].get('calc_time_ms', 0.0)}
         obstacles = self._obstacles(snap['Q'].shape[1], float(snap['dt']))
+        points = getattr(self.twin, 'last_collision_points', None) if self.twin is not None else None
+        copied['collision_points'] = {k: v.copy() for k, v in points.items()} if points else None
         try:
             self._queue.put_nowait((copied, dict(self._context), obstacles))
         except queue.Full:
@@ -220,6 +228,15 @@ class ImaginationRecorder:
             frame[f"top_cost_{name}"] = np.float64(value)
         frame['calc_time_ms'] = np.float64(diag.get('calc_time_ms', 0.0))
         frame.update(obstacles)
+        points = snap.get('collision_points')
+        if points is not None and len(points['rollout']):
+            index_in_sel = {int(r): i for i, r in enumerate(sel)}
+            keep = np.array([int(r) in index_in_sel for r in points['rollout']], dtype=bool)
+            frame['contact_rollout'] = np.array([index_in_sel[int(r)] for r in points['rollout'][keep]], dtype=np.int64)
+            frame['contact_step'] = points['step'][keep]
+            frame['contact_position'] = points['position'][keep].astype(np.float32)
+            frame['contact_distance'] = points['distance'][keep].astype(np.float32)
+            frame['contact_obstacle'] = points['obstacle'][keep]
 
         # The scene is (re)sent whenever a new obstacle appears, e.g. objects spawned after the first solve.
         ids = set(int(i) for i in np.asarray(obstacles.get('obstacle_ids', []), dtype=np.int64))
