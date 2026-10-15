@@ -177,3 +177,5 @@ scratch/test_cache/
 scratch/*_cache/
 
 logs/
+.mp4
+assets/

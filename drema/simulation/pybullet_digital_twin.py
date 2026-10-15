@@ -18,6 +18,7 @@ from typing import Optional, Tuple, List, Dict, Union, Any
 import pybullet as p
 import pybullet_data
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized, aggregate_gvm_costs
+from .mesh_decomposition import convex_decomposition
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 from drema.controller.franka_kinematics import FrankaKinematics
 from scipy.spatial.transform import Rotation
@@ -42,10 +43,23 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         sim_substeps: int = 1,
         predictor: Optional[BaseObstaclePredictor] = None,
         joint_angle_offsets: Optional[List[float]] = None,
-        table_in_collision_costs: bool = True
+        table_in_collision_costs: bool = True,
+        obstacle_convex_decomposition: bool = True,
+        vhacd_resolution: int = 100000,
+        vhacd_concavity: float = 0.05
     ):
+        """
+        :param obstacle_convex_decomposition: Dynamic PyBullet bodies collide through the convex hull of their mesh,
+            which fills concave shapes (e.g. the free space under an arch). When True, obstacle meshes are split into
+            convex parts with V-HACD (cached next to the mesh) and the compound is used for collision queries.
+        :param vhacd_resolution: V-HACD voxel resolution.
+        :param vhacd_concavity: V-HACD maximum concavity per part: higher values give fewer, coarser parts.
+        """
         super().__init__(joint_angle_offsets)
         self.table_in_collision_costs = bool(table_in_collision_costs)
+        self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
+        self.vhacd_resolution = int(vhacd_resolution)
+        self.vhacd_concavity = float(vhacd_concavity)
         self.visualize = visualize
         self.table_z = table_z
         self.tracking_mode = tracking_mode.lower()
@@ -123,6 +137,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         try:
             self.robot_id = p.loadURDF(self.robot_urdf_path, list(base_position), list(base_orientation), useFixedBase=True)
             self.robot_loaded = True
+            self._open_fingers()
             print(f"[PYBULLET DIGITAL TWIN] Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
         except Exception as e:
             print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to load Franka Panda URDF: {e}")
@@ -134,6 +149,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             self.sync_robot_state(joint_positions)
 
         return True
+
+    def _open_fingers(self, opening: float = 0.04) -> None:
+        """The URDF loads with the fingers closed; the twin keeps the gripper open like the controlled robot."""
+        for j in range(p.getNumJoints(self.robot_id)):
+            if b"finger_joint" in p.getJointInfo(self.robot_id, j)[1]:
+                p.resetJointState(self.robot_id, j, opening)
+                p.setJointMotorControl2(self.robot_id, j, p.POSITION_CONTROL, targetPosition=opening)
 
     def _reset_robot_base(self, base_position, base_orientation) -> None:
         """
@@ -230,6 +252,16 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     # Generic Dynamic Object Spawning (Called by Perception pipeline)
     # -------------------------------------------------------------------------
 
+    def _collision_mesh_path(self, mesh_path: str) -> str:
+        """Mesh used for collision queries: the cached V-HACD convex decomposition, or the mesh itself."""
+        if not self.obstacle_convex_decomposition:
+            return mesh_path
+        try:
+            return convex_decomposition(mesh_path, self.vhacd_resolution, self.vhacd_concavity)
+        except Exception as e:
+            print(f"[PYBULLET DIGITAL TWIN WARNING] Convex decomposition failed ({e}): using the convex hull of '{mesh_path}'")
+            return mesh_path
+
     @synchronized
     def spawn_scanned_mesh_obstacle(
         self,
@@ -260,7 +292,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             if mass <= 0.0 and self.tracking_mode == "constraint":
                 print(f"[PYBULLET DIGITAL TWIN ERROR] Obstacle '{name}' (ID: {target_obj_id}) spawned with mass={mass} <= 0! In PyBullet, static bodies cannot be moved by constraints.")
 
-            col_id = p.createCollisionShape(p.GEOM_MESH, fileName=mesh_path)
+            col_id = p.createCollisionShape(p.GEOM_MESH, fileName=self._collision_mesh_path(mesh_path))
             vis_id = p.createVisualShape(p.GEOM_MESH, fileName=mesh_path, rgbaColor=list(col))
             body_id = p.createMultiBody(
                 baseMass=mass,

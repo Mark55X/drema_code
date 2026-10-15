@@ -180,11 +180,15 @@ class DremaDynamicSystem:
                 kp_rot=kp_rot,
                 kd_rot=kd_rot,
                 sim_substeps=sim_substeps,
-                joint_angle_offsets=self.joint_angle_offsets
+                joint_angle_offsets=self.joint_angle_offsets,
+                obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
+                vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
+                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05))
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
         elif twin_engine in ["mujoco", "mjx"]:
-            mujoco_model_path = config.get_nested("digital_twin.mujoco_model_path", "assets/franka_panda/panda.xml")
+            mujoco_model_path = config.get_nested("digital_twin.mujoco_model_path",
+                                                  "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml")
             enable_mjx = bool(config.get_nested("digital_twin.enable_mjx", False)) or (twin_engine == "mjx")
             self.digital_twin: BaseDigitalTwin = MuJoCoDigitalTwin(
                 visualize=twin_gui,
@@ -198,7 +202,10 @@ class DremaDynamicSystem:
                 kd_rot=kd_rot,
                 sim_substeps=sim_substeps,
                 enable_mjx=enable_mjx,
-                joint_angle_offsets=self.joint_angle_offsets
+                joint_angle_offsets=self.joint_angle_offsets,
+                obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
+                vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
+                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05))
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
 
@@ -214,36 +221,7 @@ class DremaDynamicSystem:
         self._mpc_lock = threading.Lock()
         self._last_action: Optional[drema_comm_pb2.ControlAction] = None
         self._last_action_time = 0.0
-        self.mpc_controller = MPCController(
-            digital_twin=self.digital_twin,
-            num_joints=7,
-            max_joint_velocity=float(ctrl_cfg.get("max_joint_velocity", 1.0)),
-            horizon=int(ctrl_cfg.get("horizon", 15)),
-            dt=float(ctrl_cfg.get("dt", 0.05)),
-            num_samples_per_planner=int(ctrl_cfg.get("num_samples_per_planner", 24)),
-            top_k=int(ctrl_cfg.get("top_k", 12)),
-            max_joint_acc=float(ctrl_cfg.get("max_joint_acc", 2.0)),
-            alpha_pos=float(ctrl_cfg.get("alpha_pos", 1.0)),
-            alpha_rot=float(ctrl_cfg.get("alpha_rot", 0.25)),
-            convergence_radius_xi=float(ctrl_cfg.get("convergence_radius_xi", 0.15)),
-            convergence_radius_xi_cart=float(ctrl_cfg.get("convergence_radius_xi_cart", 0.03)),
-            approach_funnel_weight=float(ctrl_cfg.get("approach_funnel_weight", 300.0)),
-            approach_funnel_activation_radius=float(ctrl_cfg.get("approach_funnel_activation_radius", 0.15)),
-            approach_cone_half_angle_deg=float(ctrl_cfg.get("approach_cone_half_angle_deg", 30.0)),
-            approach_cone_base_radius=float(ctrl_cfg.get("approach_cone_base_radius", 0.01)),
-            sigma_1=float(ctrl_cfg.get("sigma_1", 0.02)),
-            sigma_2=float(ctrl_cfg.get("sigma_2", 0.05)),
-            kappa=float(ctrl_cfg.get("kappa", 15.0)),
-            adaptive_goal_margin=bool(ctrl_cfg.get("adaptive_goal_margin", False)),
-            evade_min_distance=float(ctrl_cfg.get("evade_min_distance", 0.01)),
-            evade_max_distance=float(ctrl_cfg.get("evade_max_distance", 0.35)),
-            evade_ttc_threshold=float(ctrl_cfg.get("evade_ttc_threshold", 2.0)),
-            evade_min_speed=float(ctrl_cfg.get("evade_min_speed", 0.03)),
-            evade_imminent_distance=float(ctrl_cfg.get("evade_imminent_distance", 0.06)),
-            evade_retreat_speed=float(ctrl_cfg.get("evade_retreat_speed", 0.15)),
-            evade_lift_speed=float(ctrl_cfg.get("evade_lift_speed", 0.12)),
-            joint_angle_offsets=self.joint_angle_offsets
-        )
+        self.mpc_controller = MPCController.from_config(ctrl_cfg, self.digital_twin, self.joint_angle_offsets)
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 
         # 3. Initialize Modular Perception Backend

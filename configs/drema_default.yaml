@@ -124,7 +124,7 @@ digital_twin:
 
   time_step: 0.002                   # Physics simulation time step in seconds
   urdf_path: "franka_panda/panda.urdf"                      # Calibrated URDF for PyBullet backend (neutral 0,0,0 base)
-  mujoco_model_path: "assets/franka_panda/panda.xml"        # MJCF XML for MuJoCo backend
+  mujoco_model_path: "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml"  # MuJoCo Menagerie Panda (collision geometry only is used)
   tracking_mode: "constraint"        # "constraint" (6-DoF constraint / MuJoCo mocap-weld), "pd_force", or "teleport"
   constraint_max_force: 300.0        # Maximum force for 6-DoF constraint (N)
   kp_pos: 250.0                      # Proportional gain for PD position tracking (N/m)
@@ -132,6 +132,9 @@ digital_twin:
   kp_rot: 15.0                       # Proportional gain for PD orientation tracking (N*m/rad)
   kd_rot: 1.5                        # Derivative gain for PD angular velocity damping (N*m*s/rad)
   sim_substeps: 2                    # Micro-steps per simulation step for high contact stability
+  obstacle_convex_decomposition: true  # Split obstacle meshes into convex parts (V-HACD) in both twins, otherwise concave shapes collide as their convex hull
+  vhacd_resolution: 100000           # V-HACD voxel resolution
+  vhacd_concavity: 0.05              # V-HACD max concavity per part (higher = fewer, coarser parts; 0.05 -> ~11 parts, ~5 mm error on the tunnel)
 
 # ------------------------------------------------------------------------------
 # 5. Controller (MP-PMPPI / Future GPU MuJoCo Rollouts)

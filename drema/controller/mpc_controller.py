@@ -102,6 +102,42 @@ class MPCController:
             evade_lift_speed=evade_lift_speed
         )
 
+    @classmethod
+    def from_config(cls, ctrl_cfg: Dict[str, Any], digital_twin: Optional[Any] = None,
+                    joint_angle_offsets: Optional[List[float]] = None) -> "MPCController":
+        """Controller built from the 'controller' section of the DREMA config (shared by the server and the benchmarks)."""
+        c = ctrl_cfg or {}
+        return cls(
+            digital_twin=digital_twin,
+            num_joints=7,
+            max_joint_velocity=float(c.get("max_joint_velocity", 1.0)),
+            horizon=int(c.get("horizon", 15)),
+            dt=float(c.get("dt", 0.05)),
+            num_samples_per_planner=int(c.get("num_samples_per_planner", 24)),
+            top_k=int(c.get("top_k", 12)),
+            max_joint_acc=float(c.get("max_joint_acc", 2.0)),
+            alpha_pos=float(c.get("alpha_pos", 1.0)),
+            alpha_rot=float(c.get("alpha_rot", 0.25)),
+            convergence_radius_xi=float(c.get("convergence_radius_xi", 0.15)),
+            convergence_radius_xi_cart=float(c.get("convergence_radius_xi_cart", 0.03)),
+            approach_funnel_weight=float(c.get("approach_funnel_weight", 300.0)),
+            approach_funnel_activation_radius=float(c.get("approach_funnel_activation_radius", 0.15)),
+            approach_cone_half_angle_deg=float(c.get("approach_cone_half_angle_deg", 30.0)),
+            approach_cone_base_radius=float(c.get("approach_cone_base_radius", 0.01)),
+            sigma_1=float(c.get("sigma_1", 0.02)),
+            sigma_2=float(c.get("sigma_2", 0.05)),
+            kappa=float(c.get("kappa", 15.0)),
+            adaptive_goal_margin=bool(c.get("adaptive_goal_margin", False)),
+            evade_min_distance=float(c.get("evade_min_distance", 0.01)),
+            evade_max_distance=float(c.get("evade_max_distance", 0.35)),
+            evade_ttc_threshold=float(c.get("evade_ttc_threshold", 2.0)),
+            evade_min_speed=float(c.get("evade_min_speed", 0.03)),
+            evade_imminent_distance=float(c.get("evade_imminent_distance", 0.06)),
+            evade_retreat_speed=float(c.get("evade_retreat_speed", 0.15)),
+            evade_lift_speed=float(c.get("evade_lift_speed", 0.12)),
+            joint_angle_offsets=joint_angle_offsets
+        )
+
     def set_digital_twin(self, digital_twin: Any) -> None:
         """Sets or updates the Digital Twin reference."""
         self.digital_twin = digital_twin

@@ -448,6 +448,58 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             depth_masked[0, dilated] = 0.0
         return depth_masked, mask_t
 
+    def _upload_camera_view(self, c_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Uploads one camera's depth, intrinsics, pose and robot-masked depth to the device once per frame."""
+        depth_t = torch.from_numpy(c_data['depth'].copy()).unsqueeze(0).to(self.device)
+        intrinsics_t = torch.from_numpy(c_data['intrinsics'].copy()).to(self.device)
+        pose_t = torch.from_numpy(c_data['extrinsics'].copy()).to(self.device)
+        depth_masked, mask_t = self._apply_semantic_robot_mask(depth_t=depth_t, mask_np=c_data.get('mask'))
+        return {'depth': depth_t, 'intrinsics': intrinsics_t, 'pose': pose_t,
+                'depth_masked': depth_masked, 'mask': mask_t}
+
+    def _prepare_tracking_views(
+        self,
+        camera_views: Dict[str, Dict[str, Any]],
+        cam_tensors: Dict[str, Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """
+        Per-camera device tensors for object back-projection, shared by all tracked objects.
+        Uses the raw (not robot-dilated) mask and depth, reusing tensors already uploaded this frame.
+        """
+        views = []
+        for c_name, c_data in camera_views.items():
+            if c_data.get('mask') is None or c_data.get('depth') is None:
+                continue
+            cached = cam_tensors.get(c_name, {})
+            mask_t = cached.get('mask')
+            if mask_t is None:
+                mask_t = torch.as_tensor(to_numpy(c_data['mask']), device=self.device)
+            depth_t = cached.get('depth')
+            if depth_t is None:
+                depth_t = torch.as_tensor(to_numpy(c_data['depth']), device=self.device)
+            while mask_t.dim() > 2:
+                mask_t = mask_t.squeeze(0)
+            while depth_t.dim() > 2:
+                depth_t = depth_t.squeeze(0)
+
+            rgb_t, scale_255 = None, False
+            if c_data.get('rgb') is not None:
+                rgb_t = cached.get('rgb_raw')
+                if rgb_t is None:
+                    rgb_t = torch.as_tensor(to_numpy(c_data['rgb']), device=self.device)
+                if rgb_t.dim() == 3 and rgb_t.shape[0] == 3:
+                    rgb_t = rgb_t.permute(1, 2, 0)
+                scale_255 = bool(rgb_t.max() > 1.0)
+
+            K = to_numpy(c_data['intrinsics'])
+            c2w = torch.as_tensor(to_numpy(c_data['extrinsics']), device=self.device).double()
+            views.append({
+                'mask': mask_t, 'depth': depth_t, 'rgb': rgb_t, 'rgb_scale_255': scale_255,
+                'fx': float(K[0, 0]), 'fy': float(K[1, 1]), 'cx': float(K[0, 2]), 'cy': float(K[1, 2]),
+                'R_c2w': c2w[:3, :3], 't_c2w': c2w[:3, 3]
+            })
+        return views
+
     def get_all_active_gaussians(self) -> Dict[str, torch.Tensor]:
         """
         Assembles all active Gaussians (static background + all tracked dynamic objects)
@@ -1532,6 +1584,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         tracked_poses = {}
         tracked_deltas = {}
         all_active_surface_mortons = None
+        log_this_frame = self.enable_timing_breakdown and (timestep % self.log_interval_frames == 0 or timestep <= 2)
+        sync_cuda = torch.cuda.is_available() and str(self.device).startswith('cuda')
+        cam_tensors: Dict[str, Dict[str, Any]] = {}
 
         if self.vg_pipeline is not None and len(camera_views) > 0:
             workspace_bounds_t = self.workspace_bounds_t
@@ -1542,10 +1597,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             active_surface_morton_list = []
             for c_name, c_data in camera_views.items():
                 try:
-                    c_d = torch.from_numpy(c_data['depth'].copy()).unsqueeze(0).to(self.device)
-                    c_k = torch.from_numpy(c_data['intrinsics'].copy()).to(self.device)
-                    c_p = torch.from_numpy(c_data['extrinsics'].copy()).to(self.device)
-                    c_d_masked, _ = self._apply_semantic_robot_mask(depth_t=c_d, mask_np=c_data.get('mask'))
+                    cam_tensors[c_name] = self._upload_camera_view(c_data)
+                    c_k = cam_tensors[c_name]['intrinsics']
+                    c_p = cam_tensors[c_name]['pose']
+                    c_d_masked = cam_tensors[c_name]['depth_masked']
                     H_c, W_c = c_d_masked.shape[1], c_d_masked.shape[2]
                     v_g, u_g = torch.meshgrid(torch.arange(0, H_c, 2, device=self.device), torch.arange(0, W_c, 2, device=self.device), indexing='ij')
                     u_f, v_f = u_g.flatten(), v_g.flatten()
@@ -1569,13 +1624,16 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             for cam_name, cam_data in camera_views.items():
                 try:
-                    d_tensor = torch.from_numpy(cam_data['depth'].copy()).unsqueeze(0).to(self.device)
-                    k_tensor = torch.from_numpy(cam_data['intrinsics'].copy()).to(self.device)
-                    t_tensor = torch.from_numpy(cam_data['extrinsics'].copy()).to(self.device)
-                    rgb_tensor = torch.from_numpy(cam_data['rgb'].copy()).permute(2, 0, 1).float().to(self.device) / 255.0
-                    mask_np = cam_data.get('mask')
-
-                    d_masked, mask_t = self._apply_semantic_robot_mask(depth_t=d_tensor, mask_np=mask_np)
+                    cam = cam_tensors.get(cam_name)
+                    if cam is None:
+                        cam = self._upload_camera_view(cam_data)
+                        cam_tensors[cam_name] = cam
+                    k_tensor = cam['intrinsics']
+                    t_tensor = cam['pose']
+                    # uint8 upload is 4x smaller; uint8->float is exact, so the normalised image is unchanged.
+                    cam['rgb_raw'] = torch.from_numpy(cam_data['rgb'].copy()).to(self.device)
+                    rgb_tensor = cam['rgb_raw'].permute(2, 0, 1).float() / 255.0
+                    d_masked, mask_t = cam['depth_masked'], cam['mask']
 
                     # Step 1: Raycast Pruning of deleted objects against prior TSDF map (Eq. 17)
                     # + Direct Floater Pruning for confirmed free space where F > tau_floater (Paper Sec. III-B.2)
@@ -1632,7 +1690,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     else:
                         rendered_rgb = rgb_tensor.clone()
                     rendered_depth = d_masked.clone()
-                    if torch.cuda.is_available() and str(self.device).startswith('cuda'):
+                    # Synchronising only matters for the printed breakdown; on other frames it would just stall the queue.
+                    if log_this_frame and sync_cuda:
                         torch.cuda.synchronize()
                     t_render_total += (time.perf_counter() - t_render_start) * 1000.0
 
@@ -1742,6 +1801,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             initial_T_coarse_dict = {}
 
             z_tab = self.z_table
+            tracking_views = self._prepare_tracking_views(camera_views, cam_tensors)
 
             for oid, obj_info in self.tracked_objects.items():
                 src_xyz = obj_info['canonical_points']['xyz']
@@ -1751,50 +1811,32 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
                 # 1. Direct semantic backprojection from current camera frames
                 obs_xyz_list, obs_rgb_list = [], []
-                for c_name, c_data in camera_views.items():
-                    c_mask = c_data.get('mask')
-                    if c_mask is None:
+                for tv in tracking_views:
+                    obj_px = (tv['mask'] == oid)
+                    if not torch.any(obj_px):
                         continue
-                    mask_np = to_numpy(c_mask)
-                    if mask_np.ndim == 3:
-                        mask_np = mask_np.squeeze(0)
-                    obj_px = (mask_np == oid)
-                    if not np.any(obj_px):
-                        continue
-
-                    c_d = c_data.get('depth')
-                    if c_d is None:
-                        continue
-                    d_np = to_numpy(c_d)
-                    if d_np.ndim == 3:
-                        d_np = d_np.squeeze(0)
-                    d_vals = d_np[obj_px]
+                    d_vals = tv['depth'][obj_px]
                     valid = (d_vals > self.depth_near) & (d_vals < self.depth_far)
-                    if not np.any(valid):
+                    if not torch.any(valid):
                         continue
 
-                    v_idx, u_idx = np.nonzero(obj_px)
+                    v_idx, u_idx = torch.nonzero(obj_px, as_tuple=True)
                     v_idx, u_idx, d_vals = v_idx[valid], u_idx[valid], d_vals[valid]
-                    K = c_data['intrinsics']
-                    fx, fy = float(K[0, 0]), float(K[1, 1])
-                    cx, cy = float(K[0, 2]), float(K[1, 2])
-                    xc = (u_idx.astype(float) - cx) * d_vals / fx
-                    yc = (v_idx.astype(float) - cy) * d_vals / fy
-                    p_c = np.stack([xc, yc, d_vals], axis=-1)
-                    c2w = c_data['extrinsics']
-                    p_w = p_c @ c2w[:3, :3].T + c2w[:3, 3]
+                    fx, fy, cx, cy = tv['fx'], tv['fy'], tv['cx'], tv['cy']
+                    # float64 on purpose: reproduces the previous numpy back-projection before the float32 cast.
+                    xc = (u_idx.double() - cx) * d_vals / fx
+                    yc = (v_idx.double() - cy) * d_vals / fy
+                    p_c = torch.stack([xc, yc, d_vals.double()], dim=-1)
+                    p_w = p_c @ tv['R_c2w'].T + tv['t_c2w']
 
-                    c_rgb_raw = c_data.get('rgb')
-                    if c_rgb_raw is not None:
-                        rgb_np = to_numpy(c_rgb_raw)
-                        if rgb_np.ndim == 3 and rgb_np.shape[0] == 3:
-                            rgb_np = np.transpose(rgb_np, (1, 2, 0))
-                        if rgb_np.max() > 1.0:
-                            rgb_np = rgb_np / 255.0
-                        obs_rgb_list.append(torch.as_tensor(rgb_np[v_idx, u_idx], dtype=torch.float32, device=self.device))
+                    if tv['rgb'] is not None:
+                        rgb_px = tv['rgb'][v_idx, u_idx]
+                        if tv['rgb_scale_255']:
+                            rgb_px = (rgb_px.double() if not rgb_px.is_floating_point() else rgb_px) / 255.0
+                        obs_rgb_list.append(rgb_px.to(torch.float32))
                     else:
                         obs_rgb_list.append(torch.full((len(p_w), 3), 0.5, device=self.device, dtype=torch.float32))
-                    obs_xyz_list.append(torch.as_tensor(p_w, dtype=torch.float32, device=self.device))
+                    obs_xyz_list.append(p_w.to(torch.float32))
 
                 if len(obs_xyz_list) == 0:
                     # No visual observations for this object in the current camera frames (e.g. occluded or off-view).
@@ -1832,9 +1874,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     R_fine = T_fine[:3, :3]
                     t_fine = T_fine[:3, 3]
                     c0_t = torch.tensor(c0, dtype=torch.float32, device=self.device)
-                    pos_w = R_fine @ c0_t + t_fine
-                    pos_z = max(float(pos_w[2].item()), float(z_tab) + float(half_h))
-                    new_pos = (float(pos_w[0].item()), float(pos_w[1].item()), pos_z)
+                    pos_x, pos_y, pos_wz = (R_fine @ c0_t + t_fine).tolist()
+                    pos_z = max(pos_wz, float(z_tab) + float(half_h))
+                    new_pos = (pos_x, pos_y, pos_z)
                     quat = rotation_matrix_to_quaternion(R_fine)
 
                     # Compute displacement delta relative to previous position
@@ -1859,10 +1901,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
             t_se3_total = (time.perf_counter() - t_s3) * 1000.0
 
+        # One sync per frame keeps latency_ms honest now that the per-camera syncs are gone.
+        if sync_cuda:
+            torch.cuda.synchronize()
         total_elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
         # Periodic structured diagnostic report
-        if self.enable_timing_breakdown and (timestep % self.log_interval_frames == 0 or timestep <= 2):
+        if log_this_frame:
             tsdf_active_voxels = 0
             w_max = 0.0
             w_mean = 0.0

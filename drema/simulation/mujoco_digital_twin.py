@@ -3,7 +3,8 @@
 MuJoCo Digital Twin for DREMA Dynamic Inference System.
 
 Agnostic & Dynamic Scene Manager running on MuJoCo:
-- Loads the Franka Emika Panda robot model and static environment (ground, table).
+- Loads the Franka Emika Panda from the MuJoCo Menagerie MJCF (collision geometry only) and the static
+  environment (ground, table).
 - Dynamically compiles discovered 3D surface mesh obstacles extracted by Perception.
 - Fluid dynamic multi-body tracking using MuJoCo Mocap Bodies + Weld Equality Constraints
   (or Cartesian PD force/torque with gravity feedforward), natively enforcing non-interpenetration.
@@ -13,6 +14,7 @@ Agnostic & Dynamic Scene Manager running on MuJoCo:
 import os
 import sys
 import time
+import xml.etree.ElementTree as ET
 import numpy as np
 from typing import Optional, Tuple, List, Dict, Union, Any
 from scipy.spatial.transform import Rotation
@@ -25,6 +27,7 @@ except ImportError:
     MUJOCO_AVAILABLE = False
 
 from .base_twin import BaseDigitalTwin, DEFAULT_TABLE_COLOR, DEFAULT_OBSTACLE_COLOR, synchronized, aggregate_gvm_costs
+from .mesh_decomposition import convex_parts
 from drema.controller.franka_kinematics import FrankaKinematics
 from drema.prediction import BaseObstaclePredictor, ObstacleTrajectoryPredictor
 
@@ -44,6 +47,21 @@ def _matrix_to_quat_xyzw(rot_mat: np.ndarray) -> Tuple[float, float, float, floa
     q_wxyz = np.zeros(4, dtype=np.float64)
     mujoco.mju_mat2Quat(q_wxyz, rot_mat.astype(np.float64).flatten())
     return _wxyz_to_xyzw(q_wxyz)
+
+
+DEFAULT_ROBOT_MODEL = "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml"
+# Robot bodies whose geometry follows the TCP (link index 8 in the robot geom map)
+HAND_BODIES = ("hand", "left_finger", "right_finger")
+FINGER_OPENING = 0.04  # [m] per finger: the twin keeps the gripper open
+
+
+def _world_aabbs(model, data, geom_ids: np.ndarray):
+    """World-frame AABB centres and half sizes of the given geoms (from their geom-frame bounding boxes)."""
+    R = data.geom_xmat[geom_ids].reshape(-1, 3, 3)
+    box = model.geom_aabb[geom_ids]
+    center = data.geom_xpos[geom_ids] + np.einsum('nij,nj->ni', R, box[:, :3])
+    half = np.einsum('nij,nj->ni', np.abs(R), box[:, 3:])
+    return center, half
 
 
 def _quat_xyzw_to_matrix(q: Union[Tuple[float, ...], List[float], np.ndarray]) -> np.ndarray:
@@ -75,8 +93,17 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         enable_mjx: bool = False,
         predictor: Optional[BaseObstaclePredictor] = None,
         joint_angle_offsets: Optional[List[float]] = None,
-        table_in_collision_costs: bool = True
+        table_in_collision_costs: bool = True,
+        obstacle_convex_decomposition: bool = True,
+        vhacd_resolution: int = 100000,
+        vhacd_concavity: float = 0.05
     ):
+        """
+        :param robot_model_path: Panda MJCF (default: MuJoCo Menagerie franka_emika_panda); only its collision
+            geometry is used, so the robot matches the URDF used by the PyBullet twin.
+        :param obstacle_convex_decomposition: MuJoCo collides every mesh geom through its convex hull; when True,
+            obstacle meshes are split into V-HACD convex parts, one geom each (same parts as the PyBullet twin).
+        """
         if not MUJOCO_AVAILABLE:
             raise ImportError(
                 "[MUJOCO DIGITAL TWIN ERROR] 'mujoco' package is not installed. "
@@ -85,6 +112,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         super().__init__(joint_angle_offsets)
         self.table_in_collision_costs = bool(table_in_collision_costs)
+        self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
+        self.vhacd_resolution = int(vhacd_resolution)
+        self.vhacd_concavity = float(vhacd_concavity)
         self.visualize = visualize
         self.table_z = float(table_z)
         self.enable_mjx = bool(enable_mjx)
@@ -118,8 +148,14 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if robot_model_path is not None and os.path.exists(robot_model_path):
             self.robot_model_path = os.path.abspath(robot_model_path)
         else:
-            default_path = os.path.abspath("assets/franka_panda/panda.xml")
-            self.robot_model_path = default_path if os.path.exists(default_path) else None
+            self.robot_model_path = os.path.abspath(DEFAULT_ROBOT_MODEL)
+        if not os.path.exists(self.robot_model_path):
+            raise FileNotFoundError(f"[MUJOCO DIGITAL TWIN ERROR] Panda MJCF not found: '{self.robot_model_path}'")
+        self._robot_mjcf: Optional[Tuple[str, List[str], str]] = None
+        self._model_has_robot = False
+        # (geom id, body id, link index 0..7 or 8 for hand/fingers) and (geom id, obstacle id), rebuilt with the model
+        self._robot_geoms: List[Tuple[int, int, int]] = []
+        self._obstacle_geoms: List[Tuple[int, int]] = []
 
         self.robot_loaded = False
         self.robot_base_pos = np.array([0.0, 0.0, self.table_z], dtype=np.float64)
@@ -171,6 +207,53 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     # In-Memory MJCF Dynamic Model Construction
     # -------------------------------------------------------------------------
 
+    def _load_robot_mjcf(self) -> Tuple[str, List[str], str]:
+        """
+        Collision-only Panda from the Menagerie MJCF: the 'panda' default classes, the collision mesh assets with
+        absolute paths and the link0 body tree, plus a 'tcp' site at the Panda_tip pose of the analytical model.
+        """
+        if self._robot_mjcf is not None:
+            return self._robot_mjcf
+        root = ET.parse(self.robot_model_path).getroot()
+        compiler = root.find('compiler')
+        mesh_dir = os.path.join(os.path.dirname(self.robot_model_path),
+                                compiler.get('meshdir', '') if compiler is not None else '')
+        defaults = root.find('default').find("default[@class='panda']")
+        link0 = root.find('worldbody').find("body[@name='link0']")
+        for body in link0.iter('body'):
+            for geom in [g for g in body.findall('geom') if g.get('class') == 'visual']:
+                body.remove(geom)
+        used = {g.get('mesh') for g in link0.iter('geom') if g.get('mesh')}
+        assets = []
+        for mesh in root.find('asset').findall('mesh'):
+            name = mesh.get('name') or os.path.splitext(mesh.get('file'))[0]
+            if name in used:
+                assets.append(f'<mesh name="{name}" file="{os.path.join(mesh_dir, mesh.get("file"))}"/>')
+        link7 = link0.find(".//body[@name='link7']")
+        ox, oy, oz = (float(v) for v in FrankaKinematics.EE_OFFSET)
+        ET.SubElement(link7, 'site', {'name': 'tcp', 'pos': f"{ox:.6f} {oy:.6f} {0.107 + oz:.6f}"})
+        self._robot_mjcf = (ET.tostring(defaults, encoding='unicode'), assets, ET.tostring(link0, encoding='unicode'))
+        return self._robot_mjcf
+
+    def _index_geoms(self) -> None:
+        """Robot collision geoms by body and link, and obstacle geoms by obstacle id."""
+        m = self.model
+        self._robot_geoms, self._obstacle_geoms = [], []
+        for g in range(m.ngeom):
+            if m.geom_contype[g] == 0 and m.geom_conaffinity[g] == 0:
+                continue
+            body = int(m.geom_bodyid[g])
+            name = m.body(body).name
+            if name.startswith('link') and name[4:].isdigit():
+                self._robot_geoms.append((g, body, int(name[4:])))
+            elif name in HAND_BODIES:
+                self._robot_geoms.append((g, body, 8))
+            elif name.startswith('obs_'):
+                try:
+                    self._obstacle_geoms.append((g, int(name.split('_')[1])))
+                except ValueError:
+                    pass
+
     def _generate_mjcf_xml(self) -> str:
         """
         Dynamically constructs the complete MJCF XML string for the current scene,
@@ -180,60 +263,16 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         body_elements = []
         equality_constraints = []
 
-        objs_dir = os.path.abspath("assets/franka_panda/objs")
-
-        # 1. Base Robot Meshes (if robot model path exists)
+        robot_defaults = ""
         if self.robot_loaded:
-            mesh_assets.append(f'<mesh name="franka_base" file="{os.path.join(objs_dir, "robot_base.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link1" file="{os.path.join(objs_dir, "Panda_link1_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link2" file="{os.path.join(objs_dir, "Panda_link2_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link3" file="{os.path.join(objs_dir, "Panda_link3_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link4" file="{os.path.join(objs_dir, "Panda_link4_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link5" file="{os.path.join(objs_dir, "Panda_link5_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link6" file="{os.path.join(objs_dir, "Panda_link6_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_link7" file="{os.path.join(objs_dir, "Panda_link7_respondable.obj")}"/>')
-            mesh_assets.append(f'<mesh name="franka_gripper" file="{os.path.join(objs_dir, "Panda_gripper_visual.obj")}"/>')
-
-            # Robot body tree
+            robot_defaults, robot_assets, robot_body = self._load_robot_mjcf()
+            mesh_assets.extend(robot_assets)
             bx, by, bz = self.robot_base_pos
             qw, qx, qy, qz = self.robot_base_quat
-            robot_tree = f"""
-    <body name="robot_base" pos="{bx:.6f} {by:.6f} {bz:.6f}" quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">
-      <geom name="robot_base_geom" type="mesh" mesh="franka_base" rgba="0.95 0.95 0.95 1"/>
-      <body name="link1" pos="0 0 0.333">
-        <joint name="joint1" type="hinge" axis="0 0 1" range="-2.8973 2.8973"/>
-        <geom name="link1_geom" type="mesh" mesh="franka_link1" rgba="0.95 0.95 0.95 1"/>
-        <body name="link2" pos="0 0 0" quat="0.7071068 -0.7071068 0 0">
-          <joint name="joint2" type="hinge" axis="0 0 1" range="-1.7628 1.7628"/>
-          <geom name="link2_geom" type="mesh" mesh="franka_link2" rgba="0.95 0.95 0.95 1"/>
-          <body name="link3" pos="0 -0.316 0" quat="0.7071068 0.7071068 0 0">
-            <joint name="joint3" type="hinge" axis="0 0 1" range="-2.8973 2.8973"/>
-            <geom name="link3_geom" type="mesh" mesh="franka_link3" rgba="0.95 0.95 0.95 1"/>
-            <body name="link4" pos="0.0825 0 0" quat="0.7071068 0.7071068 0 0">
-              <joint name="joint4" type="hinge" axis="0 0 1" range="-3.0718 -0.0698"/>
-              <geom name="link4_geom" type="mesh" mesh="franka_link4" rgba="0.95 0.95 0.95 1"/>
-              <body name="link5" pos="-0.0825 0.384 0" quat="0.7071068 -0.7071068 0 0">
-                <joint name="joint5" type="hinge" axis="0 0 1" range="-2.8973 2.8973"/>
-                <geom name="link5_geom" type="mesh" mesh="franka_link5" rgba="0.95 0.95 0.95 1"/>
-                <body name="link6" pos="0 0 0" quat="0.7071068 0.7071068 0 0">
-                  <joint name="joint6" type="hinge" axis="0 0 1" range="-0.0175 3.7525"/>
-                  <geom name="link6_geom" type="mesh" mesh="franka_link6" rgba="0.95 0.95 0.95 1"/>
-                  <body name="link7" pos="0.088 0 0" quat="0.7071068 0.7071068 0 0">
-                    <joint name="joint7" type="hinge" axis="0 0 1" range="-2.8973 2.8973"/>
-                    <geom name="link7_geom" type="mesh" mesh="franka_link7" rgba="0.95 0.95 0.95 1"/>
-                    <body name="ee" pos="0 0 0.107">
-                      <geom name="gripper_geom" type="mesh" mesh="franka_gripper" rgba="0.3 0.3 0.3 1"/>
-                      <site name="tcp" pos="0 0 0.1034"/>
-                    </body>
-                  </body>
-                </body>
-              </body>
-            </body>
-          </body>
-        </body>
-      </body>
-    </body>"""
-            body_elements.append(robot_tree)
+            body_elements.append(
+                f'<body name="robot_base" pos="{bx:.6f} {by:.6f} {bz:.6f}" quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">'
+                f'{robot_body}</body>'
+            )
 
         # 2. Table Structure
         if self.table_spawned:
@@ -263,13 +302,22 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         # 3. Dynamic Tracked Mesh Obstacles
         for obj_id, obj in self.tracked_objects.items():
-            mesh_name = f"mesh_obs_{obj_id}"
-            abs_mesh_path = os.path.abspath(obj["mesh_path"])
-            mesh_assets.append(f'<mesh name="{mesh_name}" file="{abs_mesh_path}"/>')
+            parts = obj.get("collision_parts") or [obj["mesh_path"]]
+            for k, part in enumerate(parts):
+                mesh_assets.append(f'<mesh name="mesh_obs_{obj_id}_{k}" file="{os.path.abspath(part)}"/>')
+            if self.visualize and len(parts) > 1:
+                mesh_assets.append(f'<mesh name="mesh_obs_{obj_id}_visual" file="{os.path.abspath(obj["mesh_path"])}"/>')
 
             col = obj.get("color", DEFAULT_OBSTACLE_COLOR)
             rgba_str = f"{col[0]:.3f} {col[1]:.3f} {col[2]:.3f} {col[3]:.3f}"
-            mass_val = float(obj.get("mass", 1.0))
+            mass_val = float(obj.get("mass", 1.0)) / len(parts)
+            geoms = "".join(
+                f'  <geom name="obs_{obj_id}_geom_{k}" type="mesh" mesh="mesh_obs_{obj_id}_{k}" mass="{mass_val:.4f}" '
+                f'rgba="{rgba_str}" friction="0.5 0.005 0.0001"/>\n' for k in range(len(parts))
+            )
+            if self.visualize and len(parts) > 1:
+                geoms += (f'  <geom name="obs_{obj_id}_visual" type="mesh" mesh="mesh_obs_{obj_id}_visual" '
+                          f'contype="0" conaffinity="0" rgba="{rgba_str}"/>\n')
 
             px, py, pz = obj["target_pos"]
             qw, qx, qy, qz = obj["target_quat"]
@@ -280,10 +328,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 # instantaneous kinematic updates via eval_data/data mocap_pos, and exact collision distance queries.
                 mocap_body = (
                     f'<body name="obs_{obj_id}" mocap="true" pos="{px:.6f} {py:.6f} {pz:.6f}" '
-                    f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">\n'
-                    f'  <geom name="obs_{obj_id}_geom" type="mesh" mesh="{mesh_name}" mass="{mass_val:.3f}" '
-                    f'rgba="{rgba_str}" friction="0.5 0.005 0.0001"/>\n'
-                    f'</body>'
+                    f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">\n{geoms}</body>'
                 )
                 body_elements.append(mocap_body)
             else:
@@ -291,10 +336,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 dyn_body = (
                     f'<body name="obs_{obj_id}" pos="{px:.6f} {py:.6f} {pz:.6f}" '
                     f'quat="{qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f}">\n'
-                    f'  <freejoint name="obs_{obj_id}_joint"/>\n'
-                    f'  <geom name="obs_{obj_id}_geom" type="mesh" mesh="{mesh_name}" mass="{mass_val:.3f}" '
-                    f'rgba="{rgba_str}" friction="0.5 0.005 0.0001"/>\n'
-                    f'</body>'
+                    f'  <freejoint name="obs_{obj_id}_joint"/>\n{geoms}</body>'
                 )
                 body_elements.append(dyn_body)
 
@@ -309,6 +351,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
   <default>
     <joint damping="1.0" armature="0.1"/>
     <geom contype="1" conaffinity="1" density="1000"/>
+    {robot_defaults}
   </default>
 
   <asset>
@@ -334,21 +377,24 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         preserving previous robot joint states and dynamic obstacle states across rebuilds.
         """
         # Save previous states if existing
-        prev_qpos = None
-        prev_qvel = None
-        if self.model is not None and self.data is not None:
-            prev_qpos = self.data.qpos.copy()
-            prev_qvel = self.data.qvel.copy()
+        # Only a previous model that already contained the robot holds robot joint values in qpos[:7]; otherwise
+        # those entries belong to an obstacle free joint.
+        prev_robot_q = None
+        if self.model is not None and self.data is not None and self._model_has_robot:
+            prev_robot_q = self.data.qpos[:7].copy()
 
         xml = self._generate_mjcf_xml()
         new_model = mujoco.MjModel.from_xml_string(xml)
         new_data = mujoco.MjData(new_model)
 
         # Restore states
-        if prev_qpos is not None and self.robot_loaded:
-            num_j = min(7, new_model.nq, len(prev_qpos))
-            new_data.qpos[:num_j] = prev_qpos[:num_j]
-            new_data.qvel[:num_j] = prev_qvel[:num_j]
+        if self.robot_loaded:
+            if prev_robot_q is not None:
+                new_data.qpos[:7] = prev_robot_q
+            for finger in ("finger_joint1", "finger_joint2"):
+                jid = mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_JOINT, finger)
+                if jid >= 0:
+                    new_data.qpos[new_model.jnt_qposadr[jid]] = FINGER_OPENING
 
         # Initialize mocap positions for obstacles
         if self.tracking_mode == "mocap":
@@ -367,6 +413,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.model = new_model
         self.data = new_data
         self._eval_data = mujoco.MjData(new_model)
+        self._model_has_robot = self.robot_loaded
+        self._index_geoms()
 
         if self.enable_mjx:
             try:
@@ -515,9 +563,17 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         col = tuple(color) if color is not None else DEFAULT_OBSTACLE_COLOR
         quat_wxyz = _xyzw_to_wxyz(initial_quat)
 
+        parts = [mesh_path]
+        if self.obstacle_convex_decomposition:
+            try:
+                parts = convex_parts(mesh_path, self.vhacd_resolution, self.vhacd_concavity)
+            except Exception as e:
+                print(f"[MUJOCO DIGITAL TWIN WARNING] Convex decomposition failed ({e}): using the convex hull of '{mesh_path}'")
+
         self.tracked_objects[target_obj_id] = {
             "name": name,
             "mesh_path": mesh_path,
+            "collision_parts": parts,
             "mass": float(mass),
             "color": col,
             "target_pos": np.array(initial_pos, dtype=np.float64),
@@ -675,11 +731,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None:
             return False
 
-        robot_body_names = ["robot_base", "link1", "link2", "link3", "link4", "link5", "link6", "link7", "ee"]
-        robot_body_ids = {
-            mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, name)
-            for name in robot_body_names
-        }
+        robot_body_ids = {body for _, body, _ in self._robot_geoms}
 
         for i in range(self.data.ncon):
             contact = self.data.contact[i]
@@ -698,14 +750,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
             return float("inf")
 
-        robot_geoms = [
-            i for i in range(self.model.ngeom)
-            if any(k in self.model.geom(i).name for k in ["robot_base", "link", "gripper"])
-        ]
-        obstacle_geoms = [
-            i for i in range(self.model.ngeom)
-            if "obs_" in self.model.geom(i).name and "_geom" in self.model.geom(i).name
-        ]
+        robot_geoms = [g for g, _, _ in self._robot_geoms]
+        obstacle_geoms = [g for g, _ in self._obstacle_geoms]
 
         if not robot_geoms or not obstacle_geoms:
             return float("inf")
@@ -731,14 +777,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
             return []
 
-        robot_geoms = [
-            i for i in range(self.model.ngeom)
-            if any(k in self.model.geom(i).name for k in ["link", "gripper"])
-        ]
-        obstacle_geoms = [
-            i for i in range(self.model.ngeom)
-            if "obs_" in self.model.geom(i).name and "_geom" in self.model.geom(i).name
-        ]
+        robot_geoms = [g for g, _, link in self._robot_geoms if link >= 1]
+        obstacle_geoms = [g for g, _ in self._obstacle_geoms]
 
         results = []
         fromto = np.zeros(6, dtype=np.float64)
@@ -804,25 +844,12 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or not self.robot_loaded:
             return []
 
-        robot_geoms = []
-        for i in range(self.model.ngeom):
-            g_name = self.model.geom(i).name
-            if "gripper" in g_name:
-                robot_geoms.append((i, 7))
-            for link_num in range(1, 8):
-                if g_name == f"link{link_num}_geom":
-                    robot_geoms.append((i, link_num))
+        # Hand and fingers are rigidly attached to link 7, as in the PyBullet twin.
+        robot_geoms = [(g, min(link, 7)) for g, _, link in self._robot_geoms if link >= 1]
 
         closest: Dict[Tuple[int, int], Tuple[float, np.ndarray, np.ndarray]] = {}
         fromto = np.zeros(6, dtype=np.float64)
-        for og in range(self.model.ngeom):
-            g_name = self.model.geom(og).name
-            if not (g_name.startswith("obs_") and g_name.endswith("_geom")):
-                continue
-            try:
-                obj_id = int(g_name.split("_")[1])
-            except ValueError:
-                continue
+        for og, obj_id in self._obstacle_geoms:
             if self.tracked_objects.get(obj_id, {}).get("is_target", False):
                 continue
             for rg, link_idx in robot_geoms:
@@ -881,7 +908,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 rot_mat = Rotation.from_quat(tq.flatten()).as_matrix().astype(np.float64)
 
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "tcp")
-        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "ee")
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
         if site_id < 0 and body_id < 0:
             return None
 
@@ -967,26 +994,26 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             }
             return coll_p, coll_gvm
 
-        # Extract obstacle geoms (ignore targets) and map to obj_id
+        # Obstacle geoms (several convex parts per obstacle) and the obstacle slot used for the cost grouping:
+        # potentials are aggregated per (obstacle, robot body), as in the PyBullet twin.
         obstacle_geoms = []
         geom_to_obj_id = {}
-        for i in range(self.model.ngeom):
-            g_name = self.model.geom(i).name
-            if g_name.startswith("obs_") and g_name.endswith("_geom"):
-                try:
-                    obj_id = int(g_name.split("_")[1])
-                    if self.tracked_objects.get(obj_id, {}).get("is_target", False):
-                        continue
-                    obstacle_geoms.append(i)
-                    geom_to_obj_id[i] = obj_id
-                except Exception:
-                    pass
-        # The table is static (no prediction, zero velocity); the robot base geom is not in the
-        # robot link map, so only the moving links are penalized against it.
+        geom_slot = {}
+        slots: Dict[int, int] = {}
+        for g, obj_id in self._obstacle_geoms:
+            if self.tracked_objects.get(obj_id, {}).get("is_target", False):
+                continue
+            obstacle_geoms.append(g)
+            geom_to_obj_id[g] = obj_id
+            geom_slot[g] = slots.setdefault(obj_id, len(slots))
+        # The table is static (no prediction, zero velocity); the fixed base link0 is left out of the robot
+        # geoms below, so only the moving links are penalized against it.
         if self.table_in_collision_costs:
             table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
             if table_geom_id >= 0:
                 obstacle_geoms.append(table_geom_id)
+                geom_slot[table_geom_id] = len(slots)
+                slots[-1] = len(slots)
 
         if not obstacle_geoms:
             self.last_collision_timings = {
@@ -998,17 +1025,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             }
             return coll_p, coll_gvm
 
-        # Pre-cache robot arm geoms and link indices
-        robot_geom_link_map = []
-        for i in range(self.model.ngeom):
-            g_name = self.model.geom(i).name
-            if "link" in g_name:
-                for link_num in range(1, 8):
-                    if f"link{link_num}" in g_name:
-                        robot_geom_link_map.append((i, link_num))
-                        break
-            elif "gripper" in g_name or "ee" in g_name:
-                robot_geom_link_map.append((i, -1))
+        # Moving robot geoms: (geom, body, velocity slot of batch_link_linear_velocities; hand/fingers -> TCP)
+        robot_geom_link_map = [(g, body, link - 1 if link <= 7 else 7) for g, body, link in self._robot_geoms if link >= 1]
+        robot_geom_ids = np.array([g for g, _, _ in robot_geom_link_map], dtype=np.int64)
+        obstacle_geom_ids = np.array(obstacle_geoms, dtype=np.int64)
+        n_bodies = self.model.nbody
 
         if not robot_geom_link_map:
             self.last_collision_timings = {
@@ -1062,9 +1083,10 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         fromto = np.zeros(6, dtype=np.float64)
 
-        # Closest-point records, aggregated per robot link across all obstacles.
+        # Closest-point records, aggregated per (obstacle, robot body).
         rec_k: List[int] = []
         rec_e: List[int] = []
+        rec_group: List[int] = []
         rec_slot: List[int] = []
         rec_d: List[float] = []
         rec_normal: List[Any] = []
@@ -1095,40 +1117,38 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 mujoco.mj_kinematics(self.model, eval_data)
                 t_mj_total += (time.perf_counter() - t_mj_s)
 
-                for rg, fk_link_idx in robot_geom_link_map:
-                    rg_pos = eval_data.geom_xpos[rg]
-                    rg_r = self.model.geom_rbound[rg]
-
-                    for og in obstacle_geoms:
-                        og_pos = eval_data.geom_xpos[og]
-                        og_r = self.model.geom_rbound[og]
-
-                        # Broadphase culling: skip if bounding spheres are farther than sigma_2
-                        dist_centers = np.linalg.norm(rg_pos - og_pos)
-                        if dist_centers > (rg_r + og_r + sigma_2):
-                            continue
-
-                        t_mj_s = time.perf_counter()
-                        try:
-                            d = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2), fromto)
-                        except Exception:
-                            t_mj_total += (time.perf_counter() - t_mj_s)
-                            continue
+                # Broadphase: only geom pairs whose world AABBs, grown by sigma_2, overlap reach the GJK query.
+                r_center, r_half = _world_aabbs(self.model, eval_data, robot_geom_ids)
+                o_center, o_half = _world_aabbs(self.model, eval_data, obstacle_geom_ids)
+                near = np.all(np.abs(r_center[:, None] - o_center[None]) <= r_half[:, None] + o_half[None] + sigma_2,
+                              axis=-1)
+                for ri, oi in zip(*np.nonzero(near)):
+                    rg, rbody, vel_slot = robot_geom_link_map[ri]
+                    og = obstacle_geoms[oi]
+                    t_mj_s = time.perf_counter()
+                    try:
+                        d = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2), fromto)
+                    except Exception:
                         t_mj_total += (time.perf_counter() - t_mj_s)
+                        continue
+                    t_mj_total += (time.perf_counter() - t_mj_s)
 
-                        if d > sigma_2:
-                            continue
+                    # mj_geomDistance returns distmax itself when the pair is farther than distmax
+                    if d >= sigma_2:
+                        continue
 
-                        total_contact_pts += 1
-                        rec_k.append(k)
-                        rec_e.append(e)
-                        rec_slot.append(7 if fk_link_idx < 1 else fk_link_idx - 1)
-                        rec_d.append(d)
-                        rec_normal.append(fromto[0:3] - fromto[3:6])
-                        rec_v_obs.append(obs_vel[og])
-                        if record_points:
-                            rec_point.append(fromto[0:3].copy())
-                            rec_obj.append(geom_to_obj_id.get(og, -1))
+                    total_contact_pts += 1
+                    rec_k.append(k)
+                    rec_e.append(e)
+                    rec_group.append(geom_slot[og] * n_bodies + rbody)
+                    rec_slot.append(vel_slot)
+                    rec_d.append(d)
+                    # obstacle -> robot direction; the nearest-point pair crosses when penetrating
+                    rec_normal.append(fromto[0:3] - fromto[3:6] if d >= 0.0 else fromto[3:6] - fromto[0:3])
+                    rec_v_obs.append(obs_vel[og])
+                    if record_points:
+                        rec_point.append(fromto[0:3].copy())
+                        rec_obj.append(geom_to_obj_id.get(og, -1))
 
         if record_points:
             self.last_collision_points = {
@@ -1141,8 +1161,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         t_gvm_s = time.perf_counter()
         coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(
-            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_slot, rec_slot, rec_d, rec_normal, rec_v_obs,
-            n_groups=8, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho, kin_helper=kin_helper
+            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_group, rec_slot, rec_d, rec_normal, rec_v_obs,
+            n_groups=max(1, len(slots)) * n_bodies, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho,
+            kin_helper=kin_helper
         )
         coll_p[:, eval_steps] = coll_p_eval
         coll_gvm[:, eval_steps] = coll_gvm_eval

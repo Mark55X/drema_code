@@ -102,13 +102,14 @@ def _clip_segment(p0: np.ndarray, p1: np.ndarray, lo: np.ndarray, hi: np.ndarray
 class ImaginationRenderer:
     def __init__(self, frames: List[Dict[str, np.ndarray]], scene: Dict[str, np.ndarray],
                  sim_index: Dict[int, str], dt: float, size=(1920, 1080), dpi: int = 100,
-                 view=(22.0, -60.0), zoom: Optional[float] = 0.32):
+                 view=(22.0, -60.0), zoom: Optional[float] = 0.32, cost_ylim: Optional[float] = None):
         self.frames = frames
         self.scene = scene
         self.sim_index = sim_index
         self.sim_steps = np.array(sorted(sim_index)) if sim_index else np.zeros(0, dtype=int)
         self.dt = dt
         self.view = view
+        self.cost_ylim = cost_ylim
         self.fig = plt.figure(figsize=(size[0] / dpi, size[1] / dpi), dpi=dpi)
         self._telemetry = self._collect_telemetry()
         self.center, self.half = self._scene_limits(zoom)
@@ -319,13 +320,12 @@ class ImaginationRenderer:
         a2b.legend(fontsize=7, loc='lower right')
         dist = np.r_[T['d_goal'], T['min_d']]
         a0.set_ylim(0, max(10.0, float(np.nanmax(dist[np.isfinite(dist)])) * 100 * 1.05))
-        # Cost terms span 0 to several thousands: symlog keeps the small terms readable and every peak in range.
         costs = np.r_[T['goal'], T['coll'], T['funnel']]
         costs = costs[np.isfinite(costs)]
-        a1.set_yscale('symlog', linthresh=10.0)
-        a1.set_ylim(0, max(10.0, float(costs.max()) * 1.5) if costs.size else 10.0)
+        top = self.cost_ylim if self.cost_ylim else (max(10.0, float(costs.max()) * 1.1) if costs.size else 10.0)
+        a1.set_ylim(0, top)
         a2.set_ylim(-0.05, 1.05)
-        for a, title in zip(axes, ('distances', 'cost terms of the chosen candidate (symlog)',
+        for a, title in zip(axes, ('distances', 'cost terms of the chosen candidate',
                                    'Judge weights and closest-obstacle speed')):
             a.set_xlim(*span)
             a.axvline(now, color=(0.5, 0.5, 0.5), lw=0.8)
@@ -367,6 +367,8 @@ def main() -> None:
     parser.add_argument("--view", type=float, nargs=2, default=[22.0, -60.0], metavar=("ELEV", "AZIM"))
     parser.add_argument("--zoom", type=float, default=0.32, help="Half size [m] of the close-up cube around the grasp goal")
     parser.add_argument("--overview", action="store_true", help="Frame the whole arm instead of the close-up")
+    parser.add_argument("--cost_ylim", type=float, default=None,
+                        help="Upper limit of the cost plot (default: 10%% above the largest cost of the run)")
     parser.add_argument("--episode", type=int, default=-1,
                         help="Episode to render when the recording contains client resets (default: the last one)")
     parser.add_argument("--gap", type=int, default=60,
@@ -388,7 +390,7 @@ def main() -> None:
     scene_path = os.path.join(args.frames, "scene.npz")
     scene = dict(np.load(scene_path, allow_pickle=False)) if os.path.exists(scene_path) else {}
     renderer = ImaginationRenderer(frames, scene, sim_index, dt=args.dt, view=tuple(args.view),
-                                   zoom=None if args.overview else args.zoom)
+                                   zoom=None if args.overview else args.zoom, cost_ylim=args.cost_ylim)
     steps = np.array([int(fr['timestep']) for fr in frames])
 
     if args.still:
