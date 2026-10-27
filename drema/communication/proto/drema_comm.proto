@@ -38,6 +38,44 @@ message StreamStatus {
   bool initial_scan_ready = 4;  // True when initial scene reconstruction (table + obstacles) is ready
 }
 
+// Semantic permission on a scene object: whether the robot may touch it.
+enum ObjectPermission {
+  PERMISSION_UNSPECIFIED = 0;
+  AVOID = 1;    // full collision margins
+  TOUCH = 2;    // hand and fingers may contact it
+  FRAGILE = 3;  // avoided with an extra margin
+}
+
+// Who asked for a permission. The server arbitrates: only HUMAN may relax (TOUCH) persistently.
+enum RoleSource {
+  SOURCE_UNSPECIFIED = 0;
+  CONFIG = 1;
+  VLM = 2;
+  HUMAN = 3;
+}
+
+message ObjectRoleAssignment {
+  int32 object_id = 1;              // CoppeliaSim handle, same id used by perception
+  ObjectPermission permission = 2;
+  RoleSource source = 3;
+  string reason = 4;
+  float extra_margin = 5;           // FRAGILE only; 0 = server default
+}
+
+// Orientation convention of RobotState.target_pose.
+enum TargetFrame {
+  FRAME_FLANGE = 0;  // FrankaKinematics EE convention (legacy default)
+  FRAME_TIP = 1;     // CoppeliaSim Panda_tip / RLBench gripper_pose / PerAct keyposes
+}
+
+// Effective role of an object as resolved by the server, reported back to the environment.
+message ObjectRoleStatus {
+  int32 object_id = 1;
+  string role = 2;                  // OBSTACLE, TARGET, HELD, FRAGILE
+  string decided_by = 3;
+  bool hand_contact_allowed = 4;
+}
+
 // Current kinematic & dynamic state of the robot
 message RobotState {
   double timestamp = 1;
@@ -52,6 +90,16 @@ message RobotState {
   repeated double robot_base_pos = 10;  // Robot base position [x, y, z] in world coordinates
   double reachability_radius = 11;      // Robot maximum kinematic reach radius in meters
   optional bool approach_funnel = 12;   // Approach cone cost on the active target; unset = enabled
+  // Keyframe policy output (PerAct action layout: pose, gripper_open, ignore_collisions)
+  optional double gripper_command = 13; // Gripper state requested by the active keyframe (1 open, 0 closed)
+  optional bool ignore_collisions = 14; // Keyframe allows hand contact with the objects at the keypose
+  int32 keyframe_index = 15;            // Changes when the active keyframe changes
+  TargetFrame target_frame = 16;
+  // Environment-side role assignments, sent as a full snapshot so dropped requests lose nothing
+  int64 roles_revision = 17;
+  repeated ObjectRoleAssignment role_assignments = 18;
+  // Parallel gripper: the target may be rotated by 180 deg about the gripper axis (the server picks the reachable one)
+  optional bool yaw_symmetric = 19;
 }
 
 // Action returned by MPC controller to the robot
@@ -62,6 +110,8 @@ message ControlAction {
   double gripper_action = 4;            // Target gripper action (1.0 open, 0.0 close)
   bool safety_stop = 5;                 // True if controller demands immediate hold/stop
   string status_message = 6;            // Debug / telemetry message
+  repeated ObjectRoleStatus object_roles = 7;
+  int64 roles_revision_applied = 8;
 }
 
 // Synchronization and episode reset messages

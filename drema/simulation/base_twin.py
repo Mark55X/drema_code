@@ -9,6 +9,9 @@ import threading
 from abc import ABC, abstractmethod
 from typing import Optional, Tuple, List, Dict, Any, Union
 import numpy as np
+from scipy.spatial.transform import Rotation
+
+from ..roles.types import FULL_CONTACT, ObjectCollisionPolicy
 
 
 
@@ -108,6 +111,125 @@ class BaseDigitalTwin(ABC):
         # robot-side closest points of its last call in last_collision_points.
         self.record_collision_points = False
         self.last_collision_points: Optional[Dict[str, np.ndarray]] = None
+
+        # Object roles (drema.roles): per-object collision policies and objects held by the gripper,
+        # with the TCP->object transform and the kinematics (measured joint space) that moves them.
+        self.object_policies: Dict[int, ObjectCollisionPolicy] = {}
+        self.table_policy = ObjectCollisionPolicy()
+        self.attachments: Dict[int, np.ndarray] = {}
+        self._attach_kin: Any = None
+        self._surface_points: Dict[str, np.ndarray] = {}
+
+    # -------------------------------------------------------------------------
+    # Object roles (shared by every backend)
+    # -------------------------------------------------------------------------
+
+    def object_ids(self) -> List[int]:
+        return list(getattr(self, 'tracked_objects', {}).keys())
+
+    def is_legacy_target(self, obj_id: int) -> bool:
+        return bool(getattr(self, 'tracked_objects', {}).get(obj_id, {}).get('is_target', False))
+
+    def set_object_policies(self, policies: Dict[int, ObjectCollisionPolicy],
+                            table_policy: Optional[ObjectCollisionPolicy] = None) -> None:
+        with self.state_lock:
+            self.object_policies = dict(policies)
+            self.table_policy = table_policy if table_policy is not None else ObjectCollisionPolicy()
+
+    def object_policy(self, obj_id: int) -> ObjectCollisionPolicy:
+        if obj_id in self.attachments:
+            return ObjectCollisionPolicy(hand_contact=True, arm_contact=True, held=True)
+        policy = self.object_policies.get(obj_id)
+        if policy is not None:
+            return policy
+        return FULL_CONTACT if self.is_legacy_target(obj_id) else ObjectCollisionPolicy()
+
+    def _object_surface_points(self, mesh_path: str, max_points: int = 2000) -> np.ndarray:
+        """Vertices of an object mesh in its body frame (perception exports meshes centred on the body origin)."""
+        pts = self._surface_points.get(mesh_path)
+        if pts is None:
+            import trimesh
+            pts = np.asarray(trimesh.load(mesh_path, force='mesh').vertices, dtype=np.float64)
+            if len(pts) > max_points:
+                pts = pts[np.linspace(0, len(pts) - 1, max_points).astype(np.int64)]
+            self._surface_points[mesh_path] = pts
+        return pts
+
+    def objects_near_point(self, point: np.ndarray, radius: float, include_table: bool = False) -> Dict[int, float]:
+        """
+        Objects whose surface lies within `radius` of a world point, as {obj_id: distance}; the table, when
+        requested and present, is reported with id -1 (distance to its top plane).
+        """
+        point = np.asarray(point, dtype=np.float64).reshape(3)
+        near: Dict[int, float] = {}
+        with self.state_lock:
+            for obj_id, obj in getattr(self, 'tracked_objects', {}).items():
+                mesh_path = obj.get('mesh_path')
+                pose = self.tracked_object_pose(obj_id)
+                if not mesh_path or pose is None:
+                    continue
+                try:
+                    local = self._object_surface_points(mesh_path)
+                except Exception:
+                    continue
+                world = local @ Rotation.from_quat(pose[1]).as_matrix().T + np.asarray(pose[0])
+                d = float(np.min(np.linalg.norm(world - point, axis=1))) if len(world) else float('inf')
+                if d <= radius:
+                    near[obj_id] = d
+            if include_table and getattr(self, 'table_id', -1) >= 0:
+                d_table = max(0.0, float(point[2]) - float(getattr(self, 'table_z', 0.0)))
+                if d_table <= radius:
+                    near[-1] = d_table
+        return near
+
+    def tracked_object_pose(self, obj_id: int) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
+        """Pose last set by tracking (or by the gripper when held), not the physics body lagging behind it."""
+        return self.get_object_pose(obj_id)
+
+    def attach_object(self, obj_id: int, tcp_T_obj: np.ndarray, kinematics: Any) -> None:
+        """Rigidly attaches a tracked object to the TCP: it follows the robot instead of perception."""
+        with self.state_lock:
+            self.attachments[obj_id] = np.asarray(tcp_T_obj, dtype=np.float64)
+            self._attach_kin = kinematics
+            self._on_attach(obj_id)
+
+    def detach_object(self, obj_id: int) -> None:
+        with self.state_lock:
+            if self.attachments.pop(obj_id, None) is None:
+                return
+            # The pose history while held came from the robot, not from perception.
+            predictor = getattr(self, 'predictor', None)
+            if predictor is not None and hasattr(predictor, 'filters'):
+                predictor.filters.pop(obj_id, None)
+            self._on_detach(obj_id)
+
+    def _on_attach(self, obj_id: int) -> None:
+        pass
+
+    def _on_detach(self, obj_id: int) -> None:
+        pass
+
+    def attached_poses(self, q_flat: np.ndarray) -> Dict[int, Tuple[np.ndarray, np.ndarray]]:
+        """
+        World poses of the held objects for a batch of measured joint configurations [N, 7]:
+        {obj_id: (positions [N, 3], quaternions xyzw [N, 4])}.
+        """
+        if not self.attachments or self._attach_kin is None:
+            return {}
+        q_flat = np.asarray(q_flat, dtype=np.float64).reshape(-1, 7)
+        pos, quat = self._attach_kin.batch_forward_kinematics_ee(q_flat[None], return_orientations=True)
+        R_tcp = Rotation.from_quat(quat[0].astype(np.float64)).as_matrix()
+        p_tcp = pos[0].astype(np.float64)
+        out = {}
+        for obj_id, T in self.attachments.items():
+            R_obj = R_tcp @ T[:3, :3]
+            p_obj = p_tcp + R_tcp @ T[:3, 3]
+            out[obj_id] = (p_obj, Rotation.from_matrix(R_obj).as_quat())
+        return out
+
+    def sync_gripper(self, open_amount: float) -> None:
+        """Mirrors the measured gripper opening (1 open, 0 closed) on the twin fingers."""
+        pass
 
     @abstractmethod
     def load_robot(

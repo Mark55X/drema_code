@@ -165,7 +165,7 @@ class MPCController:
                 timestamp=time.time(),
                 timestep=robot_state.timestep,
                 joint_velocities=[0.0] * self.num_joints,
-                gripper_action=robot_state.gripper_open,
+                gripper_action=self._gripper_action(robot_state),
                 safety_stop=True,
                 status_message=f"INVALID STATE: joint_positions length ({len(robot_state.joint_positions)}) != {self.num_joints}"
             )
@@ -187,7 +187,7 @@ class MPCController:
                 timestamp=time.time(),
                 timestep=robot_state.timestep,
                 joint_velocities=[0.0] * self.num_joints,
-                gripper_action=robot_state.gripper_open,
+                gripper_action=self._gripper_action(robot_state),
                 safety_stop=False,
                 status_message="IDLE: Waiting for CLI 'start' command"
             )
@@ -208,7 +208,7 @@ class MPCController:
                 timestamp=time.time(),
                 timestep=robot_state.timestep,
                 joint_velocities=[0.0] * self.num_joints,
-                gripper_action=robot_state.gripper_open,
+                gripper_action=self._gripper_action(robot_state),
                 safety_stop=True,
                 status_message=f"SAFETY HALT: Active physical collision detected in Digital Twin (d = {min_dist:.4f}m)"
             )
@@ -226,7 +226,7 @@ class MPCController:
                 timestamp=time.time(),
                 timestep=robot_state.timestep,
                 joint_velocities=[0.0] * self.num_joints,
-                gripper_action=robot_state.gripper_open,
+                gripper_action=self._gripper_action(robot_state),
                 safety_stop=False,
                 status_message="WAIT: Task active but waiting for target goal (holding position)"
             )
@@ -295,7 +295,7 @@ class MPCController:
             timestamp=time.time(),
             timestep=robot_state.timestep,
             joint_velocities=qd_clamped.tolist(),
-            gripper_action=robot_state.gripper_open,
+            gripper_action=self._gripper_action(robot_state),
             safety_stop=False,
             status_message=status_msg
         )
@@ -303,6 +303,13 @@ class MPCController:
     def reset(self):
         """Resets controller internal states and distributions."""
         self.engine.reset()
+
+    @staticmethod
+    def _gripper_action(robot_state: drema_comm_pb2.RobotState) -> float:
+        """The keyframe gripper command when the environment sends one, otherwise the measured state (no change)."""
+        if robot_state.HasField('gripper_command'):
+            return float(robot_state.gripper_command)
+        return float(robot_state.gripper_open)
 
     @staticmethod
     def _quat_to_rot_matrix(x: float, y: float, z: float, w: float) -> np.ndarray:

@@ -332,12 +332,22 @@ class DremaGrpcClient:
         reachability_radius: float = 0.95,
         timeout: float = 0.5,
         blocking: bool = True,
-        approach_funnel: Optional[bool] = None
+        approach_funnel: Optional[bool] = None,
+        gripper_command: Optional[float] = None,
+        ignore_collisions: Optional[bool] = None,
+        keyframe_index: int = 0,
+        target_in_tip_frame: bool = False,
+        roles_revision: int = 0,
+        role_assignments: Optional[List[Any]] = None,
+        yaw_symmetric: bool = False
     ) -> drema_comm_pb2.ControlAction:
         """
         Queries the MPC controller for the next joint velocity command.
 
         :param approach_funnel: Enables / disables the approach cone on this target; None leaves the server default (enabled).
+        :param gripper_command / ignore_collisions: Active keyframe flags (PerAct action layout); None = not sent.
+        :param target_in_tip_frame: target_pose orientation is a Panda_tip orientation (RLBench / PerAct).
+        :param role_assignments: drema.roles.RoleAssignment snapshot of the environment, with its revision.
         :param timeout: Blocking mode: RPC deadline. Non-blocking mode: how long to wait for a just-sent
                         request before falling back to the most recent fresh action.
         :param blocking: If True, waits up to `timeout` for the action solved on this state (lockstep).
@@ -360,6 +370,17 @@ class DremaGrpcClient:
         )
         if approach_funnel is not None:
             state.approach_funnel = bool(approach_funnel)
+        if gripper_command is not None:
+            state.gripper_command = float(gripper_command)
+        if ignore_collisions is not None:
+            state.ignore_collisions = bool(ignore_collisions)
+        state.keyframe_index = int(keyframe_index)
+        state.target_frame = drema_comm_pb2.FRAME_TIP if target_in_tip_frame else drema_comm_pb2.FRAME_FLANGE
+        state.roles_revision = int(roles_revision)
+        if role_assignments:
+            state.role_assignments.extend(a.to_proto(drema_comm_pb2) for a in role_assignments)
+        if yaw_symmetric:
+            state.yaw_symmetric = True
         if not blocking:
             return self._request_action_async(state, timeout, len(joint_positions), gripper_open)
 

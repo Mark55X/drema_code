@@ -48,14 +48,16 @@ perception:
     workspace_margin: 0.05           # Lateral safety expansion margin for workspace TSDF bounds in meters
     table_thickness: 0.05            # Estimated vertical thickness below tabletop surface in meters
     table_bounds_fallback: [-0.50, 1.10, -0.55, 0.55] # Fallback horizontal table bounds [xmin, xmax, ymin, ymax]
-    # Semantic keyword filters for CoppeliaSim object classification
+    # Semantic keyword filters for CoppeliaSim object classification. Physical task objects are kept whatever their
+    # name (RLBench calls the object to manipulate "*_target"); only non-physical helpers are virtual: name visual-only
+    # markers "*_marker" to keep them out of the reconstruction.
     robot_keywords: ["panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"]
     background_keywords: [
       "workspace", "table", "floor", "wall", "ceiling", "pillar",
       "sensor", "success", "camera", "head", "waypoint", "detector",
-      "target", "goal", "marker", "dummy"
+      "marker", "dummy"
     ]
-    virtual_keywords: ["target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"]
+    virtual_keywords: ["marker", "dummy", "waypoint", "detector", "sensor", "success"]
 
   # Online Raycast Pruning & VDC Mapping
   mapping:
@@ -172,6 +174,36 @@ controller:
   evade_imminent_distance: 0.06      # Immediate physical proximity margin triggering evasion [m]
   evade_retreat_speed: 0.15          # Linear retreat speed for evasive maneuvers [m/s]
   evade_lift_speed: 0.12             # Upward vertical lift component for evade_over [m/s]
+
+# ------------------------------------------------------------------------------
+# 5a. Object roles (drema/roles): which objects the robot may touch, grasp and carry
+# ------------------------------------------------------------------------------
+# Permissions come from the environment (configs/roles_env.yaml: config rules, VLM, human). Only a human may
+# relax (TOUCH); CONFIG / VLM may only restrict (AVOID / FRAGILE). Without assignments every object is an obstacle.
+# Each mechanism has its own switch; with everything off the server behaves as before the roles existed.
+roles:
+  enabled: true                      # Master switch: false = every object is an obstacle, nothing is ever held
+  verbose: true
+  yaw_symmetry: true                 # Tip-frame keyframes may be turned by 180 deg about the gripper axis when easier to reach
+  permissions:                       # Permissions sent by the environment (roles_env.yaml)
+    enabled: true
+  touch_exempts_arm: false           # A human TOUCH also lets the arm links (not only hand and fingers) touch the object
+  fragile_extra_margin: 0.03         # Extra clearance [m] around FRAGILE objects
+  policy_contact:                    # Keyframe policy (PerAct / task keyframes) contact: hand only, active keyframe only
+    enabled: true
+    on_grasp_keyframes: true         # Gripper commanded closed at the keypose: the hand may enclose the objects there (TARGET)
+    on_approach_keyframes: true      # ignore_collisions with the gripper open: the hand may come close to them (NEAR)
+    radius: 0.05                     # Objects whose surface is within this distance [m] of the keypose TCP
+    include_table: true              # The table becomes touchable by the hand when it lies at the keypose
+    near_margin: 0.03                # NEAR: hand margin reduced by this [m]
+  grasp:                             # Held state: closed gripper + touchable object at the TCP -> attached in the twin
+    enabled: true
+    radius: 0.04                     # Max object surface distance [m] from the TCP to attach it
+    closed_threshold: 0.9            # Below this the fingers count as closed; wider grasps are detected from the finger motion stopping
+    open_threshold: 0.9              # Commanded release completes above this open amount (or once the fingers open 2% from the grasp)
+    settle_steps: 3                  # Consecutive control requests with the gripper closed before attaching
+    released_state: true             # A released object stays touchable by the hand until the TCP is release_clearance away
+    release_clearance: 0.03          # [m]
 
 # ------------------------------------------------------------------------------
 # 5b. Visualization of the MPC imagination (drema/visualization), off by default

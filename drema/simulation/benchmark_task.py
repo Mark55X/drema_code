@@ -68,9 +68,9 @@ def build_twin(backend: str, cfg: Any, offsets):
 def run_episode(env: Any, task: Any, backend: str, mode: str, seed: int, args: Any, cfg: Any) -> Dict[str, Any]:
     from pyrep.objects.shape import Shape
     from pyrep.backend import sim
+    from drema.client import JointCommandExecutor, KeyframeSequencer, RLBenchGripperController, TaskKeyframeSource
     from drema.communication.proto import drema_comm_pb2 as pb2
     from drema.controller.mpc_controller import MPCController
-    import run_coppelia_client as rc
 
     np.random.seed(seed)
     rng = np.random.default_rng(seed)
@@ -98,8 +98,11 @@ def run_episode(env: Any, task: Any, backend: str, mode: str, seed: int, args: A
     twin.spawn_scanned_table(args.table_z, bounds=tuple(args.table_bounds))
     twin.spawn_scanned_mesh_obstacle(args.mesh, tuple(tunnel.get_position()), obj_id=84, name="tunnel_obstacle")
     controller = MPCController.from_config(cfg.get_nested("controller", {}), twin, offsets)
-    client = rc.CoppeliaSimulationClient.__new__(rc.CoppeliaSimulationClient)
-    client.keyframe_idx, client.keyframe_label, client.keyframe_funnel = 0, "", None
+    # Same keyframe sequencing, gripper and arm actuation as run_coppelia_client.py
+    sequencer = KeyframeSequencer(TaskKeyframeSource(t_inst), log=lambda m: None)
+    gripper_ctrl = RLBenchGripperController(task._robot, t_inst)
+    actuator = JointCommandExecutor(arm, args.actuation, dt=pyrep.get_simulation_timestep())
+    actuator.reset()
     base = np.array(arm.joints[0].get_position()) - [0.0, 0.0, 0.333]
     dt = args.dt
 
@@ -124,7 +127,10 @@ def run_episode(env: Any, task: Any, backend: str, mode: str, seed: int, args: A
             q = list(arm.get_joint_positions())
             qd = list(arm.get_joint_velocities())
             ee_pose = list(tip.get_pose())
-            target_pose = client._active_keyframe_pose(t_inst.get_keyframes(), ee_pose)
+            sequencer.current(lambda: None)
+            sequencer.step(ee_pose, gripper_ctrl)
+            kf = sequencer.current(lambda: None)
+            target_pose = list(kf.pose)
             if not robot_loaded:
                 twin.load_robot(tuple(base), joint_positions=q)
                 robot_loaded = True
@@ -134,15 +140,19 @@ def run_episode(env: Any, task: Any, backend: str, mode: str, seed: int, args: A
             state = pb2.RobotState(timestep=step, joint_positions=q, joint_velocities=qd, ee_pose=ee_pose,
                                    task_active=True, target_available=True, target_pose=target_pose,
                                    robot_base_pos=list(base), gripper_open=float(gripper.get_open_amount()[0]))
-            if client.keyframe_funnel is not None:
-                state.approach_funnel = bool(client.keyframe_funnel)
+            if kf.approach_funnel is not None:
+                state.approach_funnel = bool(kf.approach_funnel)
             t0 = time.perf_counter()
             action = controller.compute_action(robot_state=state, target_goal=np.asarray(target_pose[:3], np.float32))
             solve_ms.append((time.perf_counter() - t0) * 1000.0)
             rec['safety_stops'] += int(action.safety_stop)
-            arm.set_joint_target_velocities([0.0] * 7 if action.safety_stop else list(action.joint_velocities))
+            if action.safety_stop:
+                actuator.hold()
+            else:
+                actuator.apply(action.joint_velocities)
         else:
-            arm.set_joint_target_velocities([0.0] * 7)
+            actuator.hold()
+        gripper_ctrl.step()
         t_inst.step()
         pyrep.step()
 
@@ -163,7 +173,7 @@ def run_episode(env: Any, task: Any, backend: str, mode: str, seed: int, args: A
     twin.shutdown()
     final_err = float(np.linalg.norm(np.asarray(tip.get_position()) - np.asarray(t_inst.target.get_position())))
     return dict(
-        backend=backend, mode=mode, seed=seed,
+        backend=backend, mode=mode, seed=seed, actuation=args.actuation,
         success=int(rec['success_step'] is not None),
         time_to_success_s=(rec['success_step'] * dt) if rec['success_step'] is not None else np.nan,
         min_clearance_cm=rec['min_clearance'] * 100.0,
@@ -223,6 +233,8 @@ def main() -> None:
     parser.add_argument("--rot_noise_deg", type=float, default=2.0, help="Perceived orientation noise std [deg]")
     parser.add_argument("--table_z", type=float, default=0.749)
     parser.add_argument("--table_bounds", type=float, nargs=4, default=[-0.482, 0.691, -0.549, 0.549])
+    parser.add_argument("--actuation", default="position", choices=["position", "velocity"],
+                        help="Arm actuation, as in run_coppelia_client.py --actuation")
     parser.add_argument("--headless", action="store_true", default=True)
     parser.add_argument("--out", default="logs/task_benchmark", help="Output prefix (.csv per episode, .md summary)")
     args = parser.parse_args()

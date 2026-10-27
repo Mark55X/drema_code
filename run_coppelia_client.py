@@ -13,6 +13,7 @@ Controls the simulation environment:
 import os
 import sys
 import time
+import queue
 import argparse
 import threading
 import numpy as np
@@ -24,6 +25,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 
 from drema.communication.grpc_client import DremaGrpcClient
 from drema.visualization.sim_recorder import SimVideoRecorder, showcase_view
+from drema.config import load_config
+from drema.client import (JointCommandExecutor, KeyframeSequencer, PolicyKeyframeSource, RLBenchGripperController,
+                          StaticKeyframeSource, TaskKeyframeSource, keyframes_from_demo)
+from drema.roles.providers import ConfigRoleProvider, HumanRoleProvider, RoleManager, VLMSafetyProvider
+from drema.roles.set_of_marks import draw_marks
+from drema.roles.vlm import SceneObject, build_vlm_backend
 
 try:
     from rlbench.environment import Environment
@@ -68,9 +75,29 @@ class CoppeliaSimulationClient:
         record_every: int = 1,
         record_fov: Optional[float] = None,
         record_eye: Optional[List[float]] = None,
-        record_look_at: Optional[List[float]] = None
+        record_look_at: Optional[List[float]] = None,
+        roles_config: Optional[str] = "configs/roles_env.yaml",
+        keyframes: str = "auto",
+        policy: Optional[str] = None,
+        actuation: str = "position"
     ):
+        """
+        :param roles_config: Environment-side object roles (providers on/off, VLM endpoint); None disables them.
+        :param keyframes: Keyframe source: 'task' (Task.get_keyframes), 'demo' (RLBench demo keyposes found with
+                          PerAct's keypoint discovery), 'policy' (--policy), 'none', or 'auto'.
+        :param policy: External keyframe policy 'module:function' (e.g. a PerAct wrapper), see PolicyKeyframeSource.
+        :param actuation: How the MPC joint velocities reach the arm, see drema.client.actuation.
+        """
         self.server_address = server_address
+        self.keyframe_mode = keyframes
+        self.policy_spec = policy
+        self.actuation_mode = actuation
+        self.actuator: Optional[JointCommandExecutor] = None
+        self.sequencer: Optional[KeyframeSequencer] = None
+        self.gripper_ctrl: Optional[RLBenchGripperController] = None
+        self.semantic_labels: Dict[str, int] = {}
+        self.task_description = ""
+        self._init_roles(roles_config)
         self.task_name = task_name
         self.sync_mode = sync_mode.lower()
         self.headless = headless
@@ -93,9 +120,7 @@ class CoppeliaSimulationClient:
         self.step_counter = 0
         self.sim_steps = 0
         self.active_actions_count = 0
-        self.keyframe_idx = 0
         self.keyframe_label = ""
-        self.keyframe_funnel = None
         self._reset_requested = False
         self.server_connected = False
         self.initial_scan_done = False
@@ -140,6 +165,9 @@ class CoppeliaSimulationClient:
         # Every loop iteration advances CoppeliaSim by exactly one physics step, so the
         # simulated clock (not the wall clock) is the time base for commands and timestamps.
         self.sim_dt = float(self.env._pyrep.get_simulation_timestep())
+        self.actuator = JointCommandExecutor(self.task._robot.arm, self.actuation_mode, dt=self.sim_dt)
+        self.actuator.reset()
+        print(f"[CoppeliaClient] Arm actuation: {self.actuation_mode}")
         if self.ctrl_fps is None:
             self.ctrl_fps = 1.0 / self.sim_dt
         self.ctrl_period = 1.0 / self.ctrl_fps
@@ -261,21 +289,7 @@ class CoppeliaSimulationClient:
                 if (step_idx + 1) % 10 == 0:
                     print(f"[CoppeliaClient Scan] Captured {(step_idx + 1) * 4}/{num_steps * 4} views...")
 
-            # Extract semantic labels from CoppeliaSim scene shapes
-            from pyrep.backend import sim
-            from pyrep.objects.shape import Shape
-            handles = sim.simGetObjectsInTree(sim.sim_handle_scene, sim.sim_object_shape_type, 0)
-            semantic_labels = {}
-            filter_names = ["DefaultCamera", "ResizableFloor", "Floor", "Wall", "Ceiling"]
-            for h in handles:
-                try:
-                    name = Shape(h).get_name()
-                    if any(f in name for f in filter_names):
-                        continue
-                    semantic_labels[name] = int(h)
-                except Exception:
-                    pass
-
+            semantic_labels = self._scene_shape_labels()
             print(f"[CoppeliaClient Scan] Extracted {len(semantic_labels)} semantic labels from CoppeliaSim scene.")
 
             # Retrieve real robot base position and initial joint positions
@@ -301,6 +315,7 @@ class CoppeliaSimulationClient:
             if res and res.initial_scan_ready:
                 print(f"\n✓ [CoppeliaClient] 360° orbital scan complete! All {len(all_scan_cameras)} views sent. DREMA scene populated.")
                 self.initial_scan_done = True
+                self._on_scene_ready()
                 return True
             else:
                 print(f"\n❌ [CoppeliaClient Error] DREMA server failed to acknowledge initial scan (status: {res})!")
@@ -360,12 +375,17 @@ class CoppeliaSimulationClient:
             task_cls = ReachTargetMovingCube
         else:
             from rlbench import tasks
-            task_cls = getattr(tasks, self.task_name)
+            task_cls = getattr(tasks, self.task_name, None)
+            if not isinstance(task_cls, type):
+                # snake_case task file name, as in the RLBench / PerAct task lists (e.g. close_jar)
+                from rlbench.backend.utils import task_file_to_task_class
+                task_cls = task_file_to_task_class(self.task_name)
 
         self.task = self.env.get_task(task_cls)
         descriptions, self.current_obs = self.task.reset()
         print(f"✓ Loaded RLBench Task: {self.task_name}")
         print(f"  Task description: {descriptions[0]}")
+        self.task_description = descriptions[0]
 
         # Cache sensor references from scene
         scene = self.task._scene
@@ -380,6 +400,144 @@ class CoppeliaSimulationClient:
             'overhead': getattr(scene, '_cam_overhead_mask', None)
         }
 
+        self.gripper_ctrl = RLBenchGripperController(self.task._robot, self.task._task)
+        self.semantic_labels = self._scene_shape_labels()
+        self._prepare_keyframes()
+
+    def _scene_shape_labels(self) -> Dict[str, int]:
+        """CoppeliaSim shape name -> handle; handles are the object ids shared with perception and the roles."""
+        from pyrep.backend import sim
+        from pyrep.objects.shape import Shape
+        handles = sim.simGetObjectsInTree(sim.sim_handle_scene, sim.sim_object_shape_type, 0)
+        labels = {}
+        filter_names = ["DefaultCamera", "ResizableFloor", "Floor", "Wall", "Ceiling"]
+        for h in handles:
+            try:
+                name = Shape(h).get_name()
+                if any(f in name for f in filter_names):
+                    continue
+                labels[name] = int(h)
+            except Exception:
+                pass
+        self.semantic_labels = labels
+        return labels
+
+    def _prepare_keyframes(self) -> None:
+        """Builds the keyframe sequencer for the current episode (a demo source re-records its demo each episode)."""
+        task_inst = getattr(self.task, '_task', self.task)
+        mode = self.keyframe_mode
+        if mode == "auto":
+            mode = "policy" if self.policy_spec else ("task" if hasattr(task_inst, 'get_keyframes') else "none")
+
+        if mode == "task":
+            source = TaskKeyframeSource(task_inst)
+        elif mode == "demo":
+            demo = None
+            for attempt in range(3):
+                try:
+                    # The RLBench fork calls callable_each_step(reset=True) after a failed attempt: it must not be None.
+                    demo = self.task.get_demos(1, live_demos=True, callable_each_step=lambda *a, **k: None)[0]
+                    break
+                except Exception as e:
+                    print(f"[CoppeliaClient] [Warning] Demo recording failed (attempt {attempt + 1}/3): {e}")
+            if demo is None:
+                raise RuntimeError(f"Could not record a demo for task '{self.task_name}'")
+            frames = keyframes_from_demo(demo)
+            descriptions, self.current_obs = self.task.reset_to_demo(demo)
+            self.task_description = descriptions[0]
+            print(f"[CoppeliaClient] Demo keyframes (PerAct keypoint discovery): {len(frames)} -> "
+                  + ", ".join(f"{k.name}[grip={'open' if k.gripper_open else 'close'}"
+                              f"{', ignore_coll' if k.ignore_collisions else ''}]" for k in frames))
+            source = StaticKeyframeSource(frames)
+        elif mode == "policy":
+            source = PolicyKeyframeSource.load(self.policy_spec, self)
+        else:
+            self.sequencer = None
+            return
+        self.sequencer = KeyframeSequencer(source, log=lambda m: print(f"[COPPELIA ENVIRONMENT] >>> {m}"))
+
+    def observe(self) -> Any:
+        """Current RLBench Observation (for keyframe policies such as PerAct)."""
+        return self.task._scene.get_observation()
+
+    # -------------------------------------------------------------------------
+    # Object roles (environment side)
+    # -------------------------------------------------------------------------
+
+    def _init_roles(self, roles_config: Optional[str]) -> None:
+        self.role_manager = RoleManager()
+        self._role_requests: "queue.Queue[Tuple[str, Any]]" = queue.Queue()
+        self.config_roles = self.vlm_safety = self.human_roles = None
+        self.roles_cfg: Dict[str, Any] = {}
+        self._last_vlm_safety = 0.0
+        if not roles_config:
+            return
+        cfg = load_config(roles_config).get("roles", {}) if os.path.exists(roles_config) else {}
+        if not cfg:
+            print(f"[CoppeliaClient] [Notice] Roles config '{roles_config}' not found: environment roles disabled.")
+            return
+        if not bool(cfg.get("enabled", True)):
+            return
+        self.roles_cfg = cfg
+        log = lambda m: print(f"[ROLES] {m}")
+        vlm_cfg = cfg.get("vlm", {}) or {}
+        human_cfg = cfg.get("human", {}) or {}
+        vlm_on = bool(vlm_cfg.get("enabled", False))
+        backend = build_vlm_backend(vlm_cfg) if vlm_on else None
+        if bool(cfg.get("config_provider", {}).get("enabled", True)):
+            self.config_roles = ConfigRoleProvider(cfg.get("config_provider", {}).get("rules", []) or [],
+                                                   self.role_manager, log)
+        if vlm_on and bool(cfg.get("vlm_safety", {}).get("enabled", False)):
+            self.vlm_safety = VLMSafetyProvider(backend, self.role_manager, log)
+        if bool(human_cfg.get("enabled", True)):
+            self.human_roles = HumanRoleProvider(backend if bool(human_cfg.get("use_vlm", True)) else None,
+                                                 self.role_manager, float(human_cfg.get("min_confidence", 0.7)),
+                                                 str(human_cfg.get("confirm_relax", "uncertain")), log)
+        print(f"[CoppeliaClient] Object roles: config={'on' if self.config_roles else 'off'}, "
+              f"vlm_safety={'on' if self.vlm_safety else 'off'}, human={'on' if self.human_roles else 'off'} "
+              f"(VLM backend: {vlm_cfg.get('backend', 'keyword') if backend else 'none'})")
+
+    def _scene_objects(self) -> List[SceneObject]:
+        """Objects offered to the VLM: those the server tracks when known, else the non-excluded scene shapes."""
+        names = {h: n for n, h in self.semantic_labels.items()}
+        if self.role_manager.server_status:
+            return [SceneObject(h, names.get(h, f"object_{h}")) for h in sorted(self.role_manager.server_status)]
+        exclude = [k.lower() for k in self.roles_cfg.get("exclude_keywords", [])]
+        return [SceneObject(h, n) for n, h in sorted(self.semantic_labels.items(), key=lambda kv: kv[1])
+                if not any(k in n.lower() for k in exclude)]
+
+    def _vlm_image(self, objects: List[SceneObject]) -> Optional[np.ndarray]:
+        cam = str(self.roles_cfg.get("vlm", {}).get("camera", "front"))
+        data = self.capture_camera_data().get(cam)
+        if data is None:
+            return None
+        return draw_marks(data['rgb'], data.get('mask'), [o.object_id for o in objects])
+
+    def _on_scene_ready(self) -> None:
+        objects = self._scene_objects()
+        if self.config_roles is not None:
+            self.config_roles.apply(objects)
+        if self.vlm_safety is not None and bool(self.roles_cfg.get("vlm_safety", {}).get("on_scan", True)):
+            self._role_requests.put(("safety", None))
+
+    def _process_role_requests(self) -> None:
+        """Runs on the simulation thread: camera captures must not be issued from the CLI thread."""
+        period = float(self.roles_cfg.get("vlm_safety", {}).get("period_s", 0) or 0)
+        if self.vlm_safety is not None and self.task_active and period > 0 and time.time() - self._last_vlm_safety > period:
+            self._role_requests.put(("safety", None))
+        while True:
+            try:
+                kind, payload = self._role_requests.get_nowait()
+            except queue.Empty:
+                return
+            objects = self._scene_objects()
+            image = self._vlm_image(objects) if objects else None
+            if kind == "safety" and self.vlm_safety is not None:
+                self._last_vlm_safety = time.time()
+                self.vlm_safety.request(objects, image, self.task_description)
+            elif kind == "say" and self.human_roles is not None:
+                self.human_roles.submit_message(payload, objects, image, self.task_description)
+
     def _cli_listener(self):
         """CLI thread listening for interactive commands."""
         time.sleep(0.5)
@@ -390,14 +548,23 @@ class CoppeliaSimulationClient:
         print("    'stop'  (or 'pause')     -> Halt robot motion     ")
         print("    'reset'                  -> Reset episode         ")
         print("    'quit'  (or 'exit')      -> Exit simulation       ")
+        print("  Object roles:                                       ")
+        print("    'say <text>'             -> Tell the robot about an object (VLM)")
+        print("    'yes' / 'no'             -> Confirm / cancel a pending permission")
+        print("    'role <id> <touch|avoid|fragile|clear>'           ")
+        print("    'roles'                  -> Show object roles     ")
+        print("    'vlm'                    -> Run the VLM safety check now")
         print("=======================================================\n")
 
         while self.running:
             try:
-                cmd = sys.stdin.readline()
-                if not cmd:
+                raw = sys.stdin.readline()
+                if not raw:
                     break
-                cmd = cmd.strip().lower()
+                raw = raw.strip()
+                cmd = raw.lower()
+                if self._handle_role_command(raw, cmd):
+                    continue
 
                 if cmd in ['start', 'run']:
                     self.task_active = True
@@ -422,6 +589,44 @@ class CoppeliaSimulationClient:
                     print(f"[COPPELIA ENVIRONMENT] Unknown command '{cmd}'. Type 'start', 'stop', 'reset', or 'quit'.")
             except Exception:
                 break
+
+    def _handle_role_command(self, raw: str, cmd: str) -> bool:
+        """Console commands about object roles; returns True when the line was one of them."""
+        names = {h: n for n, h in self.semantic_labels.items()}
+        word = cmd.split(" ", 1)[0]
+        if word == "say":
+            text = raw.split(" ", 1)[1] if " " in raw else ""
+            if self.human_roles is None:
+                print("[ROLES] Human role provider disabled (configs/roles_env.yaml: roles.human.enabled)")
+            elif text:
+                self._role_requests.put(("say", text))
+            return True
+        if cmd in ("yes", "y", "no", "n"):
+            if self.human_roles is None:
+                return False
+            self.human_roles.confirm(cmd in ("yes", "y"))
+            return True
+        if word == "role":
+            parts = cmd.split()
+            if self.human_roles is None or len(parts) != 3 or not parts[1].lstrip("-").isdigit() \
+                    or parts[2] not in ("touch", "avoid", "fragile", "clear"):
+                print("[ROLES] Usage: role <id> <touch|avoid|fragile|clear>  (ids: 'roles')")
+            else:
+                # An exact id typed by the operator needs no grounding, hence no confirmation.
+                self.human_roles.apply(int(parts[1]), parts[2], names, reason="console")
+            return True
+        if cmd == "roles":
+            print("[ROLES] Scene objects offered to the VLM: "
+                  + ", ".join(f"{o.object_id}={o.name}" for o in self._scene_objects()))
+            print(self.role_manager.describe(names))
+            return True
+        if cmd == "vlm":
+            if self.vlm_safety is None:
+                print("[ROLES] VLM safety provider disabled (configs/roles_env.yaml: roles.vlm_safety.enabled)")
+            else:
+                self._role_requests.put(("safety", None))
+            return True
+        return False
 
     def capture_camera_data(self):
         """Extracts RGB, Depth, Extrinsics, Intrinsics, and Masks from all vision sensors."""
@@ -475,36 +680,6 @@ class CoppeliaSimulationClient:
                     return cam_dict
                 continue
         return cam_dict
-
-    @staticmethod
-    def _quat_z_axis(quat_xyzw) -> np.ndarray:
-        x, y, z, w = quat_xyzw
-        return np.array([2.0 * (x * z + w * y), 2.0 * (y * z - w * x), 1.0 - 2.0 * (x * x + y * y)])
-
-    def _active_keyframe_pose(self, keyframes: List[dict], ee_pose: List[float]) -> List[float]:
-        """
-        Keyframe sequencing (next-best-pose scheme, as a keyframe policy like PerAct would drive it):
-        the MPC tracks the active keyframe; once the tip is within its position tolerance and the gripper
-        axis within its approach tolerance, the next keyframe becomes active. The last one is held.
-        Panda_tip shares its z-axis with the flange, so the axis check needs no frame conversion.
-        The keyframe's optional 'approach_funnel' flag is exposed in self.keyframe_funnel (None = server default).
-        """
-        self.keyframe_idx = min(self.keyframe_idx, len(keyframes) - 1)
-        active = keyframes[self.keyframe_idx]
-        if self.keyframe_idx < len(keyframes) - 1 and len(ee_pose) >= 7:
-            pos_err = float(np.linalg.norm(np.asarray(ee_pose[:3]) - np.asarray(active['pose'][:3])))
-            axis_err = 0.0
-            if len(active['pose']) >= 7:
-                cos_axis = float(np.dot(self._quat_z_axis(ee_pose[3:7]), self._quat_z_axis(active['pose'][3:7])))
-                axis_err = float(np.degrees(np.arccos(np.clip(cos_axis, -1.0, 1.0))))
-            if pos_err <= active.get('position_tolerance', 0.02) and axis_err <= active.get('approach_tolerance_deg', 10.0):
-                print(f"[COPPELIA ENVIRONMENT] >>> Keyframe '{active.get('name', self.keyframe_idx)}' reached "
-                      f"(pos err {pos_err*100:.1f} cm, axis err {axis_err:.1f} deg) -> next keyframe")
-                self.keyframe_idx += 1
-                active = keyframes[self.keyframe_idx]
-        self.keyframe_label = f"{active.get('name', self.keyframe_idx)} ({self.keyframe_idx + 1}/{len(keyframes)})"
-        self.keyframe_funnel = active.get('approach_funnel')
-        return list(active['pose'])
 
     def get_calibrated_robot_base_pos(self) -> List[float]:
         """
@@ -560,6 +735,8 @@ class CoppeliaSimulationClient:
         # If server is already online at launch, perform initial scan if needed
         if self.server_connected and not self.initial_scan_done:
             self.perform_initial_scan(num_steps=self.scan_steps)
+        elif self.initial_scan_done:
+            self._on_scene_ready()
 
         try:
             while self.running:
@@ -572,7 +749,6 @@ class CoppeliaSimulationClient:
                     self.step_counter = 0
                     self.sim_steps = 0
                     self.active_actions_count = 0
-                    self.keyframe_idx = 0
                     self.initial_scan_done = False
                     if self.server_connected:
                         try:
@@ -580,6 +756,11 @@ class CoppeliaSimulationClient:
                         except Exception:
                             pass
                     descriptions, self.current_obs = self.task.reset()
+                    self.task_description = descriptions[0]
+                    self.role_manager.reset()
+                    self._prepare_keyframes()
+                    self.gripper_ctrl.reset()
+                    self.actuator.reset()
                     print("\n[COPPELIA ENVIRONMENT] >>> EPISODE RESET COMPLETE! Re-scanning initial scene...\n")
                     if self.server_connected:
                         self.perform_initial_scan(num_steps=self.scan_steps)
@@ -598,6 +779,7 @@ class CoppeliaSimulationClient:
                             if status == "SCAN_READY":
                                 print("✓ [CoppeliaClient] DREMA server already has scene initialized! Ready for dynamic streaming.\n")
                                 self.initial_scan_done = True
+                                self._on_scene_ready()
                             elif not self.initial_scan_done:
                                 self.perform_initial_scan(num_steps=self.scan_steps)
                     else:
@@ -641,15 +823,31 @@ class CoppeliaSimulationClient:
                         break
                     continue
 
+                self._process_role_requests()
+
                 target_pose = []
                 target_available = False
                 approach_funnel = None
+                gripper_command = None
+                ignore_collisions = None
+                target_in_tip_frame = False
                 task_inst = getattr(self.task, '_task', self.task)
-                if hasattr(task_inst, 'get_keyframes'):
+                if self.sequencer is not None:
                     try:
-                        target_pose = self._active_keyframe_pose(task_inst.get_keyframes(), ee_pose)
-                        approach_funnel = self.keyframe_funnel
-                        target_available = True
+                        kf = self.sequencer.current(self.observe)
+                        if kf is not None:
+                            if self.task_active:
+                                self.sequencer.step(ee_pose, self.gripper_ctrl)
+                                kf = self.sequencer.current(self.observe)
+                            target_pose = list(kf.pose)
+                            approach_funnel = kf.approach_funnel
+                            gripper_command = kf.gripper_open
+                            ignore_collisions = kf.contact_flag()
+                            target_in_tip_frame = kf.frame == "tip"
+                            target_available = True
+                            self.keyframe_label = (f"{kf.name} (#{self.sequencer.index + 1}"
+                                                   f"{', done' if self.sequencer.finished else ''}"
+                                                   f"{', gripper' if self.sequencer.phase == 'gripper' else ''})")
                     except Exception as e:
                         print(f"[CoppeliaClient] [Warning] Keyframe sequencing failed: {e}")
                         target_available = False
@@ -674,6 +872,7 @@ class CoppeliaSimulationClient:
 
                 # 3. Request Control Action from DREMA MPC Controller
                 if self.server_connected and self.task_active:
+                    roles_revision, role_assignments = self.role_manager.snapshot()
                     action = self.client.request_action(
                         timestep=self.step_counter,
                         joint_positions=q,
@@ -687,13 +886,21 @@ class CoppeliaSimulationClient:
                         reachability_radius=self.reachability_radius,
                         timeout=(2.0 if self.sync_mode == "stepped" else 0.5 * self.ctrl_period),
                         blocking=(self.sync_mode == "stepped"),
-                        approach_funnel=approach_funnel
+                        approach_funnel=approach_funnel,
+                        gripper_command=gripper_command,
+                        ignore_collisions=ignore_collisions,
+                        keyframe_index=self.sequencer.index if self.sequencer is not None else 0,
+                        target_in_tip_frame=target_in_tip_frame,
+                        yaw_symmetric=target_in_tip_frame,
+                        roles_revision=roles_revision,
+                        role_assignments=role_assignments
                     )
+                    self.role_manager.update_server_status(action.object_roles)
                     # 4. Actuate Robot
                     if not action.safety_stop and len(action.joint_velocities) == len(q):
-                        arm.set_joint_target_velocities(action.joint_velocities)
+                        self.actuator.apply(action.joint_velocities)
                     else:
-                        arm.set_joint_target_velocities([0.0] * len(q))
+                        self.actuator.hold()
 
                     self.active_actions_count += 1
                     if self.active_actions_count <= 3 or (self.log_interval_actions > 0 and self.active_actions_count % self.log_interval_actions == 0):
@@ -725,10 +932,10 @@ class CoppeliaSimulationClient:
                             if near_lims:
                                 print(f"   ↳ [LIMIT WARNING] {', '.join(near_lims)}")
                 else:
-                    # Hold position: zero target velocities
-                    arm.set_joint_target_velocities([0.0] * len(q))
+                    self.actuator.hold()
 
-                # 5. Advance Task and CoppeliaSim Physics Step
+                # 5. Advance gripper, Task and CoppeliaSim Physics Step
+                self.gripper_ctrl.step()
                 self.task._task.step()  # Moves oscillating tunnel obstacle
                 self.env._pyrep.step()
                 self.sim_steps += 1
@@ -739,7 +946,7 @@ class CoppeliaSimulationClient:
                 if self.task_active:
                     success, terminate = self.task._task.success()
                     if success:
-                        print(f"\n★ TASK SUCCESS ACHIEVED at step {self.step_counter}! Target touched cleanly.\n")
+                        print(f"\n★ TASK SUCCESS ACHIEVED at step {self.step_counter}! ({self.task_name})\n")
                         self.task_active = False
 
                 # 7. Synchronization timing
@@ -807,6 +1014,16 @@ def parse_args():
     parser.add_argument("--record_resolution", type=int, nargs=2, default=[960, 540], metavar=("WIDTH", "HEIGHT"),
                         help="Recording resolution (default: 960 540)")
     parser.add_argument("--record_every", type=int, default=1, help="Record every N simulation steps (default: 1)")
+    parser.add_argument("--roles_config", type=str, default="configs/roles_env.yaml",
+                        help="Environment-side object roles config ('' disables config / VLM / human providers)")
+    parser.add_argument("--keyframes", type=str, default="auto", choices=["auto", "task", "demo", "policy", "none"],
+                        help="Keyframe source: task keyframes, RLBench demo keyposes (PerAct keypoint discovery), "
+                             "an external policy (--policy), or none (default: auto)")
+    parser.add_argument("--policy", type=str, default=None,
+                        help="External keyframe policy 'module:function' returning act(obs) -> PerAct action vector")
+    parser.add_argument("--actuation", type=str, default="position", choices=list(JointCommandExecutor.MODES),
+                        help="Arm actuation: 'position' integrates the MPC joint velocities into a joint reference "
+                             "(holds against gravity, default); 'velocity' sends raw joint velocity targets")
     return parser.parse_args()
 
 
@@ -836,6 +1053,10 @@ if __name__ == "__main__":
         record_every=args.record_every,
         record_fov=args.record_fov,
         record_eye=args.record_eye,
-        record_look_at=args.record_look_at
+        record_look_at=args.record_look_at,
+        roles_config=args.roles_config or None,
+        keyframes=args.keyframes,
+        policy=args.policy,
+        actuation=args.actuation
     )
     client.run()

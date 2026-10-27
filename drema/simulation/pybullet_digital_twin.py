@@ -321,7 +321,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 'color': col,
                 'canonical_position': initial_pos,
                 'target_pos': initial_pos,
-                'target_quat': initial_quat
+                'target_quat': initial_quat,
+                'is_target': bool(kwargs.get('is_target', False))
             }
 
             # Initialize 6-DoF tracking constraint immediately if in constraint mode
@@ -398,6 +399,77 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 p.resetJointState(self.robot_id, i, float(joint_positions[arm_j]) + offset)
                 arm_j += 1
 
+        if self.attachments and len(joint_positions) >= 7:
+            for obj_id, (pos, quat) in self.attached_poses(np.asarray(joint_positions[:7])).items():
+                self._place_held_object(obj_id, pos[0], quat[0], persistent=True)
+
+    # PyBullet link indices >= 7 are the flange, hand, fingers and grasp target, all rigid with link7.
+    HAND_LINK_MIN = 7
+
+    def _place_held_object(self, obj_id: int, pos: np.ndarray, quat_xyzw: np.ndarray, persistent: bool) -> None:
+        """Puts a held object at its TCP-attached pose; persistent also moves its tracking target."""
+        obj = self.tracked_objects.get(obj_id)
+        if obj is None:
+            return
+        pos_l = [float(x) for x in pos]
+        quat_l = [float(x) for x in quat_xyzw]
+        p.resetBasePositionAndOrientation(obj['body_id'], pos_l, quat_l)
+        if persistent:
+            obj['target_pos'] = tuple(pos_l)
+            obj['target_quat'] = tuple(quat_l)
+            cid = obj.get('constraint_id', -1)
+            if cid >= 0:
+                p.changeConstraint(cid, jointChildPivot=pos_l, jointChildFrameOrientation=quat_l,
+                                   maxForce=self.constraint_max_force)
+
+    def _set_robot_collision_with(self, body_id: int, enable: bool) -> None:
+        for link in range(-1, p.getNumJoints(self.robot_id)):
+            p.setCollisionFilterPair(self.robot_id, body_id, link, -1, int(enable))
+
+    def _on_attach(self, obj_id: int) -> None:
+        if self.robot_id >= 0 and obj_id in self.tracked_objects:
+            self._set_robot_collision_with(self.tracked_objects[obj_id]['body_id'], False)
+
+    def _on_detach(self, obj_id: int) -> None:
+        if self.robot_id >= 0 and obj_id in self.tracked_objects:
+            self._set_robot_collision_with(self.tracked_objects[obj_id]['body_id'], True)
+
+    @synchronized
+    def sync_gripper(self, open_amount: float) -> None:
+        if self.robot_id >= 0:
+            self._open_fingers(0.04 * float(np.clip(open_amount, 0.0, 1.0)))
+
+    def _collision_pairs(self, include_table: bool):
+        """
+        Bodies the robot must keep clear, according to the object policies:
+        - obstacles: (body_id, obj_id or -1 for the table, policy);
+        - held: [(body_id, obj_id)] held objects, checked as part of the hand.
+        """
+        obstacles, held = [], []
+        for obj_id, obj in self.tracked_objects.items():
+            body_id = obj.get('body_id', -1)
+            if body_id < 0:
+                continue
+            if obj_id in self.attachments:
+                held.append((body_id, obj_id))
+                continue
+            policy = self.object_policy(obj_id)
+            if policy.hand_contact and policy.arm_contact:
+                continue
+            obstacles.append((body_id, obj_id, policy))
+        if include_table and self.table_id >= 0:
+            obstacles.append((self.table_id, -1, self.table_policy))
+        return obstacles, held
+
+    def _robot_link_allowed(self, policy, link_a: int) -> bool:
+        return policy.pair_allowed(link_a >= self.HAND_LINK_MIN)
+
+    @staticmethod
+    def _query_margin(policy) -> float:
+        """Largest distance offset over the hand and arm pairs of an object (the closest-point query radius)."""
+        margins = [m for m in (policy.pair_margin(True), policy.pair_margin(False)) if m is not None]
+        return max(margins) if margins else 0.0
+
     @synchronized
     def sync_object_pose(
         self,
@@ -420,6 +492,11 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         body_id = obj_data['body_id']
         pos = (float(position[0]), float(position[1]), float(position[2]))
         orn = (float(orientation[0]), float(orientation[1]), float(orientation[2]), float(orientation[3]))
+
+        # A held object follows the TCP; perception (often occluded by the fingers) is kept for diagnostics only.
+        if obj_id in self.attachments:
+            obj_data['perceived_pos'] = pos
+            return
 
         obj_data['target_pos'] = pos
         obj_data['target_quat'] = orn
@@ -460,6 +537,14 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         return None
 
     @synchronized
+    def tracked_object_pose(self, obj_id: int):
+        # In constraint / PD mode the body only reaches its tracked pose after the next physics steps.
+        obj = self.tracked_objects.get(obj_id)
+        if obj is None or 'target_pos' not in obj:
+            return None
+        return tuple(float(x) for x in obj['target_pos']), tuple(float(x) for x in obj.get('target_quat', (0, 0, 0, 1)))
+
+    @synchronized
     def get_min_obstacle_distance(self) -> float:
         """
         Calculates the minimum clearance distance between the Franka Panda arm and
@@ -470,19 +555,15 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             return float('inf')
 
         min_distance = float('inf')
-
-        for obj_id, obj_data in self.tracked_objects.items():
-            body_id = obj_data['body_id']
-            contact_pts = p.getClosestPoints(
-                bodyA=self.robot_id,
-                bodyB=body_id,
-                distance=2.0
-            )
-
-            if contact_pts:
-                obj_min_d = min(pt[8] for pt in contact_pts)
-                if obj_min_d < min_distance:
-                    min_distance = obj_min_d
+        obstacles, held = self._collision_pairs(include_table=False)
+        for body_id, obj_id, policy in obstacles:
+            for pt in p.getClosestPoints(bodyA=self.robot_id, bodyB=body_id, distance=2.0):
+                if self._robot_link_allowed(policy, pt[3]):
+                    min_distance = min(min_distance, pt[8])
+            if policy.pair_allowed(True):
+                for held_body, _ in held:
+                    for pt in p.getClosestPoints(bodyA=held_body, bodyB=body_id, distance=2.0):
+                        min_distance = min(min_distance, pt[8])
 
         return float(min_distance)
 
@@ -585,33 +666,44 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             return []
 
         entries = []
-        for obj_id, obj in self.tracked_objects.items():
-            if obj.get('is_target', False) or obj.get('body_id', -1) < 0:
-                continue
+        obstacles, held = self._collision_pairs(include_table=False)
+        for body_id, obj_id, policy in obstacles:
             velocity = (0.0, 0.0, 0.0)
             if self.predictor is not None:
                 st = self.predictor.get_estimated_state(obj_id)
                 if st is not None:
                     velocity = tuple(float(x) for x in st['velocity'])
 
+            query = max(float(max_distance) + self._query_margin(policy), 1e-4)
+            # link_idx -> (closest point, distance shifted by the pair margin)
             closest_per_link: Dict[int, Any] = {}
-            for pt in p.getClosestPoints(bodyA=self.robot_id, bodyB=obj['body_id'], distance=float(max_distance)):
+            for pt in p.getClosestPoints(bodyA=self.robot_id, bodyB=body_id, distance=query):
                 # PyBullet link -1 is the fixed base (link0); 0..6 are link1..link7; flange, hand,
                 # fingers and grasp target are rigidly attached to link7.
-                if pt[3] < 0:
+                margin = policy.pair_margin(pt[3] >= self.HAND_LINK_MIN)
+                if pt[3] < 0 or margin is None:
                     continue
                 link_idx = min(pt[3] + 1, 7)
-                if link_idx not in closest_per_link or pt[8] < closest_per_link[link_idx][8]:
-                    closest_per_link[link_idx] = pt
+                d = float(pt[8]) - margin
+                if d < max_distance and (link_idx not in closest_per_link or d < closest_per_link[link_idx][1]):
+                    closest_per_link[link_idx] = (pt, d)
+            hand_margin = policy.pair_margin(True)
+            if hand_margin is not None:
+                # Held objects move with link7: their closest points count as link7 points.
+                for held_body, _ in held:
+                    for pt in p.getClosestPoints(bodyA=held_body, bodyB=body_id, distance=query):
+                        d = float(pt[8]) - hand_margin
+                        if d < max_distance and (7 not in closest_per_link or d < closest_per_link[7][1]):
+                            closest_per_link[7] = (pt, d)
 
-            for link_idx, pt in closest_per_link.items():
+            for link_idx, (pt, d) in closest_per_link.items():
                 normal = np.array(pt[7], dtype=np.float64)
                 entries.append({
                     'obj_id': obj_id,
                     'link_idx': link_idx,
                     'point_world': np.array(pt[5], dtype=np.float64),
                     'normal': normal / max(np.linalg.norm(normal), 1e-9),
-                    'distance': float(pt[8]),
+                    'distance': d,
                     'velocity': velocity
                 })
         return entries
@@ -712,18 +804,13 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             }
             return coll_p, coll_gvm
 
-        # Map body_id -> obj_id for dynamic obstacles
-        body_to_obj_id: Dict[int, int] = {}
-        obstacle_body_ids: List[int] = []
-        for obj_id, obj in self.tracked_objects.items():
-            if not obj.get('is_target', False) and obj.get('body_id', -1) >= 0:
-                b_id = obj['body_id']
-                obstacle_body_ids.append(b_id)
-                body_to_obj_id[b_id] = obj_id
-        # The table is static (no prediction, zero velocity); only the moving links can be penalized
-        # against it, since the fixed base link rests on its surface.
-        if self.table_in_collision_costs and self.table_id >= 0:
-            obstacle_body_ids.append(self.table_id)
+        # Obstacles allowed by the object policies (body_id -> obj_id for the tracked ones). The table is static
+        # (no prediction, zero velocity); only the moving links can be penalized against it, since the fixed base
+        # link rests on its surface. Held objects move with the TCP and are checked as part of the hand.
+        obstacles, held = self._collision_pairs(include_table=self.table_in_collision_costs)
+        obstacle_body_ids: List[int] = [b for b, _, _ in obstacles]
+        obstacle_policies = [pol for _, _, pol in obstacles]
+        body_to_obj_id: Dict[int, int] = {b: o for b, o, _ in obstacles if o >= 0}
 
         if not obstacle_body_ids:
             self.last_collision_timings = {
@@ -767,7 +854,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
 
         # Closest-point records, aggregated per (obstacle, robot link) as in Zhou et al. Eq. 10, 21:
         # the potential is evaluated per kinematic link instead of summing over dense mesh vertices.
-        n_links = num_j
+        # Each held object adds one extra "link" group after the robot links.
+        n_links = num_j + len(held)
+        n_eval = len(eval_steps)
+        held_poses = self.attached_poses(Q[:, eval_steps].reshape(-1, 7)) if held else {}
         rec_k: List[int] = []
         rec_e: List[int] = []
         rec_group: List[int] = []
@@ -799,19 +889,36 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 q_step = Q[k, h]
                 for arm_j, j_idx in enumerate(arm_joint_indices):
                     p.resetJointState(robot_id, j_idx, float(q_step[arm_j]) + self.joint_angle_offsets[arm_j])
+                for held_body, held_obj in held:
+                    pos_h, quat_h = held_poses[held_obj]
+                    self._place_held_object(held_obj, pos_h[k * n_eval + e], quat_h[k * n_eval + e], persistent=False)
 
                 for slot, obs_id in enumerate(obstacle_body_ids):
-                    closest_pts = p.getClosestPoints(bodyA=robot_id, bodyB=obs_id, distance=float(sigma_2))
-                    total_contact_pts += len(closest_pts)
-                    for pt in closest_pts:
-                        link_a = pt[3]
-                        if link_a < 0:
-                            continue  # fixed base link (link0): its distance cannot be changed by any control
+                    policy = obstacle_policies[slot]
+                    query = max(float(sigma_2) + self._query_margin(policy), 1e-4)
+                    hand_margin = policy.pair_margin(True)
+                    # (closest point, group link, velocity slot, pair margin): robot links, then held objects as hand parts
+                    candidates = []
+                    for pt in p.getClosestPoints(bodyA=robot_id, bodyB=obs_id, distance=query):
+                        margin = policy.pair_margin(pt[3] >= self.HAND_LINK_MIN)
+                        # fixed base link (link0): its distance cannot be changed by any control
+                        if pt[3] >= 0 and margin is not None:
+                            candidates.append((pt, pt[3], pt[3] if pt[3] < 7 else 7, margin))
+                    if hand_margin is not None:
+                        for h_idx, (held_body, _) in enumerate(held):
+                            candidates.extend(
+                                (pt, num_j + h_idx, 7, hand_margin)
+                                for pt in p.getClosestPoints(bodyA=held_body, bodyB=obs_id, distance=query))
+                    total_contact_pts += len(candidates)
+                    for pt, group_link, vel_slot, margin in candidates:
+                        # Per-pair margins shift the distance: FRAGILE objects farther, approach keyframes closer to the hand.
+                        if pt[8] - margin >= sigma_2:
+                            continue
                         rec_k.append(k)
                         rec_e.append(e)
-                        rec_group.append(slot * n_links + link_a)
-                        rec_slot.append(link_a if link_a < 7 else 7)
-                        rec_d.append(pt[8])
+                        rec_group.append(slot * n_links + group_link)
+                        rec_slot.append(vel_slot)
+                        rec_d.append(pt[8] - margin)
                         rec_normal.append(pt[7])
                         rec_v_obs.append(obs_vel[slot])
                         if record_points:
@@ -850,8 +957,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         for j_idx, (q_saved, qd_saved) in zip(arm_joint_indices, saved_arm_states):
             p.resetJointState(robot_id, j_idx, q_saved, qd_saved)
 
-        # Restore all dynamic obstacles to their current instantaneous state (t=0)
-        for b_id, o_id in body_to_obj_id.items():
+        # Restore all dynamic obstacles (and held objects) to their current instantaneous state (t=0)
+        for b_id, o_id in list(body_to_obj_id.items()) + held:
             if 'target_pos' in self.tracked_objects[o_id]:
                 p.resetBasePositionAndOrientation(
                     b_id,
@@ -874,6 +981,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
     @synchronized
     def reset(self):
         """Resets the Digital Twin for a new episode."""
+        self.attachments.clear()
+        self.object_policies = {}
         self.clear_dynamic_objects()
         if self.predictor is not None:
             self.predictor.reset()

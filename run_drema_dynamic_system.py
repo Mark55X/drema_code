@@ -39,6 +39,7 @@ from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
 from drema.perception.base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
+from drema.roles import ObjectRoleRegistry
 from drema.visualization import build_visualization_hub
 
 
@@ -72,6 +73,9 @@ class DremaDynamicSystem:
     Main Orchestrator coordinating Perception, Digital Twin simulation,
     MPC Control, and real-time visualization.
     """
+
+    # Joint-limit clearance [rad] below which an equivalent (180 deg) gripper yaw is preferred
+    YAW_MIN_LIMIT_MARGIN = 0.2
 
     def __init__(
         self,
@@ -223,6 +227,17 @@ class DremaDynamicSystem:
         self._last_action_time = 0.0
         self.mpc_controller = MPCController.from_config(ctrl_cfg, self.digital_twin, self.joint_angle_offsets)
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
+
+        # Object roles: environment permissions + keyframe policy contact + held objects -> twin collision policies
+        roles_cfg = config.get_nested("roles", {}) or {}
+        self.role_registry: Optional[ObjectRoleRegistry] = (
+            ObjectRoleRegistry.from_config(roles_cfg) if bool(roles_cfg.get("enabled", True)) else None
+        )
+        # Panda_tip orientation relative to the FrankaKinematics EE (flange) orientation, measured online
+        self._tip_offset_R: Optional[np.ndarray] = None
+        self._yaw_choice: Dict[int, bool] = {}
+        self.yaw_symmetry = bool(roles_cfg.get("yaw_symmetry", True))
+        print(f"[DREMA DYNAMIC SYSTEM] ✓ Object roles {'enabled' if self.role_registry else 'disabled'}.")
 
         # 3. Initialize Modular Perception Backend
         perc_mod_name = str(config.get_nested("perception.module", "vg_mapping_recurgs")).lower()
@@ -402,6 +417,9 @@ class DremaDynamicSystem:
         self.accumulated_scan_frames.clear()
         self.robot_joint_positions.clear()
         self.perception.reset()
+        if self.role_registry is not None:
+            self.role_registry.reset(self.digital_twin)
+        self._yaw_choice.clear()
         self.digital_twin.reset()
         with self._mpc_lock:
             self.mpc_controller.reset()
@@ -720,6 +738,11 @@ class DremaDynamicSystem:
         if len(robot_state.robot_base_pos) >= 3:
             self.robot_base_pos = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
 
+        # 0. Object roles: policies and held objects must be in place before the robot (and what it holds) is synced
+        if self.role_registry is not None:
+            self.role_registry.update(robot_state, self.digital_twin, self.mpc_controller.kinematics)
+        self.digital_twin.sync_gripper(robot_state.gripper_open)
+
         # 1. Update Digital Twin robot configuration
         needs_robot_load = (
             getattr(self.digital_twin, 'robot_id', -1) < 0
@@ -736,21 +759,27 @@ class DremaDynamicSystem:
         # 2. Step physics forward
         self.digital_twin.step()
 
-        # 3. Extract target goal
+        # 3. Extract target goal (orientation in the FrankaKinematics EE convention used by the MPC)
+        mpc_state = self._target_in_flange_frame(robot_state)
         target_goal = None
-        if robot_state.target_available and len(robot_state.target_pose) >= 3:
-            target_goal = np.array(robot_state.target_pose[:3], dtype=np.float32)
+        if mpc_state.target_available and len(mpc_state.target_pose) >= 3:
+            target_goal = np.array(mpc_state.target_pose[:3], dtype=np.float32)
 
         if self.visualization.active:
-            self.visualization.before_solve(robot_state)
+            self.visualization.before_solve(mpc_state)
 
         # 4. Compute control action via MPC Controller (Digital Twin accessed internally)
         action = self.mpc_controller.compute_action(
-            robot_state=robot_state,
+            robot_state=mpc_state,
             target_goal=target_goal
         )
         if self.visualization.active:
-            self.visualization.after_solve(robot_state, action)
+            self.visualization.after_solve(mpc_state, action)
+
+        if self.role_registry is not None:
+            action.object_roles.extend(self.role_registry.status_protos(drema_comm_pb2))
+            action.roles_revision_applied = self.role_registry.roles_revision
+            action.status_message = f"{action.status_message} | {self.role_registry.summary()}"
 
         if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
             print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
@@ -772,6 +801,65 @@ class DremaDynamicSystem:
                 print(f"  └─ [MPC TIMINGS] Coll: {t_info.get('coll_ms', 0.0):.1f}ms{cdet_str} | Rollouts: {t_info.get('samples_ms', 0.0):.1f}ms | Costs(FK): {t_info.get('cost_ms', 0.0):.1f}ms | IK: {t_info.get('ik_ms', 0.0):.1f}ms | Opt: {t_info.get('opt_ms', 0.0):.1f}ms")
 
         return action
+
+    def _target_in_flange_frame(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.RobotState:
+        """
+        Converts a Panda_tip target orientation (RLBench gripper_pose, PerAct keyposes) to the EE convention of
+        FrankaKinematics. The tip->EE rotation is measured from the client's Panda_tip pose and the FK of the same
+        joint configuration, so no hand-written constant (nominally 135 deg about z) can carry a sign error.
+        """
+        if robot_state.target_frame != drema_comm_pb2.FRAME_TIP or len(robot_state.target_pose) < 7:
+            return robot_state
+        if len(robot_state.ee_pose) >= 7 and len(robot_state.joint_positions) == 7:
+            kin = self.mpc_controller.kinematics
+            if kin.base_position is None and len(robot_state.robot_base_pos) >= 3:
+                kin.base_position = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
+            _, R_fk = kin.forward_kinematics_ee(np.asarray(robot_state.joint_positions, dtype=np.float64))
+            R_off = np.asarray(R_fk, dtype=np.float64).T @ Rotation.from_quat(robot_state.ee_pose[3:7]).as_matrix()
+            if self._tip_offset_R is None:
+                rv = Rotation.from_matrix(R_off).as_rotvec()
+                print(f"[DREMA DYNAMIC SYSTEM] Panda_tip vs EE frame: {np.degrees(np.linalg.norm(rv)):.1f} deg about "
+                      f"axis {np.round(rv / max(np.linalg.norm(rv), 1e-9), 3).tolist()} (EE frame)")
+            self._tip_offset_R = R_off
+        if self._tip_offset_R is None:
+            return robot_state
+        R_target_tip = Rotation.from_quat(robot_state.target_pose[3:7]).as_matrix()
+        R_target_ee = R_target_tip @ self._tip_offset_R.T
+        if self.yaw_symmetry and robot_state.HasField('yaw_symmetric') and robot_state.yaw_symmetric:
+            R_target_ee = self._reachable_gripper_yaw(robot_state, R_target_ee)
+        quat_ee = Rotation.from_matrix(R_target_ee).as_quat()
+        converted = drema_comm_pb2.RobotState()
+        converted.CopyFrom(robot_state)
+        del converted.target_pose[:]
+        converted.target_pose.extend([float(x) for x in robot_state.target_pose[:3]] + [float(x) for x in quat_ee])
+        converted.target_frame = drema_comm_pb2.FRAME_FLANGE
+        return converted
+
+    def _reachable_gripper_yaw(self, robot_state: drema_comm_pb2.RobotState, R_target: np.ndarray) -> np.ndarray:
+        """
+        A parallel gripper grasps the same way when turned by 180 deg about its axis: of the two equivalent targets,
+        keeps the reachable one needing the smaller joint motion, unless it ends closer than YAW_MIN_LIMIT_MARGIN to a
+        joint limit (joint 7 first of all). Decided once per keyframe, so the goal cannot flip while the arm moves.
+        """
+        key = int(robot_state.keyframe_index)
+        if key not in self._yaw_choice:
+            kin = self.mpc_controller.kinematics
+            q_now = np.asarray(robot_state.joint_positions, dtype=np.float64)
+            pos = np.asarray(robot_state.target_pose[:3], dtype=np.float64)
+            scored = []
+            for flip in (False, True):
+                R = R_target @ Rotation.from_euler('z', np.pi).as_matrix() if flip else R_target
+                q_sol, ok = kin.solve_dls_ik(q_now.astype(np.float32), pos, R)
+                margin = float(np.min(np.minimum(q_sol - kin.Q_MIN, kin.Q_MAX - q_sol)))
+                scored.append((bool(ok), margin, float(np.linalg.norm(q_sol - q_now)), flip))
+            best = max(scored, key=lambda s: (s[0], s[1] >= self.YAW_MIN_LIMIT_MARGIN, -s[2]))
+            self._yaw_choice[key] = best[3]
+            print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: gripper yaw {'turned by 180 deg' if best[3] else 'as given'} "
+                  f"(IK ok / joint-limit margin: as given {scored[0][0]}/{scored[0][1]:.2f} rad, "
+                  f"turned {scored[1][0]}/{scored[1][1]:.2f} rad)")
+        if self._yaw_choice[key]:
+            return R_target @ Rotation.from_euler('z', np.pi).as_matrix()
+        return R_target
 
     def _try_startup_cache_restore(self) -> bool:
         """

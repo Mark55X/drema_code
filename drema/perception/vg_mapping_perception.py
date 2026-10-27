@@ -313,10 +313,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
     DEFAULT_BACKGROUND_KEYWORDS: Tuple[str, ...] = (
         "workspace", "table", "floor", "wall", "ceiling", "pillar",
         "sensor", "success", "camera", "head", "waypoint", "detector",
-        "target", "goal", "marker", "dummy"
+        "marker", "dummy"
     )
     DEFAULT_VIRTUAL_KEYWORDS: Tuple[str, ...] = (
-        "target", "goal", "marker", "dummy", "waypoint", "detector", "sensor", "success"
+        "marker", "dummy", "waypoint", "detector", "sensor", "success"
     )
 
     def __init__(self, config: Optional[ConfigDict] = None):
@@ -1325,6 +1325,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     # vertices, resulting in a DOUBLE OFFSET error (e.g. spawning at [0.8, 0.4, 1.6]m).
                     # Centering: subtracting `centroid` makes the geometric origin of the exported mesh (0, 0, 0).
                     min_b, max_b = mesh.bounds[0], mesh.bounds[1]
+                    # Objects entirely below the tabletop fell off the workspace (RLBench can spawn distractors past
+                    # the table edge); one resting against the robot pedestal would put the twin robot in collision.
+                    if float(max_b[2]) < float(z_table) - self.table_thickness:
+                        print(f"[VGMapping Perception] Object #{obj_id} ('{obj_name}') lies below the table "
+                              f"(top Z={float(max_b[2]):.3f}m < {float(z_table):.3f}m): outside the workspace, not spawned.")
+                        continue
                     centroid = list((min_b + max_b) / 2.0)
                     extents = list(max_b - min_b)
                     mesh_path = f"assets/scanned_meshes/{obj_name}_{obj_id}.obj"

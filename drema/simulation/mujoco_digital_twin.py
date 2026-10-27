@@ -158,6 +158,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self._obstacle_geoms: List[Tuple[int, int]] = []
 
         self.robot_loaded = False
+        self.finger_opening = FINGER_OPENING
         self.robot_base_pos = np.array([0.0, 0.0, self.table_z], dtype=np.float64)
         self.robot_base_quat = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float64) # wxyz
         self.robot_id = -1  # Negative ID until load_robot() is called
@@ -394,7 +395,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             for finger in ("finger_joint1", "finger_joint2"):
                 jid = mujoco.mj_name2id(new_model, mujoco.mjtObj.mjOBJ_JOINT, finger)
                 if jid >= 0:
-                    new_data.qpos[new_model.jnt_qposadr[jid]] = FINGER_OPENING
+                    new_data.qpos[new_model.jnt_qposadr[jid]] = self.finger_opening
 
         # Initialize mocap positions for obstacles
         if self.tracking_mode == "mocap":
@@ -469,6 +470,44 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if joint_velocities is not None:
             self.data.qvel[:num_j] = np.array(joint_velocities[:num_j], dtype=np.float64)
 
+        if self.attachments and num_j == 7:
+            for obj_id, (pos, quat) in self.attached_poses(np.asarray(joint_positions[:7])).items():
+                self._place_held_object(self.data, obj_id, pos[0], quat[0])
+
+        mujoco.mj_forward(self.model, self.data)
+
+    def _place_held_object(self, data: "mujoco.MjData", obj_id: int, pos: np.ndarray, quat_xyzw: np.ndarray) -> None:
+        """Puts a held object at its TCP-attached pose (mocap body or free joint)."""
+        obj = self.tracked_objects.get(obj_id)
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, f"obs_{obj_id}")
+        if obj is None or body_id < 0:
+            return
+        quat_wxyz = _xyzw_to_wxyz(quat_xyzw)
+        if data is self.data:
+            obj["target_pos"] = np.asarray(pos, dtype=np.float64)
+            obj["target_quat"] = quat_wxyz
+        mocap_idx = self.model.body_mocapid[body_id]
+        if mocap_idx >= 0:
+            data.mocap_pos[mocap_idx] = pos
+            data.mocap_quat[mocap_idx] = quat_wxyz
+        elif self.tracking_mode == "teleport":
+            jnt_id = self.model.body_jntadr[body_id]
+            qpos_adr = self.model.jnt_qposadr[jnt_id]
+            data.qpos[qpos_adr:qpos_adr + 3] = pos
+            data.qpos[qpos_adr + 3:qpos_adr + 7] = quat_wxyz
+
+    @synchronized
+    def sync_gripper(self, open_amount: float) -> None:
+        opening = FINGER_OPENING * float(np.clip(open_amount, 0.0, 1.0))
+        if abs(opening - self.finger_opening) < 1e-4:
+            return
+        self.finger_opening = opening
+        if not self.robot_loaded or self.data is None:
+            return
+        for finger in ("finger_joint1", "finger_joint2"):
+            jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, finger)
+            if jid >= 0:
+                self.data.qpos[self.model.jnt_qposadr[jid]] = opening
         mujoco.mj_forward(self.model, self.data)
 
     @synchronized
@@ -578,7 +617,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             "color": col,
             "target_pos": np.array(initial_pos, dtype=np.float64),
             "target_quat": quat_wxyz,
-            "body_id": target_obj_id + 10  # Virtual body ID for caller queries
+            "body_id": target_obj_id + 10,  # Virtual body ID for caller queries
+            "is_target": bool(kwargs.get("is_target", False))
         }
 
         self._rebuild_model()
@@ -602,6 +642,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         pos_arr = np.array(position, dtype=np.float64)
         quat_wxyz = _xyzw_to_wxyz(orientation)
+
+        # A held object follows the TCP; perception (often occluded by the fingers) is kept for diagnostics only.
+        if obj_id in self.attachments:
+            self.tracked_objects[obj_id]["perceived_pos"] = pos_arr
+            return
 
         self.tracked_objects[obj_id]["target_pos"] = pos_arr
         self.tracked_objects[obj_id]["target_quat"] = quat_wxyz
@@ -750,23 +795,49 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or len(self.tracked_objects) == 0:
             return float("inf")
 
-        robot_geoms = [g for g, _, _ in self._robot_geoms]
-        obstacle_geoms = [g for g, _ in self._obstacle_geoms]
-
-        if not robot_geoms or not obstacle_geoms:
-            return float("inf")
-
+        probes, obstacles, allowed, margins = self._collision_pairs(include_table=False)
         min_d = float("inf")
         fromto = np.zeros(6, dtype=np.float64)
-        for rg in robot_geoms:
-            for og in obstacle_geoms:
-                try:
-                    d = mujoco.mj_geomDistance(self.model, self.data, rg, og, 1.0, fromto)
-                    if d < min_d:
-                        min_d = d
-                except Exception:
-                    pass
+        for ri, oi in zip(*np.nonzero(allowed)):
+            try:
+                d = mujoco.mj_geomDistance(self.model, self.data, probes[ri][0], obstacles[oi][0], 1.0, fromto)
+                if d < min_d:
+                    min_d = d
+            except Exception:
+                pass
         return float(min_d)
+
+    def _collision_pairs(self, include_table: bool):
+        """
+        Geom pairs the robot must keep clear, according to the object policies:
+        - probes: (geom, body, velocity slot, link 1..7, is_hand, held obj_id or None); held objects act as hand geoms;
+        - obstacles: (geom, obj_id or -1 for the table);
+        - allowed: [P, O] bool, False where the policy lets that robot part touch that object;
+        - margins: [P, O] distance offset of each allowed pair (FRAGILE > 0, approach keyframes < 0 for the hand).
+        """
+        probes = [(g, body, link - 1 if link <= 7 else 7, min(link, 7), link == 8, None)
+                  for g, body, link in self._robot_geoms if link >= 1]
+        held = set(self.attachments) & set(self.tracked_objects)
+        obstacles, policies = [], []
+        for g, obj_id in self._obstacle_geoms:
+            if obj_id in held:
+                probes.append((g, int(self.model.geom_bodyid[g]), 7, 7, True, obj_id))
+                continue
+            policy = self.object_policy(obj_id)
+            if policy.hand_contact and policy.arm_contact:
+                continue
+            obstacles.append((g, obj_id))
+            policies.append(policy)
+        if include_table:
+            table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
+            if table_geom_id >= 0:
+                obstacles.append((table_geom_id, -1))
+                policies.append(self.table_policy)
+        pair = [[policy.pair_margin(pr[4]) for policy in policies] for pr in probes]
+        allowed = np.array([[m is not None for m in row] for row in pair], dtype=bool).reshape(len(probes), len(obstacles))
+        margins = np.array([[m if m is not None else 0.0 for m in row] for row in pair],
+                           dtype=np.float64).reshape(len(probes), len(obstacles))
+        return probes, obstacles, allowed, margins
 
     @synchronized
     def get_closest_points(self, distance: float = 0.5) -> List[Tuple[int, int, float, Tuple[float, float, float]]]:
@@ -844,16 +915,19 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         if self.model is None or self.data is None or not self.robot_loaded:
             return []
 
-        # Hand and fingers are rigidly attached to link 7, as in the PyBullet twin.
-        robot_geoms = [(g, min(link, 7)) for g, _, link in self._robot_geoms if link >= 1]
+        # Hand, fingers and held objects are rigidly attached to link 7, as in the PyBullet twin.
+        probes, obstacles, allowed, margins = self._collision_pairs(include_table=False)
 
         closest: Dict[Tuple[int, int], Tuple[float, np.ndarray, np.ndarray]] = {}
         fromto = np.zeros(6, dtype=np.float64)
-        for og, obj_id in self._obstacle_geoms:
-            if self.tracked_objects.get(obj_id, {}).get("is_target", False):
-                continue
-            for rg, link_idx in robot_geoms:
-                d = mujoco.mj_geomDistance(self.model, self.data, rg, og, float(max_distance), fromto)
+        for oi, (og, obj_id) in enumerate(obstacles):
+            for ri, probe in enumerate(probes):
+                if not allowed[ri, oi]:
+                    continue
+                rg, link_idx = probe[0], probe[3]
+                margin = margins[ri, oi]
+                d_raw = mujoco.mj_geomDistance(self.model, self.data, rg, og, float(max_distance) + margin, fromto)
+                d = d_raw - margin
                 if d >= max_distance:
                     continue
                 diff = fromto[0:3] - fromto[3:6]
@@ -862,7 +936,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     continue
                 # fromto runs from the robot geom to the obstacle geom; when penetrating, the
                 # nearest-point pair crosses, so the direction must be flipped.
-                normal = diff / norm if d >= 0.0 else -diff / norm
+                normal = diff / norm if d_raw >= 0.0 else -diff / norm
                 key = (obj_id, link_idx)
                 if key not in closest or d < closest[key][0]:
                     closest[key] = (float(d), fromto[0:3].copy(), normal)
@@ -995,25 +1069,16 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             return coll_p, coll_gvm
 
         # Obstacle geoms (several convex parts per obstacle) and the obstacle slot used for the cost grouping:
-        # potentials are aggregated per (obstacle, robot body), as in the PyBullet twin.
-        obstacle_geoms = []
-        geom_to_obj_id = {}
-        geom_slot = {}
+        # potentials are aggregated per (obstacle, robot body), as in the PyBullet twin. Robot probes are the
+        # moving links (the fixed base link0 is left out, so only those are penalized against the static table)
+        # plus the held objects, which move with the TCP.
+        probes, obstacles, allowed, margins = self._collision_pairs(include_table=self.table_in_collision_costs)
+        obstacle_geoms = [g for g, _ in obstacles]
+        geom_to_obj_id = {g: obj_id for g, obj_id in obstacles if obj_id >= 0}
         slots: Dict[int, int] = {}
-        for g, obj_id in self._obstacle_geoms:
-            if self.tracked_objects.get(obj_id, {}).get("is_target", False):
-                continue
-            obstacle_geoms.append(g)
-            geom_to_obj_id[g] = obj_id
-            geom_slot[g] = slots.setdefault(obj_id, len(slots))
-        # The table is static (no prediction, zero velocity); the fixed base link0 is left out of the robot
-        # geoms below, so only the moving links are penalized against it.
-        if self.table_in_collision_costs:
-            table_geom_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_GEOM, "table_geom")
-            if table_geom_id >= 0:
-                obstacle_geoms.append(table_geom_id)
-                geom_slot[table_geom_id] = len(slots)
-                slots[-1] = len(slots)
+        geom_slot = {g: slots.setdefault(obj_id, len(slots)) for g, obj_id in obstacles}
+        max_margin = max(0.0, float(margins.max())) if margins.size else 0.0
+        held_ids = sorted({pr[5] for pr in probes if pr[5] is not None})
 
         if not obstacle_geoms:
             self.last_collision_timings = {
@@ -1025,13 +1090,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             }
             return coll_p, coll_gvm
 
-        # Moving robot geoms: (geom, body, velocity slot of batch_link_linear_velocities; hand/fingers -> TCP)
-        robot_geom_link_map = [(g, body, link - 1 if link <= 7 else 7) for g, body, link in self._robot_geoms if link >= 1]
-        robot_geom_ids = np.array([g for g, _, _ in robot_geom_link_map], dtype=np.int64)
+        robot_geom_ids = np.array([pr[0] for pr in probes], dtype=np.int64)
         obstacle_geom_ids = np.array(obstacle_geoms, dtype=np.int64)
         n_bodies = self.model.nbody
 
-        if not robot_geom_link_map:
+        if not probes:
             self.last_collision_timings = {
                 'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
                 'pred_ms': 0.0,
@@ -1066,6 +1129,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         # Pre-cache mocap indices for tracked obstacles
         obj_mocap_map = {}
         for obj_id in predictions.keys():
+            if obj_id in self.attachments:
+                continue
             m_name = f"obs_{obj_id}"
             b_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, m_name)
             if b_id < 0:
@@ -1080,6 +1145,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         eval_steps = list(range(0, H, step_stride))
         if (H - 1) not in eval_steps:
             eval_steps.append(H - 1)
+        n_eval = len(eval_steps)
+        # Held object poses for every evaluated configuration, indexed k * n_eval + e
+        held_poses = self.attached_poses(Q[:, eval_steps].reshape(-1, 7)) if held_ids else {}
 
         fromto = np.zeros(6, dtype=np.float64)
 
@@ -1114,26 +1182,33 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 # Update Franka Panda joint positions in MuJoCo eval data
                 t_mj_s = time.perf_counter()
                 eval_data.qpos[:7] = q_step + self.joint_angle_offsets
+                for obj_id in held_ids:
+                    pos_h, quat_h = held_poses[obj_id]
+                    self._place_held_object(eval_data, obj_id, pos_h[k * n_eval + e], quat_h[k * n_eval + e])
                 mujoco.mj_kinematics(self.model, eval_data)
                 t_mj_total += (time.perf_counter() - t_mj_s)
 
-                # Broadphase: only geom pairs whose world AABBs, grown by sigma_2, overlap reach the GJK query.
+                # Broadphase: only geom pairs whose world AABBs, grown by sigma_2 (plus the largest extra margin),
+                # overlap reach the GJK query; pairs exempted by the object policies are dropped.
                 r_center, r_half = _world_aabbs(self.model, eval_data, robot_geom_ids)
                 o_center, o_half = _world_aabbs(self.model, eval_data, obstacle_geom_ids)
-                near = np.all(np.abs(r_center[:, None] - o_center[None]) <= r_half[:, None] + o_half[None] + sigma_2,
-                              axis=-1)
+                near = np.all(np.abs(r_center[:, None] - o_center[None])
+                              <= r_half[:, None] + o_half[None] + sigma_2 + max_margin, axis=-1) & allowed
                 for ri, oi in zip(*np.nonzero(near)):
-                    rg, rbody, vel_slot = robot_geom_link_map[ri]
+                    rg, rbody, vel_slot = probes[ri][0], probes[ri][1], probes[ri][2]
                     og = obstacle_geoms[oi]
+                    margin = margins[ri, oi]
                     t_mj_s = time.perf_counter()
                     try:
-                        d = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2), fromto)
+                        d_raw = mujoco.mj_geomDistance(self.model, eval_data, rg, og, float(sigma_2 + margin), fromto)
                     except Exception:
                         t_mj_total += (time.perf_counter() - t_mj_s)
                         continue
                     t_mj_total += (time.perf_counter() - t_mj_s)
 
-                    # mj_geomDistance returns distmax itself when the pair is farther than distmax
+                    # mj_geomDistance returns distmax itself when the pair is farther than distmax;
+                    # Per-pair margins shift the distance: FRAGILE objects farther, approach keyframes closer to the hand.
+                    d = d_raw - margin
                     if d >= sigma_2:
                         continue
 
@@ -1144,7 +1219,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     rec_slot.append(vel_slot)
                     rec_d.append(d)
                     # obstacle -> robot direction; the nearest-point pair crosses when penetrating
-                    rec_normal.append(fromto[0:3] - fromto[3:6] if d >= 0.0 else fromto[3:6] - fromto[0:3])
+                    rec_normal.append(fromto[0:3] - fromto[3:6] if d_raw >= 0.0 else fromto[3:6] - fromto[0:3])
                     rec_v_obs.append(obs_vel[og])
                     if record_points:
                         rec_point.append(fromto[0:3].copy())
@@ -1199,6 +1274,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
     def reset(self) -> None:
         """Resets the simulation environment and cleans up dynamic bodies."""
         self.tracked_objects.clear()
+        self.attachments.clear()
+        self.object_policies = {}
+        self.finger_opening = FINGER_OPENING
         if self.predictor is not None:
             self.predictor.reset()
         self._rebuild_model()
