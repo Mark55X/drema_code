@@ -4,9 +4,10 @@ and, optionally, the client simulation frames (run_coppelia_client.py --record_d
 
     title       : DREMA Dynamic System, time, chosen candidate, Judge weights
     left top    : simulated scene (client camera)
-    right       : 3D imagination - current arm, sampled TCP rollouts colored by planner and weighted by the
-                  softmax, executed plan with ghost arms, IK guidance posture, collision hits, current and
-                  forecast obstacle, goal and approach cone
+    right       : 3D imagination - current arm and gripper, sampled TCP rollouts colored by planner and weighted
+                  by the softmax, executed plan with ghost arms (and the held object along it), IK guidance
+                  posture, collision hits, perceived objects in their colours outlined by role, forecast
+                  obstacles, goal gripper pose and approach cone
     left bottom : telemetry up to the current time (distances, cost terms, Judge weights, closest-obstacle speed)
 
 Usage:
@@ -29,9 +30,26 @@ from matplotlib.patches import Patch  # noqa: E402
 from mpl_toolkits.mplot3d.art3d import Line3DCollection, Poly3DCollection  # noqa: E402
 from scipy.spatial.transform import Rotation  # noqa: E402
 
+from drema.roles.registry import PANDA_HAND_FOOTPRINT  # noqa: E402
+
 GROUP_COLORS = np.array([[40, 110, 230], [240, 140, 30], [150, 80, 200], [30, 170, 90]], dtype=np.float64) / 255.0
 GROUP_LABELS = ("greedy", "sensitive", "mixed", "primitives")
 FORECAST_STEPS = (5, 10, 14)
+
+# Object roles (drema.roles) drawn as outline and label; plain obstacles keep only their perceived mesh
+ROLE_COLORS = {'TARGET': (0.1, 0.65, 0.25), 'NEAR': (0.95, 0.55, 0.1), 'HELD': (0.55, 0.25, 0.75),
+               'RELEASED': (0.45, 0.8, 0.45), 'FRAGILE': (0.85, 0.1, 0.1)}
+DEFAULT_MESH_COLOR = (0.62, 0.62, 0.62)
+GOAL_GRIPPER_COLOR = (0.0, 0.5, 0.55)
+
+# Panda gripper in the hand frame (z along the approach, y along the finger opening, origin at the TCP)
+HAND_R = Rotation.from_euler('z', PANDA_HAND_FOOTPRINT['finger_axis_yaw_deg'], degrees=True).as_matrix()
+PALM_BOX = (np.array([0.0, -0.004, -0.088]), np.array([0.032, 0.104, 0.049]))
+FINGER_HALF = np.array([0.011, 0.0125, 0.028])
+FINGER_Z = -0.025
+FINGER_STROKE = 0.04
+BOX_SIGNS = np.array([[x, y, z] for x in (-1, 1) for y in (-1, 1) for z in (-1, 1)], dtype=np.float64)
+BOX_PAIRS = [(0, 1), (0, 2), (0, 4), (1, 3), (1, 5), (2, 3), (2, 6), (3, 7), (4, 5), (4, 6), (5, 7), (6, 7)]
 
 
 def load_frames(frames_dir: str) -> List[Dict[str, np.ndarray]]:
@@ -99,6 +117,18 @@ def _clip_segment(p0: np.ndarray, p1: np.ndarray, lo: np.ndarray, hi: np.ndarray
     return np.stack([p0 + t0 * d, p0 + t1 * d])
 
 
+def gripper_segments(tcp: np.ndarray, R_ee: np.ndarray, opening: float) -> List[np.ndarray]:
+    """Edges of the palm and of the two fingers, with the fingers at the given opening (1 open, 0 closed)."""
+    R = np.asarray(R_ee, dtype=np.float64) @ HAND_R
+    inner = FINGER_STROKE * float(np.clip(opening, 0.0, 1.0))
+    boxes = [PALM_BOX] + [(np.array([0.0, side * (inner + FINGER_HALF[1]), FINGER_Z]), FINGER_HALF) for side in (-1, 1)]
+    segments = []
+    for center, half in boxes:
+        corners = (center + BOX_SIGNS * half) @ R.T + np.asarray(tcp, dtype=np.float64)
+        segments.extend(np.stack([corners[a], corners[b]]) for a, b in BOX_PAIRS)
+    return segments
+
+
 class ImaginationRenderer:
     def __init__(self, frames: List[Dict[str, np.ndarray]], scene: Dict[str, np.ndarray],
                  sim_index: Dict[int, str], dt: float, size=(1920, 1080), dpi: int = 100,
@@ -114,12 +144,16 @@ class ImaginationRenderer:
         self._telemetry = self._collect_telemetry()
         self.center, self.half = self._scene_limits(zoom)
         self.lo, self.hi = self.center - self.half, self.center + self.half
+        self._kin = None
 
     def _closest_obstacle(self, fr) -> Tuple[Optional[int], float]:
-        """Obstacle nearest to the arm (mesh vertices vs link origins) and its forecast speed."""
+        """Obstacle nearest to the arm (mesh vertices vs link origins) and its forecast speed; objects the robot may
+        hold or touch as targets are not obstacles."""
         best, best_d = None, np.inf
+        roles = self._roles(fr)
+        held = set(int(i) for i in fr.get('held_ids', []))
         for oid in fr.get('obstacle_ids', np.zeros(0, dtype=int)):
-            if f"obs{oid}_pos" not in fr:
+            if f"obs{oid}_pos" not in fr or int(oid) in held or roles.get(int(oid)) in ('TARGET', 'HELD', 'RELEASED'):
                 continue
             verts = self.scene.get(f"obs{oid}_vertices")
             pts = (_pose(verts, fr[f"obs{oid}_pos"], fr[f"obs{oid}_quat"]) if verts is not None
@@ -179,17 +213,52 @@ class ImaginationRenderer:
         if segs:
             ax.add_collection3d(Line3DCollection(segs, colors=cols, linewidths=lw, linestyles=ls, zorder=zorder))
 
+    @staticmethod
+    def _roles(fr) -> Dict[int, str]:
+        ids, names = fr.get('role_ids'), fr.get('role_names')
+        if ids is None or names is None:
+            return {}
+        return {int(i): str(n) for i, n in zip(ids, names)}
+
+    def _face_colors(self, oid: int, faces: np.ndarray, alpha: float) -> np.ndarray:
+        colors = self.scene.get(f"obs{oid}_colors")
+        rgb = (np.asarray(colors, dtype=np.float64)[faces].mean(axis=1) if colors is not None
+               else np.tile(DEFAULT_MESH_COLOR, (len(faces), 1)))
+        return np.concatenate([rgb, np.full((len(faces), 1), alpha)], axis=1)
+
+    def _outline(self, ax, verts: np.ndarray, pos, quat, color, alpha: float = 1.0, lw: float = 1.6,
+                 ls: str = 'solid') -> np.ndarray:
+        corners, pairs = _box_edges(verts)
+        c = _pose(corners, pos, quat)
+        self._polylines(ax, [[c[a], c[b]] for a, b in pairs], [(*color, alpha)] * len(pairs), lw=lw, ls=ls, zorder=4)
+        return c
+
     def _draw_obstacles(self, ax, fr) -> None:
+        roles = self._roles(fr)
+        held = set(int(i) for i in fr.get('held_ids', []))
         for oid in fr.get('obstacle_ids', np.zeros(0, dtype=int)):
+            oid = int(oid)
             verts, faces = self.scene.get(f"obs{oid}_vertices"), self.scene.get(f"obs{oid}_faces")
             if verts is None or f"obs{oid}_pos" not in fr:
                 continue
             world = _pose(verts, fr[f"obs{oid}_pos"], fr[f"obs{oid}_quat"])
             tris = world[faces]
-            tris = tris[np.all(self._inside(tris), axis=1)]
-            if len(tris):
-                ax.add_collection3d(Poly3DCollection(tris, facecolor=(0.25, 0.45, 0.85, 0.35),
-                                                     edgecolor=(0.2, 0.35, 0.7, 0.08), linewidths=0.2))
+            inside = np.all(self._inside(tris), axis=1)
+            if np.any(inside):
+                ax.add_collection3d(Poly3DCollection(tris[inside], facecolor=self._face_colors(oid, faces[inside], 0.6),
+                                                     edgecolor=(0.2, 0.2, 0.2, 0.06), linewidths=0.2))
+            role = roles.get(oid, 'HELD' if oid in held else 'OBSTACLE')
+            color = ROLE_COLORS.get(role)
+            if color is not None:
+                c = self._outline(ax, verts, fr[f"obs{oid}_pos"], fr[f"obs{oid}_quat"], color)
+                top = c[np.argmax(c[:, 2])] + np.array([0.0, 0.0, 0.03])
+                if self._inside(top[None])[0]:
+                    ax.text(*top, role, color=color, fontsize=9, fontweight='bold', zorder=12)
+            for i in range(len(fr.get(f"held{oid}_ghost_pos", []))):
+                self._outline(ax, verts, fr[f"held{oid}_ghost_pos"][i], fr[f"held{oid}_ghost_quat"][i],
+                              ROLE_COLORS['HELD'], alpha=0.2 + 0.15 * i, lw=1.2, ls='dashed')
+            if oid in held:
+                continue
             pred_pos, pred_quat = fr.get(f"obs{oid}_pred_pos"), fr.get(f"obs{oid}_pred_quat")
             if pred_pos is None or float(np.linalg.norm(pred_pos[-1] - pred_pos[0])) < 1e-3:
                 continue
@@ -226,9 +295,28 @@ class ImaginationRenderer:
             spokes = [np.stack([g, ring[k]]) for k in range(0, 32, 4)]
             self._polylines(ax, [ring] + spokes, [(0.9, 0.3, 0.3, 0.55)] * (1 + len(spokes)), lw=0.9)
 
+    def _tcp_rot(self, fr) -> np.ndarray:
+        """Recordings made before the gripper was recorded only have the joints: their TCP rotation comes from FK."""
+        if 'tcp_rot' in fr:
+            return np.asarray(fr['tcp_rot'], dtype=np.float64)
+        if self._kin is None:
+            from drema.controller.franka_kinematics import FrankaKinematics
+            self._kin = FrankaKinematics(base_position=np.asarray(self.scene.get('robot_base', np.zeros(3))))
+        return np.asarray(self._kin.forward_kinematics_ee(np.asarray(fr['q'], dtype=np.float64))[1], dtype=np.float64)
+
+    def _draw_gripper(self, ax, tcp, R_ee, opening: float, color, lw: float, ls: str = 'solid', zorder: int = 5) -> None:
+        segments = gripper_segments(tcp, R_ee, opening)
+        self._polylines(ax, segments, [color] * len(segments), lw=lw, ls=ls, zorder=zorder)
+
     def _draw_robot(self, ax, fr) -> None:
+        opening = float(fr.get('gripper_open', 1.0))
         ghosts = list(fr.get('ghost_skeletons', []))
         self._polylines(ax, ghosts, [(0.25, 0.25, 0.25, 0.15 + 0.12 * i) for i in range(len(ghosts))], lw=5.0)
+        for i, quat in enumerate(fr.get('ghost_tcp_quat', [])):
+            self._draw_gripper(ax, ghosts[i][-1], Rotation.from_quat(quat).as_matrix(), opening,
+                               (0.25, 0.25, 0.25, 0.15 + 0.12 * i), lw=1.2)
+        if 'target_pos' in fr and 'target_rot' in fr:
+            self._draw_gripper(ax, fr['target_pos'], fr['target_rot'], 1.0, (*GOAL_GRIPPER_COLOR, 0.8), lw=1.0, ls='dashed')
         if 'q_des_skeleton' in fr:
             self._polylines(ax, [fr['q_des_skeleton']], [(0.15, 0.7, 0.3, 0.85)], lw=2.0, ls='dashed')
         sk = fr['skeleton']
@@ -236,6 +324,7 @@ class ImaginationRenderer:
         joints = sk[:-1][self._inside(sk[:-1])]
         if len(joints):
             ax.scatter(*joints.T, color=(0.12, 0.12, 0.12), s=30, depthshade=False)
+        self._draw_gripper(ax, sk[-1], self._tcp_rot(fr), opening, (0.12, 0.12, 0.12, 1.0), lw=2.0, zorder=6)
 
     def _draw_rollouts(self, ax, fr) -> None:
         tcp, groups = fr['rollout_tcp'].astype(np.float64), fr['rollout_group']
@@ -275,19 +364,28 @@ class ImaginationRenderer:
         self._draw_rollouts(ax, fr)
         self._draw_robot(ax, fr)
         handles = [plt.Line2D([], [], color=(0.12, 0.12, 0.12), lw=5, marker='o', markersize=4),
-                   Patch(facecolor=(0.25, 0.45, 0.85, 0.35), edgecolor=(0.2, 0.35, 0.7)),
+                   plt.Line2D([], [], color=(0.12, 0.12, 0.12), lw=2, marker='s', markersize=7, fillstyle='none'),
+                   Patch(facecolor=(*DEFAULT_MESH_COLOR, 0.6), edgecolor=(0.2, 0.2, 0.2)),
                    plt.Line2D([], [], color=(0.9, 0.1, 0.1), marker='*', ls='', markersize=12, markeredgecolor='k'),
+                   plt.Line2D([], [], color=GOAL_GRIPPER_COLOR, lw=1, ls='--', marker='s', markersize=7, fillstyle='none'),
                    plt.Line2D([], [], color=(0.9, 0.3, 0.3), lw=1)]
         handles += [plt.Line2D([], [], color=c, lw=2) for c in GROUP_COLORS]
         handles += [plt.Line2D([], [], color='k', lw=3), plt.Line2D([], [], color=(0.4, 0.4, 0.4), lw=5, alpha=0.4),
                     plt.Line2D([], [], color=(0.15, 0.7, 0.3), lw=2, ls='--'),
                     plt.Line2D([], [], color=(0.85, 0.2, 0.2), lw=1, ls='--'),
                     plt.Line2D([], [], color=(0.85, 0.05, 0.05), marker='o', ls='', markersize=4)]
-        labels = ['arm (current configuration)', 'obstacle (perceived pose)', 'active goal', 'approach cone']
+        labels = ['arm (current configuration)', 'gripper (measured opening)', 'object (perceived mesh and colour)',
+                  'active goal', 'gripper pose at the goal', 'approach cone']
         labels += [f"rollouts: {g}" for g in GROUP_LABELS]
         labels += ['executed plan (TCP path)', 'imagined arm along the plan', 'IK guidance posture q_des',
                    'forecast obstacle (+0.25 / 0.5 / 0.7 s)', 'arm points inside the collision margin']
-        ax.legend(handles, labels, loc='upper left', fontsize=8.5, framealpha=0.85)
+        main_legend = ax.legend(handles, labels, loc='upper left', fontsize=8.5, framealpha=0.85)
+        role_names = list(ROLE_COLORS)
+        role_handles = [Patch(facecolor='none', edgecolor=ROLE_COLORS[r], lw=1.6) for r in role_names]
+        role_handles.append(Patch(facecolor='none', edgecolor=ROLE_COLORS['HELD'], lw=1.2, ls='--'))
+        ax.legend(role_handles, [f"role {r}" for r in role_names] + ['held object along the plan'],
+                  loc='lower left', fontsize=8.5, framealpha=0.85, title='object outline', title_fontsize=8.5)
+        ax.add_artist(main_legend)
 
     def _draw_sim(self, ax, fr) -> None:
         ax.axis('off')

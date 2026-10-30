@@ -833,7 +833,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             if table_geom_id >= 0:
                 obstacles.append((table_geom_id, -1))
                 policies.append(self.table_policy)
-        pair = [[policy.pair_margin(pr[4]) for policy in policies] for pr in probes]
+        pair = [[policy.held_margin() if pr[5] is not None else policy.pair_margin(pr[4]) for policy in policies]
+                for pr in probes]
         allowed = np.array([[m is not None for m in row] for row in pair], dtype=bool).reshape(len(probes), len(obstacles))
         margins = np.array([[m if m is not None else 0.0 for m in row] for row in pair],
                            dtype=np.float64).reshape(len(probes), len(obstacles))

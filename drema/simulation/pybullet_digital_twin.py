@@ -560,7 +560,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             for pt in p.getClosestPoints(bodyA=self.robot_id, bodyB=body_id, distance=2.0):
                 if self._robot_link_allowed(policy, pt[3]):
                     min_distance = min(min_distance, pt[8])
-            if policy.pair_allowed(True):
+            if policy.held_margin() is not None:
                 for held_body, _ in held:
                     for pt in p.getClosestPoints(bodyA=held_body, bodyB=body_id, distance=2.0):
                         min_distance = min(min_distance, pt[8])
@@ -687,12 +687,12 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 d = float(pt[8]) - margin
                 if d < max_distance and (link_idx not in closest_per_link or d < closest_per_link[link_idx][1]):
                     closest_per_link[link_idx] = (pt, d)
-            hand_margin = policy.pair_margin(True)
-            if hand_margin is not None:
+            held_margin = policy.held_margin()
+            if held_margin is not None:
                 # Held objects move with link7: their closest points count as link7 points.
                 for held_body, _ in held:
                     for pt in p.getClosestPoints(bodyA=held_body, bodyB=body_id, distance=query):
-                        d = float(pt[8]) - hand_margin
+                        d = float(pt[8]) - held_margin
                         if d < max_distance and (7 not in closest_per_link or d < closest_per_link[7][1]):
                             closest_per_link[7] = (pt, d)
 
@@ -896,7 +896,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                 for slot, obs_id in enumerate(obstacle_body_ids):
                     policy = obstacle_policies[slot]
                     query = max(float(sigma_2) + self._query_margin(policy), 1e-4)
-                    hand_margin = policy.pair_margin(True)
+                    held_margin = policy.held_margin()
                     # (closest point, group link, velocity slot, pair margin): robot links, then held objects as hand parts
                     candidates = []
                     for pt in p.getClosestPoints(bodyA=robot_id, bodyB=obs_id, distance=query):
@@ -904,10 +904,10 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                         # fixed base link (link0): its distance cannot be changed by any control
                         if pt[3] >= 0 and margin is not None:
                             candidates.append((pt, pt[3], pt[3] if pt[3] < 7 else 7, margin))
-                    if hand_margin is not None:
+                    if held_margin is not None:
                         for h_idx, (held_body, _) in enumerate(held):
                             candidates.extend(
-                                (pt, num_j + h_idx, 7, hand_margin)
+                                (pt, num_j + h_idx, 7, held_margin)
                                 for pt in p.getClosestPoints(bodyA=held_body, bodyB=obs_id, distance=query))
                     total_contact_pts += len(candidates)
                     for pt, group_link, vel_slot, margin in candidates:

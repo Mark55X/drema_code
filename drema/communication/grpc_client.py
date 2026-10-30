@@ -339,13 +339,17 @@ class DremaGrpcClient:
         target_in_tip_frame: bool = False,
         roles_revision: int = 0,
         role_assignments: Optional[List[Any]] = None,
-        yaw_symmetric: bool = False
+        yaw_symmetric: bool = False,
+        gripper_actuated: Optional[float] = None,
+        gripper_moving: Optional[bool] = None
     ) -> drema_comm_pb2.ControlAction:
         """
         Queries the MPC controller for the next joint velocity command.
 
         :param approach_funnel: Enables / disables the approach cone on this target; None leaves the server default (enabled).
         :param gripper_command / ignore_collisions: Active keyframe flags (PerAct action layout); None = not sent.
+        :param gripper_actuated / gripper_moving: State the gripper is actually driven to and whether the fingers
+            are still moving; the server detects grasp and release from these rather than from the keyframe intent.
         :param target_in_tip_frame: target_pose orientation is a Panda_tip orientation (RLBench / PerAct).
         :param role_assignments: drema.roles.RoleAssignment snapshot of the environment, with its revision.
         :param timeout: Blocking mode: RPC deadline. Non-blocking mode: how long to wait for a just-sent
@@ -374,6 +378,10 @@ class DremaGrpcClient:
             state.gripper_command = float(gripper_command)
         if ignore_collisions is not None:
             state.ignore_collisions = bool(ignore_collisions)
+        if gripper_actuated is not None:
+            state.gripper_actuated = float(gripper_actuated)
+        if gripper_moving is not None:
+            state.gripper_moving = bool(gripper_moving)
         state.keyframe_index = int(keyframe_index)
         state.target_frame = drema_comm_pb2.FRAME_TIP if target_in_tip_frame else drema_comm_pb2.FRAME_FLANGE
         state.roles_revision = int(roles_revision)

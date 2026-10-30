@@ -100,6 +100,9 @@ message RobotState {
   repeated ObjectRoleAssignment role_assignments = 18;
   // Parallel gripper: the target may be rotated by 180 deg about the gripper axis (the server picks the reachable one)
   optional bool yaw_symmetric = 19;
+  // Gripper actuator: gripper_command is the keyframe intent, these report what the fingers are actually doing
+  optional double gripper_actuated = 20; // State currently commanded to the gripper (1 open, 0 closed)
+  optional bool gripper_moving = 21;     // Fingers still actuating towards gripper_actuated
 }
 
 // Action returned by MPC controller to the robot

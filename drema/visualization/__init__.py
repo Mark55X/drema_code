@@ -5,7 +5,7 @@ VisualizationHub.before_solve / after_solve, and every component is disabled unl
 
 import os
 import time
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from .imagination import ImaginationRecorder
 from .mpc_dump import MpcInputDumper
@@ -50,7 +50,8 @@ def build_visualization_hub(
     controller: Any,
     digital_twin: Any,
     viser_server: Optional[Any] = None,
-    scene_info: Optional[Callable[[], Dict[str, Any]]] = None
+    scene_info: Optional[Callable[[], Dict[str, Any]]] = None,
+    roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None
 ) -> VisualizationHub:
     """
     Reads controller.debug_dump_* and visualization.imagination.* from the config:
@@ -85,7 +86,8 @@ def build_visualization_hub(
             sinks=sinks,
             max_rollouts=int(img_cfg.get("max_rollouts", 40)),
             ghost_count=int(img_cfg.get("ghost_count", 3)),
-            scene_info=scene_info
+            scene_info=scene_info,
+            roles_status=roles_status
         )
     return VisualizationHub(controller, digital_twin, dumper=dumper, imagination=imagination)
 

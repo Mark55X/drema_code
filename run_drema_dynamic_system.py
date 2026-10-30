@@ -251,7 +251,8 @@ class DremaDynamicSystem:
         self.visualization = build_visualization_hub(
             config, self.mpc_controller, self.digital_twin, viser_server=self.viser_server,
             scene_info=lambda: {'table_z': getattr(self.perception, 'z_table', None),
-                                'table_bounds': getattr(self.perception, 'table_bounds', None)}
+                                'table_bounds': getattr(self.perception, 'table_bounds', None)},
+            roles_status=lambda: self.role_registry.status if self.role_registry is not None else []
         )
 
         # Frame queue & perception worker thread
@@ -738,9 +739,12 @@ class DremaDynamicSystem:
         if len(robot_state.robot_base_pos) >= 3:
             self.robot_base_pos = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
 
+        # Target orientation in the FrankaKinematics EE convention used by the MPC and by the hand footprint of the roles
+        mpc_state = self._target_in_flange_frame(robot_state)
+
         # 0. Object roles: policies and held objects must be in place before the robot (and what it holds) is synced
         if self.role_registry is not None:
-            self.role_registry.update(robot_state, self.digital_twin, self.mpc_controller.kinematics)
+            self.role_registry.update(mpc_state, self.digital_twin, self.mpc_controller.kinematics)
         self.digital_twin.sync_gripper(robot_state.gripper_open)
 
         # 1. Update Digital Twin robot configuration
@@ -759,8 +763,7 @@ class DremaDynamicSystem:
         # 2. Step physics forward
         self.digital_twin.step()
 
-        # 3. Extract target goal (orientation in the FrankaKinematics EE convention used by the MPC)
-        mpc_state = self._target_in_flange_frame(robot_state)
+        # 3. Extract target goal
         target_goal = None
         if mpc_state.target_available and len(mpc_state.target_pose) >= 3:
             target_goal = np.array(mpc_state.target_pose[:3], dtype=np.float32)

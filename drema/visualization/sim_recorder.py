@@ -41,8 +41,6 @@ class SimVideoRecorder:
     def __init__(self, out_dir: str, reference_camera: Any = None, resolution: Tuple[int, int] = (960, 540),
                  every_n: int = 1, tail_steps: int = 40, jpeg_quality: int = 92, view_angle_deg: Optional[float] = None,
                  eye=None, look_at=None):
-        from pyrep.objects.vision_sensor import VisionSensor  # client-only dependency
-
         self.out_dir = out_dir
         self.every_n = max(1, int(every_n))
         self.tail_steps = max(0, int(tail_steps))
@@ -56,17 +54,14 @@ class SimVideoRecorder:
                 view_angle_deg = float(reference_camera.get_perspective_angle())
             except (RuntimeError, AttributeError):
                 view_angle_deg = 60.0  # some PyRep / CoppeliaSim builds do not expose the parameter
-        position = list(eye) if eye is not None else list(reference_camera.get_position())
-        self.sensor = VisionSensor.create(
-            [int(resolution[0]), int(resolution[1])],
-            explicit_handling=True,
-            view_angle=float(view_angle_deg),
-            position=position
-        )
+        self.resolution = [int(resolution[0]), int(resolution[1])]
+        self.view_angle_deg = float(view_angle_deg)
+        self.position = list(eye) if eye is not None else list(reference_camera.get_position())
         if eye is not None and look_at is not None:
-            self.sensor.set_quaternion(list(look_at_quaternion(eye, look_at)))
+            self.quaternion, self.orientation = list(look_at_quaternion(eye, look_at)), None
         else:
-            self.sensor.set_orientation(list(reference_camera.get_orientation()))
+            self.quaternion, self.orientation = None, list(reference_camera.get_orientation())
+        self.sensor = None
         self._index = open(os.path.join(out_dir, 'index.csv'), 'w')
         self._index.write('sequence,step,sim_time,file\n')
         self._queue: "queue.Queue" = queue.Queue(maxsize=256)
@@ -83,6 +78,9 @@ class SimVideoRecorder:
             self._tail_left -= 1
         if step % self.every_n:
             return
+        if self.sensor is None:
+            self._create_sensor()
+            return
         self.sensor.handle_explicitly()
         rgb = (np.clip(self.sensor.capture_rgb(), 0.0, 1.0) * 255.0).astype(np.uint8)
         self._sequence += 1
@@ -90,6 +88,22 @@ class SimVideoRecorder:
             self._queue.put_nowait((self._sequence, int(step), float(sim_time), rgb))
         except queue.Full:
             pass
+
+    def _create_sensor(self) -> None:
+        """
+        Headless CoppeliaSim renders black forever from a sensor created before the simulation runs (at client start),
+        while one created once it runs is fine from its second frame: the first one is discarded.
+        """
+        from pyrep.objects.vision_sensor import VisionSensor  # client-only dependency
+
+        self.sensor = VisionSensor.create(self.resolution, explicit_handling=True, view_angle=self.view_angle_deg,
+                                          position=self.position)
+        if self.quaternion is not None:
+            self.sensor.set_quaternion(self.quaternion)
+        else:
+            self.sensor.set_orientation(self.orientation)
+        self.sensor.handle_explicitly()
+        self.sensor.capture_rgb()
 
     def _writer(self) -> None:
         while True:

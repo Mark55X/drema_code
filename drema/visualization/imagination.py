@@ -53,7 +53,8 @@ class ImaginationRecorder:
         sinks: List[ImaginationSink],
         max_rollouts: int = 40,
         ghost_count: int = 3,
-        scene_info: Optional[Callable[[], Dict[str, Any]]] = None
+        scene_info: Optional[Callable[[], Dict[str, Any]]] = None,
+        roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None
     ):
         self.engine = engine
         self.twin = digital_twin
@@ -61,6 +62,7 @@ class ImaginationRecorder:
         self.max_rollouts = max(1, int(max_rollouts))
         self.ghost_count = max(0, int(ghost_count))
         self.scene_info = scene_info
+        self.roles_status = roles_status
         self._context: Dict[str, Any] = {}
         self._scene_ids: Optional[set] = None
         self.dropped = 0
@@ -87,7 +89,13 @@ class ImaginationRecorder:
             'timestep': int(robot_state.timestep),
             'target_pose': np.asarray(robot_state.target_pose, dtype=np.float64),
             'approach_funnel': int(robot_state.approach_funnel) if robot_state.HasField('approach_funnel') else -1,
+            'gripper_open': np.float64(robot_state.gripper_open),
+            'keyframe_index': np.int64(robot_state.keyframe_index),
         }
+        status = self.roles_status() if self.roles_status is not None else []
+        if status:
+            self._context['role_ids'] = np.array([int(r['object_id']) for r in status], dtype=np.int64)
+            self._context['role_names'] = np.array([str(r['role']) for r in status])
 
     def close(self) -> None:
         self.detach()
@@ -143,17 +151,19 @@ class ImaginationRecorder:
             predictor = getattr(twin, 'predictor', None)
             preds = predictor.predict_all(horizon=horizon, dt=dt) if predictor is not None else {}
             ids = []
-            for oid, obj in twin.tracked_objects.items():
-                if obj.get('is_target', False) or 'target_pos' not in obj:
+            for oid in list(twin.tracked_objects):
+                pose = twin.tracked_object_pose(oid)
+                if pose is None:
                     continue
                 ids.append(int(oid))
-                out[f"obs{oid}_pos"] = np.asarray(obj['target_pos'], dtype=np.float64)
-                out[f"obs{oid}_quat"] = np.asarray(obj.get('target_quat', (0, 0, 0, 1)), dtype=np.float64)
+                out[f"obs{oid}_pos"] = np.asarray(pose[0], dtype=np.float64)
+                out[f"obs{oid}_quat"] = np.asarray(pose[1], dtype=np.float64)
                 if oid in preds:
                     out[f"obs{oid}_pred_pos"] = np.asarray(preds[oid].positions, dtype=np.float64)
                     out[f"obs{oid}_pred_quat"] = np.asarray(preds[oid].orientations, dtype=np.float64)
                     out[f"obs{oid}_pred_vel"] = np.asarray(preds[oid].velocities, dtype=np.float64)
             out['obstacle_ids'] = np.asarray(ids, dtype=np.int64)
+            out['held_ids'] = np.asarray(sorted(getattr(twin, 'attachments', {})), dtype=np.int64)
             out['min_obstacle_distance'] = np.float64(twin.get_min_obstacle_distance())
         return out
 
@@ -167,8 +177,6 @@ class ImaginationRecorder:
             with twin.state_lock:
                 objects = list(twin.tracked_objects.items())
             for oid, obj in objects:
-                if obj.get('is_target', False):
-                    continue
                 path = obj.get('mesh_path')
                 if path:
                     scene[f"obs{oid}_mesh_path"] = str(path)
@@ -192,6 +200,7 @@ class ImaginationRecorder:
             'q': np.asarray(snap['q_current'], dtype=np.float64),
             'qd': np.asarray(snap['qd_current'], dtype=np.float64),
             'skeleton': _link_skeletons(kin, snap['q_current'][None, :])[0],
+            'tcp_rot': np.asarray(kin.forward_kinematics_ee(snap['q_current'])[1], dtype=np.float64),
             'rollout_index': sel,
             'rollout_group': np.minimum(sel // M, 3).astype(np.int64),
             'rollout_tcp': tcp,
@@ -215,6 +224,15 @@ class ImaginationRecorder:
                 ghost_steps = np.linspace(H // self.ghost_count, H - 1, self.ghost_count).astype(int)
                 frame['ghost_steps'] = ghost_steps
                 frame['ghost_skeletons'] = _link_skeletons(kin, plan_q[ghost_steps])
+                _, ghost_quat = kin.batch_forward_kinematics_ee(plan_q[ghost_steps][None], return_orientations=True)
+                frame['ghost_tcp_quat'] = np.asarray(ghost_quat[0], dtype=np.float64)
+                held = np.asarray(obstacles.get('held_ids', []), dtype=np.int64)
+                if len(held) and self.twin is not None:
+                    with self.twin.state_lock:
+                        poses = self.twin.attached_poses(plan_q[ghost_steps])
+                    for oid, (pos, quat) in poses.items():
+                        frame[f"held{oid}_ghost_pos"] = np.asarray(pos, dtype=np.float64)
+                        frame[f"held{oid}_ghost_quat"] = np.asarray(quat, dtype=np.float64)
         if snap['q_des'] is not None:
             frame['q_des'] = np.asarray(snap['q_des'], dtype=np.float64)
             frame['q_des_skeleton'] = _link_skeletons(kin, snap['q_des'][None, :])[0]

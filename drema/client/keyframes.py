@@ -31,6 +31,7 @@ class Keyframe:
     rotation_tolerance_deg: Optional[float] = None   # full orientation check, tip-frame keyframes only
     approach_funnel: Optional[bool] = None
     allow_contact: bool = False                      # hand contact at the keypose even without ignore_collisions
+    precise: bool = False                            # approach pose of a grasp / release: left once the arm has settled
 
     def contact_flag(self) -> Optional[bool]:
         """Value sent as RobotState.ignore_collisions: the server reads it as 'hand may touch what is at the keypose'."""
@@ -159,9 +160,12 @@ def keyframes_from_demo(demo, position_tolerance: float = 0.02, rotation_toleran
         prev_open = kf.gripper_open
         frames.append(kf)
     # The pre-grasp keypose sits a couple of centimetres above the object to grasp, inside its collision margin.
+    # Grasps and releases start from the keypose before them: the short final motion cannot fix a lateral offset
+    # left there once the fingers or the held object touch.
     for kf, nxt in zip(frames[:-1], frames[1:]):
         if nxt.approach_funnel:
             kf.allow_contact = True
+        kf.precise = (nxt.gripper_open > 0.5) != (kf.gripper_open > 0.5)
     return frames
 
 
@@ -214,8 +218,13 @@ class PolicyKeyframeSource(KeyframeSource):
         if index >= self.max_keyframes:
             return None
         if index not in self.cache:
-            action = self.act(observe())
-            self.cache[index] = None if action is None else Keyframe.from_action_vector(action, f"policy_kf{index}")
+            obs = observe()
+            action = self.act(obs)
+            kf = None if action is None else Keyframe.from_action_vector(action, f"policy_kf{index}")
+            if kf is not None:
+                # Approach cone on grasps only, as for demo keyframes: elsewhere it would bend free motion
+                kf.approach_funnel = float(getattr(obs, 'gripper_open', 1.0)) > 0.5 and kf.gripper_open < 0.5
+            self.cache[index] = kf
         return self.cache[index]
 
     def reset(self):
@@ -234,20 +243,42 @@ class KeyframeSequencer:
     the gripper to the keyframe state and wait for it, then move on. The last keyframe is held.
     Keyframes where the gripper changes state get tighter tolerances: a grasp or a release closed a couple of
     centimetres off the keypose misses the object, while free-space keyframes only need to be passed through.
+    With settling, those keyframes (and the precise approach poses before them) are reached only once the arm stops
+    closing in, not on the first step inside the tolerance: fingers closed on the way in grasp the object off centre.
     """
 
     def __init__(self, source: KeyframeSource, log: Callable[[str], None] = print,
-                 gripper_change_position_tolerance: float = 0.01, gripper_change_rotation_tolerance_deg: float = 10.0):
+                 gripper_change_position_tolerance: float = 0.01, gripper_change_rotation_tolerance_deg: float = 10.0,
+                 settle_on_gripper_change: bool = False, settle_on_precise_approach: bool = False,
+                 settle_position_tolerance: float = 0.003, settle_progress: float = 0.001, settle_steps: int = 10,
+                 settle_max_steps: int = 60):
+        """
+        :param settle_on_gripper_change: Actuate the gripper only once the arm has settled on the keypose.
+        :param settle_on_precise_approach: Precise keyframes (approach poses of a grasp / release) are left only once
+            the arm has settled on them, within their own tolerance (an approach pose the arm cannot get closer to
+            is still left).
+        :param settle_position_tolerance: Settled at once within this distance [m] of the keypose.
+        :param settle_progress / settle_steps: Settled when the distance shrank less than settle_progress [m] over
+            the last settle_steps steps.
+        :param settle_max_steps: Steps inside the tolerance after which the keyframe counts as reached anyway.
+        """
         self.source = source
         self.log = log
         self.gripper_change_position_tolerance = float(gripper_change_position_tolerance)
         self.gripper_change_rotation_tolerance_deg = float(gripper_change_rotation_tolerance_deg)
+        self.settle_on_gripper_change = bool(settle_on_gripper_change)
+        self.settle_on_precise_approach = bool(settle_on_precise_approach)
+        self.settle_position_tolerance = float(settle_position_tolerance)
+        self.settle_progress = float(settle_progress)
+        self.settle_steps = max(1, int(settle_steps))
+        self.settle_max_steps = max(self.settle_steps, int(settle_max_steps))
         self.reset()
 
     def reset(self) -> None:
         self.index = 0
         self.phase = "move"
         self.finished = False
+        self._settle_errors: List[float] = []
         self.source.reset()
         self._current: Optional[Keyframe] = None
 
@@ -266,12 +297,17 @@ class KeyframeSequencer:
         if kf is None or self.finished:
             return
         gripper_change = kf.gripper_open is not None and (kf.gripper_open > 0.5) != gripper.is_open()
+        precise = self.settle_on_precise_approach and kf.precise
         tight = (self.gripper_change_position_tolerance, self.gripper_change_rotation_tolerance_deg) \
             if gripper_change else (None, None)
+        settle = precise or (gripper_change and self.settle_on_gripper_change)
         if self.phase == "move" and keyframe_reached(kf, ee_pose, *tight):
             err = keyframe_errors(kf, ee_pose)
+            if settle and not self._settled(err['pos']):
+                return
+            settled = f", settled after {len(self._settle_errors)} steps" if settle else ""
             self.log(f"Keyframe '{kf.name}' reached (pos {err['pos'] * 100:.1f} cm, axis {err['axis']:.1f} deg"
-                     + (f", rot {err['rot']:.1f} deg" if kf.frame == "tip" else "") + ")")
+                     + (f", rot {err['rot']:.1f} deg" if kf.frame == "tip" else "") + f"{settled})")
             if kf.gripper_open is not None and (kf.gripper_open > 0.5) != gripper.is_open():
                 gripper.command(kf.gripper_open)
                 self.phase = "gripper"
@@ -280,7 +316,17 @@ class KeyframeSequencer:
                 self._advance()
         elif self.phase == "gripper" and gripper.done:
             self._advance()
+        elif self.phase == "move":
+            self._settle_errors = []
+
+    def _settled(self, pos_err: float) -> bool:
+        self._settle_errors.append(pos_err)
+        n = len(self._settle_errors)
+        if pos_err <= self.settle_position_tolerance or n >= self.settle_max_steps:
+            return True
+        return n > self.settle_steps and self._settle_errors[-self.settle_steps - 1] - pos_err < self.settle_progress
 
     def _advance(self) -> None:
         self.index += 1
         self.phase = "move"
+        self._settle_errors = []

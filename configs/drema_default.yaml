@@ -193,15 +193,34 @@ roles:
     enabled: true
     on_grasp_keyframes: true         # Gripper commanded closed at the keypose: the hand may enclose the objects there (TARGET)
     on_approach_keyframes: true      # ignore_collisions with the gripper open: the hand may come close to them (NEAR)
-    radius: 0.05                     # Objects whose surface is within this distance [m] of the keypose TCP
-    include_table: true              # The table becomes touchable by the hand when it lies at the keypose
-    near_margin: 0.03                # NEAR: hand margin reduced by this [m]
+    zone_tolerance: 0.035            # Contact zone: objects within this distance [m] of the hand footprint at the keypose (= controller.sigma_2: what the hand would feel in the cost there)
+    grip_tolerance: 0.01             # Grasp keyframes: objects within this distance [m] of the space between the fingers -> TARGET
+    include_table: true              # The table may enter the contact zone
+    near_margin: 0.03                # NEAR (the rest of the zone): hand margin reduced by this [m]
+    max_speed: 0.03                  # Objects faster than this [m/s] never enter the zone; moving ones leave it until the next keyframe
+    held_contact: false              # A held object may touch every NEAR object, not only its support (see support_contact)
+    support_contact:                 # ignore_collisions keyframe with an object held: its supports at the keypose are TARGET for the keyframe
+      enabled: true
+      include_table: true            # The table may be a support
+      tolerance: 0.01                # Support = within zone_tolerance of the held object at the keypose and either brought closer by this [m] over the keyframe (the jar under its lid) or within this at both its start and its end (a lid screwed on); the closest one plus any other within this
+    hold_until_clear: true           # An object still touched when the zone changes keeps its TARGET / NEAR policy until the hand is clear of it
+    push_contact:                    # ignore_collisions keyframe started with the hand empty: the first object the hand runs into on its way to the keypose may be pushed (TARGET for the keyframe)
+      enabled: true
+      reach: 0.035                   # Only an object hit within this travel [m] from where the keyframe starts
+      step: 0.005                    # Sweep step [m] of the hand footprint along the straight line to the keypose
+      tolerance: 0.005               # Hit: footprint within this distance [m] of the object and closer than at the start by as much
+    hand_footprint:                  # Franka hand at the keypose TCP: z along the approach, y along the finger opening
+      finger_axis_yaw_deg: -45.0     # Finger opening axis vs the EE frame y axis
+      palm: {center: [0.0, -0.004, -0.1075], half_extents: [0.032, 0.104, 0.0685]}
+      fingers: {center: [0.0, -0.002, -0.034], half_extents: [0.011, 0.067, 0.037]}
+      grip: {center: [0.0, -0.002, -0.034], half_extents: [0.011, 0.038, 0.037]}
   grasp:                             # Held state: closed gripper + touchable object at the TCP -> attached in the twin
     enabled: true
     radius: 0.04                     # Max object surface distance [m] from the TCP to attach it
     closed_threshold: 0.9            # Below this the fingers count as closed; wider grasps are detected from the finger motion stopping
     open_threshold: 0.9              # Commanded release completes above this open amount (or once the fingers open 2% from the grasp)
-    settle_steps: 3                  # Consecutive control requests with the gripper closed before attaching
+    settle_steps: 3                  # Clients without gripper actuator state: consecutive closed requests before attaching
+    empty_threshold: 0.05            # Fingers that stopped closing below this open amount hold nothing
     released_state: true             # A released object stays touchable by the hand until the TCP is release_clearance away
     release_clearance: 0.03          # [m]
 

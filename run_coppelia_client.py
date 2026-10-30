@@ -79,6 +79,8 @@ class CoppeliaSimulationClient:
         roles_config: Optional[str] = "configs/roles_env.yaml",
         keyframes: str = "auto",
         policy: Optional[str] = None,
+        settle_gripper: bool = True,
+        settle_approach: bool = True,
         actuation: str = "position"
     ):
         """
@@ -86,11 +88,15 @@ class CoppeliaSimulationClient:
         :param keyframes: Keyframe source: 'task' (Task.get_keyframes), 'demo' (RLBench demo keyposes found with
                           PerAct's keypoint discovery), 'policy' (--policy), 'none', or 'auto'.
         :param policy: External keyframe policy 'module:function' (e.g. a PerAct wrapper), see PolicyKeyframeSource.
+        :param settle_gripper: Actuate the gripper only once the arm has settled on the keypose.
+        :param settle_approach: Approach poses of a grasp / release must be reached precisely, with the arm settled.
         :param actuation: How the MPC joint velocities reach the arm, see drema.client.actuation.
         """
         self.server_address = server_address
         self.keyframe_mode = keyframes
         self.policy_spec = policy
+        self.settle_gripper = bool(settle_gripper)
+        self.settle_approach = bool(settle_approach)
         self.actuation_mode = actuation
         self.actuator: Optional[JointCommandExecutor] = None
         self.sequencer: Optional[KeyframeSequencer] = None
@@ -454,7 +460,9 @@ class CoppeliaSimulationClient:
         else:
             self.sequencer = None
             return
-        self.sequencer = KeyframeSequencer(source, log=lambda m: print(f"[COPPELIA ENVIRONMENT] >>> {m}"))
+        self.sequencer = KeyframeSequencer(source, log=lambda m: print(f"[COPPELIA ENVIRONMENT] >>> {m}"),
+                                           settle_on_gripper_change=self.settle_gripper,
+                                           settle_on_precise_approach=self.settle_approach)
 
     def observe(self) -> Any:
         """Current RLBench Observation (for keyframe policies such as PerAct)."""
@@ -893,7 +901,9 @@ class CoppeliaSimulationClient:
                         target_in_tip_frame=target_in_tip_frame,
                         yaw_symmetric=target_in_tip_frame,
                         roles_revision=roles_revision,
-                        role_assignments=role_assignments
+                        role_assignments=role_assignments,
+                        gripper_actuated=self.gripper_ctrl.target if self.gripper_ctrl is not None else None,
+                        gripper_moving=self.gripper_ctrl.busy if self.gripper_ctrl is not None else None
                     )
                     self.role_manager.update_server_status(action.object_roles)
                     # 4. Actuate Robot
@@ -1021,6 +1031,10 @@ def parse_args():
                              "an external policy (--policy), or none (default: auto)")
     parser.add_argument("--policy", type=str, default=None,
                         help="External keyframe policy 'module:function' returning act(obs) -> PerAct action vector")
+    parser.add_argument("--no_settle_gripper", action="store_true", default=False,
+                        help="Actuate the gripper on the first step inside the keyframe tolerance, without waiting for the arm to settle")
+    parser.add_argument("--no_settle_approach", action="store_true", default=False,
+                        help="Approach poses of a grasp / release keep the free-space tolerance")
     parser.add_argument("--actuation", type=str, default="position", choices=list(JointCommandExecutor.MODES),
                         help="Arm actuation: 'position' integrates the MPC joint velocities into a joint reference "
                              "(holds against gravity, default); 'velocity' sends raw joint velocity targets")
@@ -1057,6 +1071,8 @@ if __name__ == "__main__":
         roles_config=args.roles_config or None,
         keyframes=args.keyframes,
         policy=args.policy,
+        settle_gripper=not args.no_settle_gripper,
+        settle_approach=not args.no_settle_approach,
         actuation=args.actuation
     )
     client.run()

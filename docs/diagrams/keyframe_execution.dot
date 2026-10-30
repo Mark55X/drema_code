@@ -1,0 +1,46 @@
+// Keyframe execution of the client (drema/client/keyframes.py, KeyframeSequencer). Fixed layout: states carry only
+// their name, edges a short word placed beside them, the legend explains both. Render with docs/diagrams/render.sh.
+digraph keyframe_execution {
+    graph [layout=neato, splines=line, fontname="Helvetica", fontsize=24, pad=0.3, outputorder=edgesfirst,
+           label=<<b>Keyframe execution: when a keyframe counts as reached</b>>, labelloc=t];
+    node [fontname="Helvetica", fontsize=16, shape=box, style="rounded,filled,bold", penwidth=1.8, fixedsize=true,
+          width=1.7, height=0.7];
+    edge [penwidth=1.6, color="#444444", arrowsize=1.1];
+
+    move    [pos="1.6,4.0!", label=<<b>MOVE</b>>, fillcolor="#cfe2f3"];
+    settle  [pos="5.6,4.0!", label=<<b>SETTLE</b>>, fillcolor="#fff2cc"];
+    gripper [pos="9.6,4.0!", label=<<b>GRIPPER</b>>, fillcolor="#d9ead3"];
+    next    [pos="5.6,1.4!", label=<<b>NEXT</b>>, fillcolor="#eeeeee"];
+
+    move:e -> settle:w;
+    settle:sw -> move:se [style=dashed];
+    settle:e -> gripper:w;
+    settle:s -> next:n;
+    gripper:s -> next:e;
+    move:s -> next:w;
+
+    node [shape=plaintext, style="", fontsize=14, fixedsize=false, width=0, height=0, margin=0];
+    l_contact  [pos="3.6,4.25!", label=<<b>contact</b>>];
+    l_leaves   [pos="3.6,3.4!", label=<<i>leaves</i>>];
+    l_settled  [pos="7.6,4.25!", label=<<b>settled</b>>];
+    l_approach [pos="6.05,2.7!", label=<<b>settled</b>>];
+    l_done     [pos="8.4,2.3!", label=<<b>done</b>>];
+    l_free     [pos="2.8,2.3!", label=<<b>free</b>>];
+
+    legend [pos="13.6,2.9!", shape=plaintext, fontsize=12, label=<
+<table border="1" cellborder="0" cellspacing="0" cellpadding="5" rows="*" color="#9e9e9e">
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>States</b>  client sequencer; the server MPPI<br/>decides how the arm moves</font></td></tr>
+<tr><td bgcolor="#cfe2f3"><b>MOVE</b></td><td align="left" balign="left">the MPPI tracks the keypose<br/>(approach cone on grasps)</td></tr>
+<tr><td bgcolor="#fff2cc"><b>SETTLE</b></td><td align="left" balign="left">wait until the arm stops closing in</td></tr>
+<tr><td bgcolor="#d9ead3"><b>GRIPPER</b></td><td align="left" balign="left">close / open, wait for the fingers</td></tr>
+<tr><td bgcolor="#eeeeee"><b>NEXT</b></td><td align="left" balign="left">the next keyframe becomes active</td></tr>
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Transitions</b></font></td></tr>
+<tr><td align="left"><b>free</b></td><td align="left" balign="left">free keyframe: within 2 cm</td></tr>
+<tr><td align="left"><b>contact</b></td><td align="left" balign="left">grasp / release: within 1 cm;<br/>approach pose before them: within 2 cm</td></tr>
+<tr><td align="left"><b>settled</b></td><td align="left" balign="left">within 3 mm, or less than 1 mm closer<br/>over 10 steps (0.5 s), or 60 steps:<br/>the gripper acts on a grasp / release,<br/>an approach pose goes straight to NEXT</td></tr>
+<tr><td align="left"><i>leaves</i></td><td align="left" balign="left">the arm leaves the tolerance while settling</td></tr>
+<tr><td align="left"><b>done</b></td><td align="left" balign="left">the fingers have stopped</td></tr>
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Note</b></font></td></tr>
+<tr><td colspan="2" align="left" balign="left">Approach poses are known for demo keyframes only:<br/>a policy gives one keyframe at a time.</td></tr>
+</table>>];
+}

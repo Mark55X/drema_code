@@ -80,6 +80,7 @@ class ObjectCollisionPolicy:
     extra_margin: float = 0.0
     held: bool = False
     hand_margin: float = 0.0    # added to extra_margin for the hand only; negative = the hand may come closer
+    held_contact: bool = False  # objects held by the gripper may touch this one (e.g. a lid placed on its jar)
 
     def pair_allowed(self, is_hand: bool) -> bool:
         """True when the (robot part, object) pair must be kept collision free."""
@@ -92,6 +93,10 @@ class ObjectCollisionPolicy:
         if not self.pair_allowed(is_hand):
             return None
         return self.extra_margin + (self.hand_margin if is_hand else 0.0)
+
+    def held_margin(self) -> Optional[float]:
+        """Distance offset of the (held object, object) pair; None when the pair is exempt."""
+        return None if self.held_contact else self.pair_margin(True)
 
 
 FULL_CONTACT = ObjectCollisionPolicy(hand_contact=True, arm_contact=True)

@@ -155,6 +155,23 @@ class BaseDigitalTwin(ABC):
             self._surface_points[mesh_path] = pts
         return pts
 
+    def object_body_points(self, obj_id: int) -> Optional[np.ndarray]:
+        """Surface points of a tracked object in its body frame, or None without a mesh."""
+        mesh_path = getattr(self, 'tracked_objects', {}).get(obj_id, {}).get('mesh_path')
+        if not mesh_path:
+            return None
+        try:
+            return self._object_surface_points(mesh_path)
+        except Exception:
+            return None
+
+    def _object_world_points(self, obj_id: int) -> Optional[np.ndarray]:
+        local = self.object_body_points(obj_id)
+        pose = self.tracked_object_pose(obj_id)
+        if local is None or pose is None or not len(local):
+            return None
+        return local @ Rotation.from_quat(pose[1]).as_matrix().T + np.asarray(pose[0])
+
     def objects_near_point(self, point: np.ndarray, radius: float, include_table: bool = False) -> Dict[int, float]:
         """
         Objects whose surface lies within `radius` of a world point, as {obj_id: distance}; the table, when
@@ -163,17 +180,11 @@ class BaseDigitalTwin(ABC):
         point = np.asarray(point, dtype=np.float64).reshape(3)
         near: Dict[int, float] = {}
         with self.state_lock:
-            for obj_id, obj in getattr(self, 'tracked_objects', {}).items():
-                mesh_path = obj.get('mesh_path')
-                pose = self.tracked_object_pose(obj_id)
-                if not mesh_path or pose is None:
+            for obj_id in getattr(self, 'tracked_objects', {}):
+                world = self._object_world_points(obj_id)
+                if world is None:
                     continue
-                try:
-                    local = self._object_surface_points(mesh_path)
-                except Exception:
-                    continue
-                world = local @ Rotation.from_quat(pose[1]).as_matrix().T + np.asarray(pose[0])
-                d = float(np.min(np.linalg.norm(world - point, axis=1))) if len(world) else float('inf')
+                d = float(np.min(np.linalg.norm(world - point, axis=1)))
                 if d <= radius:
                     near[obj_id] = d
             if include_table and getattr(self, 'table_id', -1) >= 0:
@@ -181,6 +192,62 @@ class BaseDigitalTwin(ABC):
                 if d_table <= radius:
                     near[-1] = d_table
         return near
+
+    def objects_near_geometry(
+        self,
+        radius: float,
+        boxes: List[Tuple[np.ndarray, np.ndarray]] = (),
+        points: Optional[np.ndarray] = None,
+        include_table: bool = False,
+        exclude: Any = (),
+        signed: bool = False
+    ) -> Dict[int, float]:
+        """
+        Objects whose surface lies within `radius` of a world geometry made of oriented boxes
+        [(T_world_box 4x4, half_extents)] and a point cloud [N, 3], as {obj_id: distance}; the table is id -1.
+        With `signed`, surface points inside a box count as minus their depth (how far the boxes overlap the object).
+        """
+        from scipy.spatial import cKDTree
+        tree = cKDTree(points) if points is not None and len(points) else None
+        near: Dict[int, float] = {}
+        with self.state_lock:
+            for obj_id in getattr(self, 'tracked_objects', {}):
+                if obj_id in exclude:
+                    continue
+                world = self._object_world_points(obj_id)
+                if world is None:
+                    continue
+                d = float('inf')
+                for T, half in boxes:
+                    q = np.abs((world - T[:3, 3]) @ T[:3, :3]) - half
+                    dist = np.linalg.norm(np.maximum(q, 0.0), axis=1)
+                    if signed:
+                        dist = dist + np.minimum(np.max(q, axis=1), 0.0)
+                    d = min(d, float(np.min(dist)))
+                if tree is not None:
+                    d = min(d, float(np.min(tree.query(world)[0])))
+                if d <= radius:
+                    near[obj_id] = d
+            if include_table and getattr(self, 'table_id', -1) >= 0:
+                lows = [float(np.min((T[:3, :3] @ (np.array(np.meshgrid([-1, 1], [-1, 1], [-1, 1])).reshape(3, -1)
+                                                    * np.asarray(half)[:, None]))[2] + T[2, 3]))
+                        for T, half in boxes]
+                if points is not None and len(points):
+                    lows.append(float(np.min(points[:, 2])))
+                if lows:
+                    d_table = max(0.0, min(lows) - float(getattr(self, 'table_z', 0.0)))
+                    if d_table <= radius:
+                        near[-1] = d_table
+        return near
+
+    def object_velocities(self) -> Dict[int, np.ndarray]:
+        """Estimated linear velocity [m/s] of each tracked object (zero without a motion estimate)."""
+        return {int(o['id']): np.asarray(o.get('velocity', (0.0, 0.0, 0.0)), dtype=np.float64)
+                for o in self.get_tracked_obstacles_info()}
+
+    def object_speeds(self) -> Dict[int, float]:
+        """Estimated linear speed [m/s] of each tracked object (0 without a motion estimate)."""
+        return {obj_id: float(np.linalg.norm(v)) for obj_id, v in self.object_velocities().items()}
 
     def tracked_object_pose(self, obj_id: int) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
         """Pose last set by tracking (or by the gripper when held), not the physics body lagging behind it."""

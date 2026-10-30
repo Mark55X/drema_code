@@ -83,29 +83,36 @@ class _WorkerSink(ImaginationSink):
 
 def load_obj_mesh(path: str, cluster_size: Optional[float] = None) -> Optional[tuple]:
     """
-    Vertices and triangular faces of an OBJ. With cluster_size [m], vertices are merged on a grid of that size
-    (vertex-clustering decimation), which keeps the shape while cutting the face count for lightweight rendering.
+    Vertices, triangular faces and per-vertex RGB colors (None when the OBJ has none) of an OBJ. With cluster_size
+    [m], vertices are merged on a grid of that size (vertex-clustering decimation), which keeps the shape while
+    cutting the face count for lightweight rendering.
     """
     if not path or not os.path.exists(path):
         return None
-    vertices, faces = [], []
+    vertices, colors, faces = [], [], []
     with open(path) as f:
         for line in f:
             if line.startswith('v '):
-                vertices.append([float(x) for x in line.split()[1:4]])
+                values = [float(x) for x in line.split()[1:]]
+                vertices.append(values[:3])
+                colors.append(values[3:6] if len(values) >= 6 else None)
             elif line.startswith('f '):
                 idx = [int(tok.split('/')[0]) - 1 for tok in line.split()[1:]]
                 faces.extend([idx[0], idx[i], idx[i + 1]] for i in range(1, len(idx) - 1))
     v, fc = np.asarray(vertices, dtype=np.float64), np.asarray(faces, dtype=np.int64)
+    col = np.asarray(colors, dtype=np.float64) if colors and all(c is not None for c in colors) else None
     if cluster_size:
         cells, inverse = np.unique(np.round(v / cluster_size).astype(np.int64), axis=0, return_inverse=True)
         inverse = inverse.reshape(-1)
         counts = np.bincount(inverse, minlength=len(cells)).astype(np.float64)
         v = np.stack([np.bincount(inverse, weights=v[:, k], minlength=len(cells)) for k in range(3)], axis=1) / counts[:, None]
+        if col is not None:
+            col = np.stack([np.bincount(inverse, weights=col[:, k], minlength=len(cells))
+                            for k in range(3)], axis=1) / counts[:, None]
         fc = inverse[fc]
         fc = fc[(fc[:, 0] != fc[:, 1]) & (fc[:, 1] != fc[:, 2]) & (fc[:, 0] != fc[:, 2])]
         fc = np.unique(np.sort(fc, axis=1), axis=0)
-    return v.astype(np.float32), fc
+    return v.astype(np.float32), fc, (np.clip(col, 0.0, 1.0).astype(np.float32) if col is not None else None)
 
 
 class NpzFrameRecorder(_WorkerSink):
@@ -127,7 +134,9 @@ class NpzFrameRecorder(_WorkerSink):
             mesh = load_obj_mesh(str(scene[key]), self.mesh_cluster_size)
             if mesh is not None:
                 prefix = key[:-len('_mesh_path')]
-                data[f"{prefix}_vertices"], data[f"{prefix}_faces"] = mesh
+                data[f"{prefix}_vertices"], data[f"{prefix}_faces"] = mesh[0], mesh[1]
+                if mesh[2] is not None:
+                    data[f"{prefix}_colors"] = mesh[2]
         np.savez_compressed(os.path.join(self.out_dir, 'scene.npz'), **data)
 
     def _handle_frame(self, frame: Dict[str, Any]) -> None:

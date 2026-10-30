@@ -1,0 +1,108 @@
+// Object role automaton of the server (drema/roles/registry.py). Fixed layout: states carry only their name, edges
+// a short word placed beside them, the legend explains both. Render with docs/diagrams/render.sh.
+digraph object_roles {
+    graph [layout=neato, splines=line, fontname="Helvetica", fontsize=24, pad=0.3, outputorder=edgesfirst,
+           label=<<b>Object roles: what the robot may touch</b>>, labelloc=t];
+    node [fontname="Helvetica", fontsize=16, shape=box, style="rounded,filled,bold", penwidth=1.8, fixedsize=true,
+          width=1.7, height=0.7];
+    edge [penwidth=1.6, color="#444444", arrowsize=1.1];
+
+    obstacle [pos="1.6,3.8!", label=<<b>OBSTACLE</b>>, fillcolor="#eeeeee"];
+    near     [pos="4.6,6.4!", label=<<b>NEAR</b>>, fillcolor="#fff2cc"];
+    target   [pos="7.6,3.8!", label=<<b>TARGET</b>>, fillcolor="#d9ead3"];
+    held     [pos="10.4,3.8!", label=<<b>HELD</b>>, fillcolor="#cfe2f3"];
+    released [pos="10.4,1.2!", label=<<b>RELEASED</b>>, fillcolor="#d9d2e9"];
+
+    obstacle:n -> near:w;
+    near:s -> obstacle:ne [style=dashed];
+    near:e -> target:n;
+    target:e -> held:w;
+    held:s -> released:n;
+    released:w -> obstacle:s;
+
+    // grasp and its return run between points on the facing sides, so they sit inside the height of the states
+    node [shape=point, width=0.01, style=invis, fixedsize=true];
+    grasp_o [pos="2.45,3.97!"];  grasp_t [pos="6.75,3.97!"];
+    ends_t [pos="6.75,3.63!"];  ends_o [pos="2.45,3.63!"];
+    grasp_o -> grasp_t;
+    ends_t -> ends_o [style=dashed];
+
+    // hold loops: circular arcs drawn as short segments through invisible points
+    node [shape=point, width=0.01, style=invis, fixedsize=true];
+    near_h0 [pos="4.877,6.790!"];  near_h1 [pos="4.909,6.867!"];  near_h2 [pos="4.920,6.950!"];  near_h3 [pos="4.909,7.033!"];  near_h4 [pos="4.877,7.110!"];  near_h5 [pos="4.826,7.176!"];  near_h6 [pos="4.760,7.227!"];  near_h7 [pos="4.683,7.259!"];  near_h8 [pos="4.600,7.270!"];  near_h9 [pos="4.517,7.259!"];  near_h10 [pos="4.440,7.227!"];  near_h11 [pos="4.374,7.176!"];  near_h12 [pos="4.323,7.110!"];  near_h13 [pos="4.291,7.033!"];  near_h14 [pos="4.280,6.950!"];  near_h15 [pos="4.291,6.867!"];  near_h16 [pos="4.323,6.790!"];
+    near -> near_h0 [arrowhead=none];
+    near_h0 -> near_h1 [arrowhead=none];
+    near_h1 -> near_h2 [arrowhead=none];
+    near_h2 -> near_h3 [arrowhead=none];
+    near_h3 -> near_h4 [arrowhead=none];
+    near_h4 -> near_h5 [arrowhead=none];
+    near_h5 -> near_h6 [arrowhead=none];
+    near_h6 -> near_h7 [arrowhead=none];
+    near_h7 -> near_h8 [arrowhead=none];
+    near_h8 -> near_h9 [arrowhead=none];
+    near_h9 -> near_h10 [arrowhead=none];
+    near_h10 -> near_h11 [arrowhead=none];
+    near_h11 -> near_h12 [arrowhead=none];
+    near_h12 -> near_h13 [arrowhead=none];
+    near_h13 -> near_h14 [arrowhead=none];
+    near_h14 -> near_h15 [arrowhead=none];
+    near_h15 -> near_h16 [arrowhead=none];
+    near_h16 -> near [arrowsize=0.9];
+
+    target_h0 [pos="7.340,3.320!"];  target_h1 [pos="7.310,3.248!"];  target_h2 [pos="7.300,3.170!"];  target_h3 [pos="7.310,3.092!"];  target_h4 [pos="7.340,3.020!"];  target_h5 [pos="7.388,2.958!"];  target_h6 [pos="7.450,2.910!"];  target_h7 [pos="7.522,2.880!"];  target_h8 [pos="7.600,2.870!"];  target_h9 [pos="7.678,2.880!"];  target_h10 [pos="7.750,2.910!"];  target_h11 [pos="7.812,2.958!"];  target_h12 [pos="7.860,3.020!"];  target_h13 [pos="7.890,3.092!"];  target_h14 [pos="7.900,3.170!"];  target_h15 [pos="7.890,3.248!"];  target_h16 [pos="7.860,3.320!"];
+    target -> target_h0 [arrowhead=none];
+    target_h0 -> target_h1 [arrowhead=none];
+    target_h1 -> target_h2 [arrowhead=none];
+    target_h2 -> target_h3 [arrowhead=none];
+    target_h3 -> target_h4 [arrowhead=none];
+    target_h4 -> target_h5 [arrowhead=none];
+    target_h5 -> target_h6 [arrowhead=none];
+    target_h6 -> target_h7 [arrowhead=none];
+    target_h7 -> target_h8 [arrowhead=none];
+    target_h8 -> target_h9 [arrowhead=none];
+    target_h9 -> target_h10 [arrowhead=none];
+    target_h10 -> target_h11 [arrowhead=none];
+    target_h11 -> target_h12 [arrowhead=none];
+    target_h12 -> target_h13 [arrowhead=none];
+    target_h13 -> target_h14 [arrowhead=none];
+    target_h14 -> target_h15 [arrowhead=none];
+    target_h15 -> target_h16 [arrowhead=none];
+    target_h16 -> target [arrowsize=0.9];
+
+    node [shape=plaintext, style="", fontsize=14, fixedsize=false, width=0, height=0, margin=0];
+    l_zone    [pos="2.3,5.55!", label=<<b>zone</b>>];
+    l_end1    [pos="3.9,4.8!", label=<<i>ends</i>>];
+    l_grasp   [pos="4.6,4.22!", label=<<b>grasp</b>>];
+    l_end2    [pos="4.6,3.38!", label=<<i>ends</i>>];
+    l_policy  [pos="7.3,5.75!", label=<<b>push</b> / <b>support</b>>];
+    l_close   [pos="9.0,4.05!", label=<<b>close</b>>];
+    l_open    [pos="10.75,2.5!", label=<<b>open</b>>];
+    l_away    [pos="5.5,2.02!", label=<<b>3 cm away</b>>];
+    l_hold1   [pos="4.6,7.5!", label=<<i>hold</i>>];
+    l_hold2   [pos="7.6,2.62!", label=<<i>hold</i>>];
+
+    legend [pos="14.9,3.95!", shape=plaintext, fontsize=12, label=<
+<table border="1" cellborder="0" cellspacing="0" cellpadding="5" rows="*" color="#9e9e9e">
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>States</b>  objects without an explicit permission;<br/>the arm always keeps its full margin</font></td></tr>
+<tr><td bgcolor="#eeeeee"><b>OBSTACLE</b></td><td align="left" balign="left">default: full margin, halt on penetration</td></tr>
+<tr><td bgcolor="#fff2cc"><b>NEAR</b></td><td align="left" balign="left">hand may come 3 cm closer, halt on penetration</td></tr>
+<tr><td bgcolor="#d9ead3"><b>TARGET</b></td><td align="left" balign="left">hand and held object may touch it</td></tr>
+<tr><td bgcolor="#cfe2f3"><b>HELD</b></td><td align="left" balign="left">in the gripper, moves with the hand</td></tr>
+<tr><td bgcolor="#d9d2e9"><b>RELEASED</b></td><td align="left" balign="left">just let go, the hand may still touch it</td></tr>
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Transitions</b>  on keyframes closing the gripper<br/>or with ignore_collisions</font></td></tr>
+<tr><td align="left"><b>zone</b></td><td align="left" balign="left">within 3.5 cm of the hand at the keypose</td></tr>
+<tr><td align="left"><b>grasp</b></td><td align="left" balign="left">between the fingers at the keypose</td></tr>
+<tr><td align="left"><b>push</b></td><td align="left" balign="left">hand empty: first object hit in 3.5 cm of travel</td></tr>
+<tr><td align="left"><b>support</b></td><td align="left" balign="left">holding: brought onto it, or resting on it</td></tr>
+<tr><td align="left"><b>close / open</b></td><td align="left" balign="left">the gripper closes on it / opens</td></tr>
+<tr><td align="left"><b>3 cm away</b></td><td align="left" balign="left">the hand has left the released object</td></tr>
+<tr><td align="left"><i>hold</i></td><td align="left" balign="left">still touched: keeps its role</td></tr>
+<tr><td align="left"><i>ends</i></td><td align="left" balign="left">keyframe over and hand 3.5 cm away,<br/>or moving on its own &gt; 3 cm/s<br/>(a pushed object may move with the hand)</td></tr>
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Permissions</b>  config / VLM restrict, only a human relaxes</font></td></tr>
+<tr><td bgcolor="#d9ead3"><b>TOUCH</b></td><td align="left" balign="left">human: TARGET whatever the state</td></tr>
+<tr><td bgcolor="#f4cccc"><b>AVOID</b></td><td align="left" balign="left">never NEAR / TARGET</td></tr>
+<tr><td bgcolor="#f4cccc"><b>FRAGILE</b></td><td align="left" balign="left">never NEAR / TARGET, margin +3 cm</td></tr>
+<tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Precedence</b></font></td></tr>
+<tr><td colspan="2" align="left" balign="left">HELD &gt; RELEASED &gt; TOUCH &gt; FRAGILE &gt; AVOID<br/>&gt; TARGET / NEAR &gt; OBSTACLE. The table is never pushed.</td></tr>
+</table>>];
+}
