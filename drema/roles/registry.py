@@ -24,7 +24,7 @@ On top of the permissions, two server-side mechanisms:
   Push contact: when an ignore_collisions keyframe starts with the hand empty, the first object the hand footprint
   runs into within `policy_push_reach` of its straight way to the keypose becomes TARGET for the keyframe (the block
   of slide_block, which lies where the push starts, not at the keypose); only that one, and only when at rest and
-  without an explicit permission. It is not revoked while it moves with the hand;
+  without an explicit permission. It is not revoked while the hand touches it (it moves because of the hand);
 - held state: when the gripper closes on a touchable object it is attached to the TCP in the twin, and released
   when the gripper opens again. A released object stays touchable by the hand until the TCP is
   `release_clearance` away from it (the open fingers still surround it right after the release).
@@ -270,8 +270,7 @@ class ObjectRoleRegistry:
             q = np.asarray(robot_state.joint_positions, dtype=np.float64)
             tcp_T = self._tcp_transform(kinematics, q) if len(q) == 7 else None
 
-            v_tcp = self._tcp_velocity(kinematics, q, robot_state.joint_velocities, tcp_T)
-            self._update_policy_contact(robot_state, digital_twin, tcp_T, v_tcp)
+            self._update_policy_contact(robot_state, digital_twin, tcp_T)
             if tcp_T is not None:
                 self._update_held(robot_state, digital_twin, kinematics, tcp_T, object_ids)
 
@@ -389,8 +388,7 @@ class ObjectRoleRegistry:
                 clouds.append(local @ T[:3, :3].T + T[:3, 3])
         return np.vstack(clouds) if clouds else None
 
-    def _update_policy_contact(self, robot_state: Any, digital_twin: Any, tcp_T: Optional[np.ndarray],
-                               v_tcp: np.ndarray) -> None:
+    def _update_policy_contact(self, robot_state: Any, digital_twin: Any, tcp_T: Optional[np.ndarray]) -> None:
         keyframe_index = int(robot_state.keyframe_index)
         same_keyframe = keyframe_index == self._last_keyframe_index
         self._last_keyframe_index = keyframe_index
@@ -408,15 +406,15 @@ class ObjectRoleRegistry:
 
         grasp = closed and not self.held
         exclude = set(self.held)
-        velocities = digital_twin.object_velocities()
-        speeds = {o: float(np.linalg.norm(v)) for o, v in velocities.items()}
+        speeds = digital_twin.object_speeds()
         if not same_keyframe:
             self.push_targets = set()
             if (self.policy_push_enabled and approach and boxes is not None and not self.held
                     and tcp_T is not None):
                 self.push_targets = self._push_contact(boxes["keypose"], tcp_T, digital_twin, speeds, keyframe_index)
         pushed = self.push_targets | self._pushed
-        moving = lambda o: self._moving(o, velocities, v_tcp, pushed)
+        touched_pushed = self._touching(pushed, digital_twin, tcp_T) if pushed else set()
+        moving = lambda o: self._moving(o, speeds, touched_pushed)
         zone, target = set(), set()
         if boxes is not None:
             held_points = self._held_points_at(boxes["keypose"], digital_twin)
@@ -469,12 +467,9 @@ class ObjectRoleRegistry:
         self._pushed = (self.push_targets & zone) | (self._pushed & hold)
         self.policy_contact, self.policy_contact_target = new_zone, new_target
 
-    def _moving(self, obj_id: int, velocities: Dict[int, np.ndarray], v_tcp: np.ndarray, pushed: Set[int]) -> bool:
-        """Faster than policy_contact_max_speed; a pushed object only when it does not move with the hand."""
-        v = velocities.get(obj_id)
-        if v is None or np.linalg.norm(v) <= self.policy_contact_max_speed:
-            return False
-        return obj_id not in pushed or np.linalg.norm(v - v_tcp) > self.policy_contact_max_speed
+    def _moving(self, obj_id: int, speeds: Dict[int, float], touched_pushed: Set[int]) -> bool:
+        """Moving on its own: faster than policy_contact_max_speed and not a pushed object the hand touches."""
+        return speeds.get(obj_id, 0.0) > self.policy_contact_max_speed and obj_id not in touched_pushed
 
     def _push_contact(self, key_T: np.ndarray, tcp_T: np.ndarray, digital_twin: Any, speeds: Dict[int, float],
                       keyframe_index: int) -> Set[int]:
@@ -558,24 +553,23 @@ class ObjectRoleRegistry:
                           f"({candidates[obj_id] * 100:.1f} cm, {how}), TARGET for the keyframe")
         return supports
 
-    def _tcp_velocity(self, kinematics: Any, q: np.ndarray, qd: Any, tcp_T: Optional[np.ndarray]) -> np.ndarray:
-        qd = np.asarray(qd, dtype=np.float64)
-        if tcp_T is None or len(qd) != 7:
-            return np.zeros(3)
-        eps = 1e-3
-        return (self._tcp_transform(kinematics, q + eps * qd)[:3, 3] - tcp_T[:3, 3]) / eps
-
     def _still_touched(self, candidates: Set[int], digital_twin: Any, tcp_T: Optional[np.ndarray],
                        moving: Any) -> Set[int]:
-        """Objects among the candidates that the hand, or what it holds, is still within the zone tolerance of."""
-        if not (self.policy_contact_hold and candidates) or tcp_T is None:
+        """Objects among the candidates that the hand, or what it holds, still touches, unless they move on their own."""
+        if not self.policy_contact_hold:
+            return set()
+        return {o for o in self._touching(candidates, digital_twin, tcp_T) if not moving(o)}
+
+    def _touching(self, candidates: Set[int], digital_twin: Any, tcp_T: Optional[np.ndarray]) -> Set[int]:
+        """Objects among the candidates within the zone tolerance of the hand, or of what it holds."""
+        if not candidates or tcp_T is None:
             return set()
         boxes = self._hand_boxes(tcp_T)
         held_points = self._held_points_at(tcp_T, digital_twin)
         near = digital_twin.objects_near_geometry(
             self.policy_contact_zone_tolerance, [boxes["palm"], boxes["fingers"]], held_points,
             include_table=TABLE_ID in candidates, exclude=set(self.held))
-        return {o for o in candidates if o in near and not moving(o)}
+        return {o for o in candidates if o in near}
 
     @staticmethod
     def _tcp_transform(kinematics: Any, q: np.ndarray) -> np.ndarray:

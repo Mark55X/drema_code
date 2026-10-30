@@ -66,6 +66,7 @@ class CoppeliaSimulationClient:
         ping_timeout: float = 1.5,
         ping_max_retries: int = 3,
         force_scan: bool = False,
+        reset_timeout: float = 30.0,
         cam_resolution: Tuple[int, int] = (256, 256),
         log_interval_actions: int = 10,
         max_action_age: float = 0.20,
@@ -117,6 +118,7 @@ class CoppeliaSimulationClient:
         self.ping_timeout = float(ping_timeout)
         self.ping_max_retries = int(ping_max_retries)
         self.force_scan = bool(force_scan)
+        self.reset_timeout = float(reset_timeout)
         self.cam_resolution = tuple(cam_resolution)
         self.log_interval_actions = max(0, int(log_interval_actions))
 
@@ -187,10 +189,17 @@ class CoppeliaSimulationClient:
 
         if self.force_scan:
             self.initial_scan_done = False
+            if self.server_connected:
+                self._reset_server_episode()
 
         # Start interactive CLI listener thread
         self.cli_thread = threading.Thread(target=self._cli_listener, daemon=True)
         self.cli_thread.start()
+
+    def _reset_server_episode(self) -> None:
+        """A server kept running across episodes still holds the previous scene: clear it before scanning."""
+        ok = self.client.reset_episode(episode_index=0, task_name=self.task_name, timeout=self.reset_timeout)
+        print(f"[CoppeliaClient] DREMA server episode reset before the scan: {'done' if ok else 'FAILED'}")
 
     def perform_initial_scan(self, num_steps: int = 50) -> bool:
         """
@@ -760,7 +769,8 @@ class CoppeliaSimulationClient:
                     self.initial_scan_done = False
                     if self.server_connected:
                         try:
-                            self.client.reset_episode(episode_index=0, task_name=self.task_name, timeout=0.5)
+                            self.client.reset_episode(episode_index=0, task_name=self.task_name,
+                                                      timeout=self.reset_timeout)
                         except Exception:
                             pass
                     descriptions, self.current_obs = self.task.reset()
@@ -784,7 +794,10 @@ class CoppeliaSimulationClient:
                         if not self.server_connected:
                             self.server_connected = True
                             print(f"\n✓ [CoppeliaClient] Connected to DREMA Dynamic Inference Suite! (Status: {status})\n")
-                            if status == "SCAN_READY":
+                            if self.force_scan and not self.initial_scan_done:
+                                self._reset_server_episode()
+                                self.perform_initial_scan(num_steps=self.scan_steps)
+                            elif status == "SCAN_READY":
                                 print("✓ [CoppeliaClient] DREMA server already has scene initialized! Ready for dynamic streaming.\n")
                                 self.initial_scan_done = True
                                 self._on_scene_ready()
@@ -1006,7 +1019,9 @@ def parse_args():
     parser.add_argument("--headless", action="store_true", help="Run CoppeliaSim in headless mode (no GUI window)")
     parser.add_argument("--ping_timeout", type=float, default=1.5, help="gRPC ping timeout in seconds (default: 1.5)")
     parser.add_argument("--ping_retries", type=int, default=3, help="Consecutive failed pings before holding (default: 3)")
-    parser.add_argument("--force_scan", action="store_true", default=False, help="Force orbital scan even if DREMA server has cached scene ready")
+    parser.add_argument("--force_scan", action="store_true", default=False,
+                        help="Reset the DREMA server episode and scan, even if the server already has a scene")
+    parser.add_argument("--reset_timeout", type=float, default=30.0, help="Timeout [s] of the server episode reset")
     parser.add_argument("--cam_resolution", type=int, nargs=2, default=[256, 256], metavar=("WIDTH", "HEIGHT"),
                         help="Streaming camera resolution [width, height] (default: 256 256)")
     parser.add_argument("--log_interval_actions", type=int, default=10,
@@ -1058,6 +1073,7 @@ if __name__ == "__main__":
         ping_timeout=args.ping_timeout,
         ping_max_retries=args.ping_retries,
         force_scan=args.force_scan,
+        reset_timeout=args.reset_timeout,
         cam_resolution=args.cam_resolution,
         log_interval_actions=args.log_interval_actions,
         max_action_age=args.max_action_age,

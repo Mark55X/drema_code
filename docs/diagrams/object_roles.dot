@@ -97,7 +97,7 @@ digraph object_roles {
 <tr><td align="left"><b>close / open</b></td><td align="left" balign="left">the gripper closes on it / opens</td></tr>
 <tr><td align="left"><b>3 cm away</b></td><td align="left" balign="left">the hand has left the released object</td></tr>
 <tr><td align="left"><i>hold</i></td><td align="left" balign="left">still touched: keeps its role</td></tr>
-<tr><td align="left"><i>ends</i></td><td align="left" balign="left">keyframe over and hand 3.5 cm away,<br/>or moving on its own &gt; 3 cm/s<br/>(a pushed object may move with the hand)</td></tr>
+<tr><td align="left"><i>ends</i></td><td align="left" balign="left">keyframe over and hand 3.5 cm away,<br/>or moving on its own &gt; 3 cm/s<br/>(not a pushed object while the hand touches it)</td></tr>
 <tr><td colspan="2" align="left" balign="left" bgcolor="#555555"><font color="white"><b>Permissions</b>  config / VLM restrict, only a human relaxes</font></td></tr>
 <tr><td bgcolor="#d9ead3"><b>TOUCH</b></td><td align="left" balign="left">human: TARGET whatever the state</td></tr>
 <tr><td bgcolor="#f4cccc"><b>AVOID</b></td><td align="left" balign="left">never NEAR / TARGET</td></tr>

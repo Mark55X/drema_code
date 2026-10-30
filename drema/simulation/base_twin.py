@@ -240,14 +240,10 @@ class BaseDigitalTwin(ABC):
                         near[-1] = d_table
         return near
 
-    def object_velocities(self) -> Dict[int, np.ndarray]:
-        """Estimated linear velocity [m/s] of each tracked object (zero without a motion estimate)."""
-        return {int(o['id']): np.asarray(o.get('velocity', (0.0, 0.0, 0.0)), dtype=np.float64)
-                for o in self.get_tracked_obstacles_info()}
-
     def object_speeds(self) -> Dict[int, float]:
         """Estimated linear speed [m/s] of each tracked object (0 without a motion estimate)."""
-        return {obj_id: float(np.linalg.norm(v)) for obj_id, v in self.object_velocities().items()}
+        return {int(o['id']): float(np.linalg.norm(o.get('velocity', (0.0, 0.0, 0.0))))
+                for o in self.get_tracked_obstacles_info()}
 
     def tracked_object_pose(self, obj_id: int) -> Optional[Tuple[Tuple[float, ...], Tuple[float, ...]]]:
         """Pose last set by tracking (or by the gripper when held), not the physics body lagging behind it."""

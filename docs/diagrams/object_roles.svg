@@ -403,7 +403,7 @@
 <text text-anchor="start" x="825.6" y="-174.4" font-family="Helvetica,sans-Serif" font-style="italic" font-size="12.00">ends</text>
 <text text-anchor="start" x="917.6" y="-186.4" font-family="Helvetica,sans-Serif" font-size="12.00">keyframe over and hand 3.5 cm away,</text>
 <text text-anchor="start" x="917.6" y="-173.4" font-family="Helvetica,sans-Serif" font-size="12.00">or moving on its own &gt; 3 cm/s</text>
-<text text-anchor="start" x="917.6" y="-160.4" font-family="Helvetica,sans-Serif" font-size="12.00">(a pushed object may move with the hand)</text>
+<text text-anchor="start" x="917.6" y="-160.4" font-family="Helvetica,sans-Serif" font-size="12.00">(not a pushed object while the hand touches it)</text>
 <polygon fill="#555555" stroke="transparent" points="820.6,-129 820.6,-152 1216.6,-152 1216.6,-129 820.6,-129"/>
 <text text-anchor="start" x="825.6" y="-138.4" font-family="Helvetica,sans-Serif" font-weight="bold" font-size="12.00" fill="white">Permissions</text>
 <text text-anchor="start" x="908.6" y="-138.4" font-family="Helvetica,sans-Serif" font-size="12.00" fill="white"> &#160;config / VLM restrict, only a human relaxes</text>

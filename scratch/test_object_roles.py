@@ -464,14 +464,8 @@ def test_push_contact(folder):
     behind_pos = block_pos + 0.045 * push_dir
     cube4, cube2 = cube_mesh(0.04, folder), cube_mesh(0.02, folder)
 
-    J = np.stack([(kin.forward_kinematics_ee(Q0 + 1e-4 * np.eye(7)[i])[0] - tcp) / 1e-4 for i in range(7)], axis=1)
-    qd_with_block = np.linalg.pinv(J) @ (0.1 * push_dir)
-
-    def push_state(kf, ignore_collisions=True, qd=None, **kw):
-        rs = state(target=key, gripper_command=0.0, ignore_collisions=ignore_collisions, keyframe_index=kf, **kw)
-        if qd is not None:
-            rs.joint_velocities.extend(list(qd))
-        return rs
+    def push_state(kf, ignore_collisions=True, **kw):
+        return state(target=key, gripper_command=0.0, ignore_collisions=ignore_collisions, keyframe_index=kf, **kw)
 
     def roles(reg):
         return {s["object_id"]: s["role"] for s in reg.status}
@@ -502,18 +496,23 @@ def test_push_contact(folder):
         print(f"[{name}] block AVOID: {roles(avoid)}")
         assert roles(avoid)[401] == "OBSTACLE" and roles(avoid)[403] != "TARGET"
 
-        # the pushed block moves at 10 cm/s: with the hand it stays TARGET, with the hand still it is revoked
-        t0 = time.time()
-        for i in range(12):
-            twin.sync_object_pose(401, tuple(block_pos + 0.005 * (i - 11) * push_dir), (0, 0, 0, 1),
-                                  timestamp=t0 + 0.05 * i)
-        reg.update(push_state(1, qd=qd_with_block), twin, kin)
-        with_hand = roles(reg)[401]
-        reg.update(push_state(1, qd=np.zeros(7)), twin, kin)
-        hand_still = roles(reg)[401]
-        print(f"[{name}] pushed block at {twin.object_speeds()[401]:.3f} m/s: moving with the hand {with_hand}, "
-              f"hand still {hand_still}")
-        assert (with_hand, hand_still) == ("TARGET", "OBSTACLE")
+        # the pushed block moves at 10 cm/s (tracking estimate): it stays TARGET while the hand touches it, and is
+        # revoked once it slides away from the hand
+        def slide(end):
+            t0 = time.time()
+            for i in range(12):
+                twin.sync_object_pose(401, tuple(end + 0.005 * (i - 11) * push_dir), (0, 0, 0, 1),
+                                      timestamp=t0 + 0.05 * i)
+        slide(block_pos)
+        reg.update(push_state(1), twin, kin)
+        touched = roles(reg)[401]
+        slide(block_pos + 0.06 * push_dir)
+        reg.update(push_state(1), twin, kin)
+        away = roles(reg)[401]
+        print(f"[{name}] pushed block at {twin.object_speeds()[401]:.3f} m/s: touched by the hand {touched}, "
+              f"slid away from the hand {away}")
+        assert (touched, away) == ("TARGET", "OBSTACLE")
+        slide(block_pos)
 
         # a block already moving on its own when the keyframe starts is not pushed, nor the cube behind it
         moving = ObjectRoleRegistry()

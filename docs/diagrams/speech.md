@@ -152,9 +152,13 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
 - "Ma l'MPPI non va in linea retta": è un'approssimazione per decidere *quale* oggetto è previsto. Se il robot devia e
   tocca altro, quell'oggetto è ancora ostacolo: costo o arresto, cioè un fallimento sicuro.
 - Se il primo oggetto incontrato è AVOID, FRAGILE o in movimento, non si promuove niente, nemmeno ciò che sta dietro.
-- Un oggetto spinto si muove: non viene revocato finché si muove **con la mano** (velocità relativa oggetto–mano
-  sotto 3 cm/s). La velocità della mano viene dalla cinematica e dalle velocità dei giunti; quella dell'oggetto dal
-  predittore (filtro di Kalman sul tracking).
+- Un oggetto spinto si muove: non viene revocato finché **la mano lo tocca**, perché si muove a causa della mano.
+  Si revoca solo ciò che si muove *per conto suo*. Avevamo provato con la velocità relativa oggetto–mano, ma la
+  velocità dell'oggetto viene dal filtro di tracking ed è in ritardo: quando la mano rallenta spingendo, il blocco
+  veniva revocato per errore (successo in slide_block sul server). Il contatto è il segnale giusto.
+- Con la fisica nei rollout (livello 2) la stessa regola diventa esatta: si revoca un oggetto se il suo movimento
+  osservato **non è spiegato** dall'azione del robot (predizione del simulatore contro osservazione); il contatto è
+  l'approssimazione di questo al livello 1.
 
 ### Appoggio
 - Tenendo un oggetto, lo mettiamo alla posa finale e guardiamo gli oggetti entro 3,5 cm. È appoggio un oggetto a cui
@@ -225,5 +229,10 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
 ### Limiti da dire apertamente
 - Errori di percezione di 1–2 cm (mesh gonfiate, oggetti sottili non visti) causano gran parte dei fallimenti residui.
 - La spinta di un oggetto contro un altro non è prevista: i rollout non simulano dove va l'oggetto spinto.
+- Una spinta brusca che fa "volare" l'oggetto lontano dalla mano (oltre 3,5 cm mentre si muove ancora) lo rende
+  ostacolo fino al keyframe successivo: è prudente durante il volo, ma se si ferma prima del bersaglio la mano non può
+  spingerlo di nuovo e il task fallisce, in modo sicuro. Miglioramento possibile: revocarlo solo mentre vola e
+  ricontrollare se è di nuovo davanti alla mano quando si ferma; la soluzione completa è il livello 2, dove la fisica
+  spiega il volo e i rollout sanno dove atterra.
 - I permessi valgono per l'oggetto intero (un appoggio grande è toccabile ovunque durante quel keyframe).
 - Con PerAct reale la posa che precede la presa non è nota in anticipo.
