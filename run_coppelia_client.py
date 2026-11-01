@@ -50,6 +50,8 @@ class CoppeliaSimulationClient:
     Manages CoppeliaSim simulation, sensor streaming, and interactive CLI control.
     """
 
+    SCAN_MAX_RECREATIONS = 3
+
     def __init__(
         self,
         server_address: str = "localhost:50051",
@@ -60,6 +62,7 @@ class CoppeliaSimulationClient:
         ctrl_fps: Optional[float] = None,
         reachability_radius: float = 0.95,
         scan_resolution: Tuple[int, int] = (1280, 720),
+        label_non_physical_shapes: bool = False,
         scan_steps: int = 50,
         scan_chunk_size: int = 2,
         scan_chunk_timeout: float = 180.0,
@@ -103,6 +106,7 @@ class CoppeliaSimulationClient:
         self.sequencer: Optional[KeyframeSequencer] = None
         self.gripper_ctrl: Optional[RLBenchGripperController] = None
         self.semantic_labels: Dict[str, int] = {}
+        self.label_categories: Dict[int, str] = {}
         self.task_description = ""
         self._init_roles(roles_config)
         self.task_name = task_name
@@ -112,6 +116,7 @@ class CoppeliaSimulationClient:
         self.ctrl_fps = ctrl_fps
         self.reachability_radius = reachability_radius
         self.scan_resolution = tuple(scan_resolution)
+        self.label_non_physical_shapes = bool(label_non_physical_shapes)
         self.scan_steps = int(scan_steps)
         self.scan_chunk_size = int(scan_chunk_size)
         self.scan_chunk_timeout = float(scan_chunk_timeout)
@@ -246,33 +251,27 @@ class CoppeliaSimulationClient:
             [0.0, 0.0, -0.50],
             [0.0, 0.50, -0.25]
         ]
+
+        def create_sensor(pose, render_mode):
+            s = VisionSensor.create(
+                resolution=resolutions,
+                explicit_handling=True,
+                near_clipping_plane=0.01,
+                far_clipping_plane=4.5,
+                view_angle=40.0,
+                render_mode=render_mode
+            )
+            s.set_pose(pose)
+            s.set_parent(placeholder)
+            return s
+
         for idx in range(4):
-            c = VisionSensor.create(
-                resolution=resolutions,
-                explicit_handling=True,
-                near_clipping_plane=0.01,
-                far_clipping_plane=4.5,
-                view_angle=40.0,
-                render_mode=RenderMode.OPENGL3
-            )
-            c_mask = VisionSensor.create(
-                resolution=resolutions,
-                explicit_handling=True,
-                near_clipping_plane=0.01,
-                far_clipping_plane=4.5,
-                view_angle=40.0,
-                render_mode=RenderMode.OPENGL_COLOR_CODED
-            )
             p = list(base_pose)
             p[0] += p_offsets[idx][0]
             p[1] += p_offsets[idx][1]
             p[2] += p_offsets[idx][2]
-            c.set_pose(p)
-            c_mask.set_pose(p)
-            c.set_parent(placeholder)
-            c_mask.set_parent(placeholder)
-            cams.append(c)
-            cams_mask.append(c_mask)
+            cams.append(create_sensor(p, RenderMode.OPENGL3))
+            cams_mask.append(create_sensor(p, RenderMode.OPENGL_COLOR_CODED))
 
         rotate_angle = (2.0 * np.pi) / float(num_steps)
         all_scan_cameras = []
@@ -286,6 +285,23 @@ class CoppeliaSimulationClient:
                     c.handle_explicitly()
                     c_mask.handle_explicitly()
                     rgb_float = c.capture_rgb()
+                    # Headless CoppeliaSim can leave a sensor rendering black (and garbage depth) for good while a
+                    # fresh one at the same pose renders fine from its second frame
+                    for attempt in range(1, self.SCAN_MAX_RECREATIONS + 1):
+                        if rgb_float.mean() * 255.0 >= 1.0:
+                            break
+                        print(f"[CoppeliaClient Scan] Camera {c_idx} renders black at step {step_idx}: "
+                              f"recreating it ({attempt}/{self.SCAN_MAX_RECREATIONS})")
+                        pose = c.get_pose()
+                        c.remove()
+                        c = cams[c_idx] = create_sensor(pose, RenderMode.OPENGL3)
+                        c.handle_explicitly()
+                        c.capture_rgb()
+                        c.handle_explicitly()
+                        rgb_float = c.capture_rgb()
+                    if rgb_float.mean() * 255.0 < 1.0:
+                        print(f"[CoppeliaClient Scan] Camera {c_idx} still black at step {step_idx}: view not sent")
+                        continue
                     rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
                     depth_m = c.capture_depth(in_meters=True).astype(np.float32)
                     ext = np.array(c.get_matrix(), dtype=np.float32).reshape((4, 4))
@@ -324,7 +340,8 @@ class CoppeliaSimulationClient:
                 reachability_radius=self.reachability_radius,
                 joint_positions=robot_joint_positions,
                 chunk_size=self.scan_chunk_size,
-                chunk_timeout_s=self.scan_chunk_timeout
+                chunk_timeout_s=self.scan_chunk_timeout,
+                label_categories=self.label_categories
             )
 
             if res and res.initial_scan_ready:
@@ -420,22 +437,53 @@ class CoppeliaSimulationClient:
         self._prepare_keyframes()
 
     def _scene_shape_labels(self) -> Dict[str, int]:
-        """CoppeliaSim shape name -> handle; handles are the object ids shared with perception and the roles."""
+        """
+        CoppeliaSim shape name -> handle; handles are the object ids shared with perception and the roles.
+        Shapes outside the physics (spawn areas, painted targets, success zones) get no label unless
+        label_non_physical_shapes: perception then keeps their pixels as static background, never as objects.
+        Each label gets its category from the scene tree (self.label_categories), so perception needs no names: the
+        robot's shapes are 'robot', the task's 'object', the rest of the scene (table, walls) 'background'.
+        """
         from pyrep.backend import sim
+        from pyrep.const import ObjectType
         from pyrep.objects.shape import Shape
+        robot = self.task._robot
+        robot_handles = {o.get_handle() for part in (robot.arm, robot.gripper)
+                         for o in [part] + part.get_objects_in_tree(object_type=ObjectType.SHAPE)}
+        task_base = getattr(self.task, '_task', self.task).get_base()
+        task_handles = {o.get_handle() for o in task_base.get_objects_in_tree(object_type=ObjectType.SHAPE)}
         handles = sim.simGetObjectsInTree(sim.sim_handle_scene, sim.sim_object_shape_type, 0)
-        labels = {}
+        labels, categories = {}, {}
         filter_names = ["DefaultCamera", "ResizableFloor", "Floor", "Wall", "Ceiling"]
         for h in handles:
             try:
-                name = Shape(h).get_name()
+                shape = Shape(h)
+                name = shape.get_name()
                 if any(f in name for f in filter_names):
                     continue
+                if not self.label_non_physical_shapes and not self._is_physical(shape):
+                    continue
                 labels[name] = int(h)
+                categories[int(h)] = ('robot' if h in robot_handles else
+                                      'object' if h in task_handles else 'background')
             except Exception:
                 pass
         self.semantic_labels = labels
+        self.label_categories = categories
         return labels
+
+    @staticmethod
+    def _is_physical(shape) -> bool:
+        """The shape or one of its ancestor shapes is respondable (a visual mesh belongs to its respondable parent)."""
+        from pyrep.backend import sim
+        from pyrep.objects.shape import Shape
+        node = shape
+        while node is not None:
+            handle = node.get_handle()
+            if sim.simGetObjectType(handle) == sim.sim_object_shape_type and Shape(handle).is_respondable():
+                return True
+            node = node.get_parent()
+        return False
 
     def _prepare_keyframes(self) -> None:
         """Builds the keyframe sequencer for the current episode (a demo source re-records its demo each episode)."""
@@ -515,13 +563,13 @@ class CoppeliaSimulationClient:
               f"(VLM backend: {vlm_cfg.get('backend', 'keyword') if backend else 'none'})")
 
     def _scene_objects(self) -> List[SceneObject]:
-        """Objects offered to the VLM: those the server tracks when known, else the non-excluded scene shapes."""
+        """Objects offered to the VLM: those the server tracks when known, else the non-excluded object shapes."""
         names = {h: n for n, h in self.semantic_labels.items()}
         if self.role_manager.server_status:
             return [SceneObject(h, names.get(h, f"object_{h}")) for h in sorted(self.role_manager.server_status)]
         exclude = [k.lower() for k in self.roles_cfg.get("exclude_keywords", [])]
         return [SceneObject(h, n) for n, h in sorted(self.semantic_labels.items(), key=lambda kv: kv[1])
-                if not any(k in n.lower() for k in exclude)]
+                if self.label_categories.get(h, 'object') == 'object' and not any(k in n.lower() for k in exclude)]
 
     def _vlm_image(self, objects: List[SceneObject]) -> Optional[np.ndarray]:
         cam = str(self.roles_cfg.get("vlm", {}).get("camera", "front"))
@@ -1013,6 +1061,9 @@ def parse_args():
     parser.add_argument("--reachability_radius", type=float, default=0.95, help="Robot maximum reachable radius in meters (default: 0.95)")
     parser.add_argument("--scan_resolution", type=int, nargs=2, default=[1280, 720], metavar=("WIDTH", "HEIGHT"),
                         help="Orbital scan camera resolution [width, height] (default: 1280 720)")
+    parser.add_argument("--label_non_physical_shapes", action="store_true",
+                        help="Also label shapes outside the physics (spawn areas, painted targets): perception may "
+                             "then take them for objects (default: only shapes that are, or belong to, a respondable body)")
     parser.add_argument("--scan_steps", type=int, default=50, help="Number of orbital rotation steps at t=0 (default: 50)")
     parser.add_argument("--scan_chunk_size", type=int, default=2, help="Number of views per gRPC transmission chunk (default: 2)")
     parser.add_argument("--scan_chunk_timeout", type=float, default=180.0, help="Timeout in seconds per chunk transmission (default: 180.0)")
@@ -1067,6 +1118,7 @@ if __name__ == "__main__":
         ctrl_fps=args.ctrl_fps,
         reachability_radius=args.reachability_radius,
         scan_resolution=args.scan_resolution,
+        label_non_physical_shapes=args.label_non_physical_shapes,
         scan_steps=args.scan_steps,
         scan_chunk_size=args.scan_chunk_size,
         scan_chunk_timeout=args.scan_chunk_timeout,

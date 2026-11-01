@@ -109,17 +109,24 @@ def extract_semantic_object_mesh_from_scan(
     depth_far: float = 3.0,
     max_weight: float = 15.0,
     taubin_iterations: int = 3,
-    device: str = "cuda"
+    device: str = "cuda",
+    responsive_weights: bool = False,
+    carve_free_space: bool = True,
+    support_plane_z: Optional[float] = None,
+    carving_margin: float = 0.0
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Extracts a pristine, complete 3D surface mesh for a specific semantic object ID
     from the initial scan frames following the original DREMA architecture:
-    - Isolates depth observations to only pixels where mask == target_obj_id
-    - Eliminates the supporting tabletop and background entirely from this object's reconstruction.
+    - Integrates as surface only the depth of pixels where mask == target_obj_id
+    - With carve_free_space, the other pixels mark the space in front of what they hit as empty, so the band behind
+      the object surface cannot spread past its silhouette
+    - With support_plane_z, an object resting on that plane is bounded by it: nothing of it lies below the table
     - Constructs a focused, high-resolution TSDF grid around the object bounds.
     - Extracts solid surface via Marching Cubes
     """
     valid_frames = []
+    carve_frames = []
     pts_sample = []
     total_discarded_depth_pixels = 0
     total_obj_pixels = 0
@@ -132,15 +139,16 @@ def extract_semantic_object_mesh_from_scan(
         if mask_np.ndim == 3:
             mask_np = mask_np.squeeze(0)
 
-        obj_pixels = (mask_np == target_obj_id)
-        n_obj_px = int(np.count_nonzero(obj_pixels))
-        if n_obj_px == 0:
-            continue
-        total_obj_pixels += n_obj_px
-
         depth = f.get('depth')
         if depth is None:
             continue
+        obj_pixels = (mask_np == target_obj_id)
+        n_obj_px = int(np.count_nonzero(obj_pixels))
+        if n_obj_px == 0:
+            carve_frames.append((f, obj_pixels))
+            continue
+        total_obj_pixels += n_obj_px
+
         depth_np = to_numpy(depth)
         if depth_np.ndim == 3:
             depth_np = depth_np.squeeze(0)
@@ -152,9 +160,11 @@ def extract_semantic_object_mesh_from_scan(
         total_discarded_depth_pixels += n_discarded
 
         if not np.any(valid_d):
+            carve_frames.append((f, obj_pixels))
             continue
 
         valid_frames.append((f, obj_pixels))
+        carve_frames.append((f, obj_pixels))
 
         v_coords, u_coords = np.nonzero(obj_pixels)
         v_coords = v_coords[valid_d]
@@ -207,24 +217,36 @@ def extract_semantic_object_mesh_from_scan(
         grid_dim=grid_dim,
         origin=origin,
         max_weight=max_weight,
-        device=device
+        device=device,
+        responsive_weights=responsive_weights
     )
 
-    for f, obj_pixels in valid_frames:
+    for f, obj_pixels in (carve_frames if carve_free_space else valid_frames):
         d_t = torch.as_tensor(f['depth'], dtype=torch.float32, device=device).clone()
         if d_t.dim() == 2:
             d_t = d_t.unsqueeze(0)
         elif d_t.dim() == 3 and d_t.shape[0] != 1:
             d_t = d_t.squeeze(0).unsqueeze(0)
 
-        # In pure DREMA fashion, zero out all pixels outside this object
         mask_t = torch.as_tensor(obj_pixels, dtype=torch.bool, device=device)
-        d_t[:, ~mask_t] = 0.0
+        # A reading outside the sensor range is no measurement: a view that rendered no depth must not carve the object
+        d_t[:, (d_t[0] <= depth_near) | (d_t[0] >= depth_far)] = 0.0
+        free_t = None
+        if carve_free_space:
+            free_t = ~mask_t
+        else:
+            d_t[:, ~mask_t] = 0.0
 
         k_t = torch.as_tensor(f['intrinsics'], dtype=torch.float32, device=device)
         pose_t = torch.as_tensor(f['extrinsics'], dtype=torch.float32, device=device)
 
-        obj_tsdf.integrate_depth_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far)
+        obj_tsdf.integrate_depth_frame(depth=d_t, intrinsic=k_t, pose=pose_t, max_depth=depth_far,
+                                       free_space_mask=free_t, free_space_margin=carving_margin)
+
+    # Bounded only when no observed point is below the plane: an object that fell off the table keeps its shape
+    if support_plane_z is not None and float(np.percentile(all_pts[:, 2], 1)) >= support_plane_z - sdf_trunc:
+        plane_F = torch.clamp((support_plane_z - obj_tsdf.voxel_centers[..., 2]) / sdf_trunc, min=-1.0, max=1.0)
+        obj_tsdf.F = torch.maximum(obj_tsdf.F, plane_F)
 
     verts, faces = obj_tsdf.extract_mesh(level=0.0)
     if len(verts) >= 20 and len(faces) >= 20:
@@ -377,6 +399,10 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.object_mesh_voxel_size = float(map_cfg.get("object_mesh_voxel_size", 0.005))
         self.object_mesh_sdf_trunc = float(map_cfg.get("object_mesh_sdf_trunc", 0.02))
         self.object_mesh_max_weight = float(map_cfg.get("object_mesh_max_weight", 15.0))
+        self.object_mesh_responsive_weights = bool(map_cfg.get("object_mesh_responsive_weights", False))
+        self.object_mesh_free_space_carving = bool(map_cfg.get("object_mesh_free_space_carving", True))
+        self.object_mesh_carving_margin = float(map_cfg.get("object_mesh_carving_margin", 0.0))
+        self.object_mesh_table_bound = bool(map_cfg.get("object_mesh_table_bound", True))
         self.depth_near = float(map_cfg.get("depth_near", 0.1))
         self.depth_far = float(map_cfg.get("depth_far", 3.0))
         self.taubin_iterations = int(map_cfg.get("taubin_iterations", 3))
@@ -422,6 +448,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
 
         self.robot_base_pos = np.array([0.0, 0.0, 0.0], dtype=np.float32)
         self.z_table: float = self.table_z_prior
+        self.table_plane_z: float = self.table_z_prior
         self.table_bounds: Tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
         self.active_workspace_bounds: Dict[str, float] = {}
         self.grid_origin: Tuple[float, float, float] = (0.0, 0.0, 0.0)
@@ -609,7 +636,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             tab_y_max = float(np.percentile(table_pts[:, 1], 99.5))
 
         self.z_table = z_table
-        rb_x, rb_y, rb_z = float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
+        # z_table is a histogram bin centre (up to half a bin off); bounding the object meshes needs the plane itself
+        self.table_plane_z = float(np.median(table_pts[:, 2])) if table_pts is not None else z_table
+        rb_x, rb_y, rb_z =float(self.robot_base_pos[0]), float(self.robot_base_pos[1]), float(self.robot_base_pos[2])
         r_reach = self.reachability_radius
         margin = self.workspace_margin
 
@@ -1067,10 +1096,12 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         semantic_labels: Dict[str, int],
         robot_base_pos: np.ndarray,
         digital_twin: Optional[Any] = None,
-        reachability_radius: Optional[float] = None
+        reachability_radius: Optional[float] = None,
+        label_categories: Optional[Dict[int, str]] = None
     ) -> InitialScanResult:
         """Processes initial 360 scene reconstruction or restores from pre-computed cache."""
         self.semantic_labels = semantic_labels or {}
+        label_categories = {int(h): c for h, c in (label_categories or {}).items()}
         if len(robot_base_pos) >= 3:
             self.robot_base_pos = np.array(robot_base_pos[:3], dtype=np.float32)
         if reachability_radius is not None and reachability_radius > 0:
@@ -1091,6 +1122,13 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         for name, num in self.semantic_labels.items():
             num = int(num)
             id_to_name[num] = name
+            if label_categories:
+                category = label_categories.get(num, 'background')
+                if category == 'robot':
+                    self.robot_ids.add(num)
+                elif category == 'object':
+                    self.dynamic_object_ids.add(num)
+                continue
             name_lower = name.lower()
             if any(kw in name_lower for kw in self.robot_keywords):
                 self.robot_ids.add(num)
@@ -1102,7 +1140,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 self.dynamic_object_ids.add(num)
 
         if len(self.semantic_labels) > 0:
-            print(f"[VGMapping Perception] Parsed {len(self.semantic_labels)} semantic labels from CoppeliaSim:")
+            source = "categories sent by the environment" if label_categories else "name keywords (no categories sent)"
+            print(f"[VGMapping Perception] Parsed {len(self.semantic_labels)} semantic labels, classified by {source}:")
             print(f"   Robot Arm Link IDs ({len(self.robot_ids)}): {sorted(list(self.robot_ids))}")
             if len(self.virtual_ids) > 0:
                 v_names = [f"'{id_to_name[v]}' (ID:{v})" for v in sorted(list(self.virtual_ids))]
@@ -1278,44 +1317,33 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 t_obj_start = time.perf_counter()
 
                 # High-resolution TSDF reconstruction configured via drema_default.yaml
-                verts, faces = extract_semantic_object_mesh_from_scan(
+                mesh_kwargs = dict(
                     scan_frames=scan_frames,
                     target_obj_id=obj_id,
-                    voxel_size=self.object_mesh_voxel_size,
-                    sdf_trunc=self.object_mesh_sdf_trunc,
                     depth_near=self.depth_near,
                     depth_far=self.depth_far,
                     max_weight=self.object_mesh_max_weight,
-                    device=self.device
+                    taubin_iterations=self.taubin_iterations,
+                    device=self.device,
+                    responsive_weights=self.object_mesh_responsive_weights,
+                    carve_free_space=self.object_mesh_free_space_carving,
+                    carving_margin=self.object_mesh_carving_margin,
+                    support_plane_z=self.table_plane_z if self.object_mesh_table_bound else None
                 )
+                verts, faces = extract_semantic_object_mesh_from_scan(
+                    voxel_size=self.object_mesh_voxel_size, sdf_trunc=self.object_mesh_sdf_trunc, **mesh_kwargs)
 
                 if len(verts) < 20 or len(faces) < 20:
                     # Fallback to coarser resolution if point cloud density is sparse
-                    print(f"   -> [Mesh Extraction Object #{obj_id}] Fine resolution produced < 20 elements ({len(verts)} verts, {len(faces)} faces). Retrying with coarser voxel grid ({self.object_mesh_voxel_size * 2.0 * 1000.0:.1f}mm)...")
+                    coarse_voxel = self.object_mesh_voxel_size * 2.0
+                    print(f"   -> [Mesh Extraction Object #{obj_id}] Fine resolution produced < 20 elements ({len(verts)} verts, {len(faces)} faces). Retrying with coarser voxel grid ({coarse_voxel * 1000.0:.1f}mm)...")
                     verts, faces = extract_semantic_object_mesh_from_scan(
-                        scan_frames=scan_frames,
-                        target_obj_id=obj_id,
-                        voxel_size=self.object_mesh_voxel_size * 2.0,
-                        sdf_trunc=self.object_mesh_sdf_trunc * 2.0,
-                        depth_near=self.depth_near,
-                        depth_far=self.depth_far,
-                        max_weight=self.object_mesh_max_weight,
-                        device=self.device
-                    )
+                        voxel_size=coarse_voxel, sdf_trunc=max(self.object_mesh_sdf_trunc, 2.0 * coarse_voxel),
+                        **mesh_kwargs)
 
                 if len(verts) >= 20 and len(faces) >= 20:
+                    # Largest component and Taubin smoothing already applied by the extraction
                     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=True)
-                    # Component filtering: isolate primary outer connected component
-                    components = mesh.split(only_watertight=False)
-                    if len(components) > 1:
-                        mesh = max(components, key=lambda c: len(c.vertices))
-
-                    # Generic mesh smoothing configured via perception.mapping.taubin_iterations
-                    if self.taubin_iterations > 0 and hasattr(trimesh, 'smoothing'):
-                        try:
-                            mesh = trimesh.smoothing.filter_taubin(mesh, iterations=self.taubin_iterations)
-                        except Exception:
-                            pass
 
                     # --- Math Rationale: Mesh Centering & Physics Simulation Offset Elimination ---
                     # Marching Cubes generates vertices in absolute world frame coordinates (e.g. centered near [0.4, 0.2, 0.8]m).

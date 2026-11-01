@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 
 from drema.config import load_config, ConfigDict
 from drema.communication.grpc_server import DremaGrpcServer
-from drema.communication.grpc_client import unpack_camera_frame
+from drema.communication.grpc_client import unpack_camera_frame, unpack_label_categories
 from drema.communication.proto import drema_comm_pb2
 from drema.simulation.base_twin import BaseDigitalTwin
 from drema.simulation.pybullet_digital_twin import PyBulletDigitalTwin
@@ -430,7 +430,11 @@ class DremaDynamicSystem:
             self._try_startup_cache_restore()
         return True
 
-    def _process_initial_scene_scan(self, semantic_labels: Optional[Dict[str, int]] = None) -> bool:
+    def _process_initial_scene_scan(
+        self,
+        semantic_labels: Optional[Dict[str, int]] = None,
+        label_categories: Optional[Dict[int, str]] = None
+    ) -> bool:
         """Processes initial 360 scene reconstruction or restores from pre-computed cache."""
         try:
             print("\n=======================================================")
@@ -440,6 +444,7 @@ class DremaDynamicSystem:
             res: InitialScanResult = self.perception.process_initial_scan(
                 scan_frames=self.accumulated_scan_frames,
                 semantic_labels=semantic_labels or {},
+                label_categories=label_categories or {},
                 robot_base_pos=self.robot_base_pos,
                 digital_twin=self.digital_twin,
                 reachability_radius=self.reachability_radius
@@ -482,6 +487,7 @@ class DremaDynamicSystem:
                     torch.save({
                         'scan_frames': self.accumulated_scan_frames,
                         'semantic_labels': semantic_labels or {},
+                        'label_categories': label_categories or {},
                         'robot_base_pos': self.robot_base_pos,
                         'robot_joint_positions': self.robot_joint_positions,
                         'reachability_radius': self.reachability_radius
@@ -537,7 +543,8 @@ class DremaDynamicSystem:
 
             if obs.is_scan_finished:
                 semantic_labels = dict(obs.semantic_labels) if obs.semantic_labels else None
-                success = self._process_initial_scene_scan(semantic_labels=semantic_labels)
+                success = self._process_initial_scene_scan(semantic_labels=semantic_labels,
+                                                           label_categories=unpack_label_categories(obs))
                 return drema_comm_pb2.StreamStatus(
                     success=success,
                     message="Initial 360° scan processed and Digital Twin populated" if success else "Scan processing failed",
@@ -889,6 +896,7 @@ class DremaDynamicSystem:
                 if isinstance(loaded, dict) and 'scan_frames' in loaded:
                     self.accumulated_scan_frames = loaded['scan_frames']
                     sem_labels = loaded.get('semantic_labels', {})
+                    categories = loaded.get('label_categories', {})
                     if 'robot_base_pos' in loaded and len(loaded['robot_base_pos']) >= 3:
                         self.robot_base_pos = np.array(loaded['robot_base_pos'], dtype=np.float32)
                     if 'robot_joint_positions' in loaded and len(loaded['robot_joint_positions']) > 0:
@@ -897,14 +905,14 @@ class DremaDynamicSystem:
                         self.reachability_radius = float(loaded['reachability_radius'])
                 elif isinstance(loaded, list):
                     self.accumulated_scan_frames = loaded
-                    sem_labels = {}
+                    sem_labels, categories = {}, {}
                 else:
                     return False
 
                 # Temporarily disable perception cache loading so it re-runs reconstruction algorithm
                 old_cache_enabled = self.perception.cache_enabled
                 self.perception.cache_enabled = False
-                success = self._process_initial_scene_scan(semantic_labels=sem_labels)
+                success = self._process_initial_scene_scan(semantic_labels=sem_labels, label_categories=categories)
                 self.perception.cache_enabled = old_cache_enabled
                 return success
             except Exception as e:

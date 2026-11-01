@@ -66,6 +66,17 @@ def pack_camera_frame(
     )
 
 
+def pack_label_categories(categories: Optional[Dict[int, str]]) -> Dict[int, int]:
+    """Handle -> 'robot' / 'object' / 'background' into LabelCategory values."""
+    return {int(h): drema_comm_pb2.LabelCategory.Value(c.upper()) for h, c in (categories or {}).items()}
+
+
+def unpack_label_categories(obs: drema_comm_pb2.FrameObservation) -> Dict[int, str]:
+    """LabelCategory values of an observation back into handle -> 'robot' / 'object' / 'background'."""
+    return {int(h): drema_comm_pb2.LabelCategory.Name(c).lower() for h, c in obs.label_categories.items()
+            if c != drema_comm_pb2.CATEGORY_UNSPECIFIED}
+
+
 def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, Optional[np.ndarray]]:
     """
     Deserializes a Protobuf CameraFrame into numpy arrays, clipping planes, and optional segmentation mask.
@@ -249,12 +260,14 @@ class DremaGrpcClient:
         joint_positions: Optional[List[float]] = None,
         chunk_size: int = 2,
         chunk_timeout_s: float = 180.0,
-        max_chunk_retries: int = 3
+        max_chunk_retries: int = 3,
+        label_categories: Optional[Dict[int, str]] = None
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes the 360° orbital scan frames to DREMA suite in chunks to avoid gRPC payload overflow.
         Includes automatic retry logic and configurable per-chunk timeouts for reliable transfer over SSH tunnels.
         Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip, mask])
+        label_categories: handle -> 'robot' / 'object' / 'background' for the labelled shapes
         """
         total_views = len(cameras_list)
         if total_views == 0:
@@ -292,6 +305,7 @@ class DremaGrpcClient:
                 is_initial_scan=True,
                 is_scan_finished=is_last,
                 semantic_labels=semantic_labels if is_last else {},
+                label_categories=pack_label_categories(label_categories) if is_last else {},
                 robot_base_pos=(robot_base_pos or [0.0, 0.0, 0.0]) if is_last else [],
                 reachability_radius=float(reachability_radius),
                 joint_positions=(joint_positions or []) if is_last else []

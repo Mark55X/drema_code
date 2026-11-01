@@ -48,7 +48,8 @@ perception:
     workspace_margin: 0.05           # Lateral safety expansion margin for workspace TSDF bounds in meters
     table_thickness: 0.05            # Estimated vertical thickness below tabletop surface in meters
     table_bounds_fallback: [-0.50, 1.10, -0.55, 0.55] # Fallback horizontal table bounds [xmin, xmax, ymin, ymax]
-    # Semantic keyword filters for CoppeliaSim object classification. Physical task objects are kept whatever their
+    # Fallback only: the environment sends a category per label (robot / object / background) and these name keyword
+    # filters classify the labels of an environment that sends none. Physical task objects are kept whatever their
     # name (RLBench calls the object to manipulate "*_target"); only non-physical helpers are virtual: name visual-only
     # markers "*_marker" to keep them out of the reconstruction.
     robot_keywords: ["panda", "link", "finger", "hand", "joint", "arm", "gripper", "wrist", "flange"]
@@ -72,11 +73,15 @@ perception:
 
     # Dynamic Object Semantic Mesh Extraction (DREMA Architecture)
     object_mesh_voxel_size: 0.005    # Voxel length for object TSDF integration (5mm fine resolution)
-    object_mesh_sdf_trunc: 0.02      # TSDF truncation margin for object reconstruction (2cm)
+    object_mesh_sdf_trunc: 0.01      # TSDF truncation margin for object reconstruction (1cm = 2 voxels)
     object_mesh_max_weight: 15.0     # Max TSDF weight clamp for object mesh reconstruction
+    object_mesh_responsive_weights: false  # VG-Mapping responsive negative weight (Eq. 4) in the object scan; false = multi-view average (the t=0 scene is static)
+    object_mesh_free_space_carving: true   # Pixels of other surfaces mark the space in front of what they hit as empty (no band spreading past the silhouette)
+    object_mesh_carving_margin: 0.0        # Distance [m] in front of the hit a voxel must be to be carved: the depth noise (0 for simulated depth, a few mm on a real sensor)
+    object_mesh_table_bound: true          # Objects resting on the detected table plane are bounded by it (nothing of them below the table)
     depth_near: 0.1                  # Minimum valid camera sensor depth in meters
     depth_far: 3.0                   # Maximum valid camera sensor depth in meters
-    taubin_iterations: 3             # Number of Taubin smoothing iterations (0 to disable)
+    taubin_iterations: 3             # Number of Taubin smoothing iterations on the object meshes (0 to disable)
 
   # 3D Gaussian Splatting & Normal-Guided Anisotropic Covariances
   gaussians:

@@ -38,6 +38,8 @@ def showcase_view(robot_base, target) -> tuple:
 class SimVideoRecorder:
     """Records while the task is active and for `tail_steps` steps after it stops (e.g. after success)."""
 
+    MAX_RECREATIONS = 5
+
     def __init__(self, out_dir: str, reference_camera: Any = None, resolution: Tuple[int, int] = (960, 540),
                  every_n: int = 1, tail_steps: int = 40, jpeg_quality: int = 92, view_angle_deg: Optional[float] = None,
                  eye=None, look_at=None):
@@ -62,6 +64,7 @@ class SimVideoRecorder:
         else:
             self.quaternion, self.orientation = None, list(reference_camera.get_orientation())
         self.sensor = None
+        self._recreations = 0
         self._index = open(os.path.join(out_dir, 'index.csv'), 'w')
         self._index.write('sequence,step,sim_time,file\n')
         self._queue: "queue.Queue" = queue.Queue(maxsize=256)
@@ -83,6 +86,14 @@ class SimVideoRecorder:
             return
         self.sensor.handle_explicitly()
         rgb = (np.clip(self.sensor.capture_rgb(), 0.0, 1.0) * 255.0).astype(np.uint8)
+        if rgb.mean() < 1.0 and self._recreations < self.MAX_RECREATIONS:
+            # Some headless sensors never render (all black but a few stray pixels) while a fresh one in the same scene does
+            self._recreations += 1
+            print(f"[CoppeliaClient] Recording sensor renders black: recreating it "
+                  f"({self._recreations}/{self.MAX_RECREATIONS})")
+            self.sensor.remove()
+            self.sensor = None
+            return
         self._sequence += 1
         try:
             self._queue.put_nowait((self._sequence, int(step), float(sim_time), rgb))

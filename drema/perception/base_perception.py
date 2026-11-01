@@ -61,9 +61,13 @@ class BasePerceptionModule(ABC):
         semantic_labels: Dict[str, int],
         robot_base_pos: np.ndarray,
         digital_twin: Optional[Any] = None,
-        reachability_radius: Optional[float] = None
+        reachability_radius: Optional[float] = None,
+        label_categories: Optional[Dict[int, str]] = None
     ) -> InitialScanResult:
-        """Processes initial 360 scan frames or restores from pre-computed cache."""
+        """
+        Processes initial 360 scan frames or restores from pre-computed cache.
+        label_categories: handle -> 'robot' / 'object' / 'background' from the environment; empty = name keywords.
+        """
         pass
 
     @abstractmethod
