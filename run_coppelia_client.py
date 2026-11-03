@@ -305,7 +305,7 @@ class CoppeliaSimulationClient:
                     rgb_uint8 = (np.clip(rgb_float, 0.0, 1.0) * 255.0).astype(np.uint8)
                     depth_m = c.capture_depth(in_meters=True).astype(np.float32)
                     ext = np.array(c.get_matrix(), dtype=np.float32).reshape((4, 4))
-                    intrinsic = np.array(c.get_intrinsic_matrix(), dtype=np.float32)
+                    intrinsic = self._pixel_centre_intrinsics(c)
                     near_clip = float(c.get_near_clipping_plane()) if hasattr(c, 'get_near_clipping_plane') else 0.01
                     far_clip = float(c.get_far_clipping_plane()) if hasattr(c, 'get_far_clipping_plane') else 3.5
 
@@ -471,6 +471,17 @@ class CoppeliaSimulationClient:
         self.semantic_labels = labels
         self.label_categories = categories
         return labels
+
+    @staticmethod
+    def _pixel_centre_intrinsics(sensor) -> np.ndarray:
+        """
+        Intrinsics for pixels indexed from 0: PyRep puts the principal point at (W/2, H/2) instead of
+        ((W-1)/2, (H-1)/2), which shifts every back-projected point by half a pixel (2 mm at 1.5 m on a 256 px camera).
+        """
+        K = np.array(sensor.get_intrinsic_matrix(), dtype=np.float32)
+        K[0, 2] -= 0.5
+        K[1, 2] -= 0.5
+        return K
 
     @staticmethod
     def _is_physical(shape) -> bool:
@@ -715,7 +726,7 @@ class CoppeliaSimulationClient:
                 ext = np.array(cam.get_matrix(), dtype=np.float32).reshape((4, 4))
 
                 # 3x3 Intrinsic matrix
-                intrinsic = np.array(cam.get_intrinsic_matrix(), dtype=np.float32)
+                intrinsic = self._pixel_centre_intrinsics(cam)
 
                 near_clip = float(cam.get_near_clipping_plane()) if hasattr(cam, 'get_near_clipping_plane') else 0.01
                 far_clip = float(cam.get_far_clipping_plane()) if hasattr(cam, 'get_far_clipping_plane') else 3.5

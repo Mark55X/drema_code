@@ -62,9 +62,31 @@ class ConfigDict(dict):
 
 
 def load_config(config_path: str = "configs/drema_default.yaml") -> ConfigDict:
-    """Loads a YAML configuration file into a ConfigDict."""
+    """Loads a YAML configuration file into a ConfigDict, with the robot profile merged into 'robot'."""
     if not os.path.exists(config_path):
         raise FileNotFoundError(f"Configuration file not found: {config_path}")
     with open(config_path, "r") as f:
         data = yaml.safe_load(f) or {}
-    return ConfigDict(data)
+    return ConfigDict(_with_robot_profile(data))
+
+
+def _with_robot_profile(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    robot.profile names a YAML file with the robot instance (joint offsets, TCP): its keys fill the 'robot' section,
+    keys written in the section itself override them. A relative path is looked up from the working directory, then
+    from the repository root.
+    """
+    robot = dict(data.get("robot") or {})
+    profile = robot.get("profile")
+    if not profile:
+        return data
+    path = profile
+    if not os.path.isabs(path) and not os.path.exists(path):
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), profile)
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"Robot profile not found: {profile}")
+    with open(path, "r") as f:
+        merged = yaml.safe_load(f) or {}
+    merged.update(robot)
+    merged["profile"] = os.path.abspath(path)
+    return {**data, "robot": merged}

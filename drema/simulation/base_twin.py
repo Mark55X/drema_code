@@ -95,13 +95,15 @@ class BaseDigitalTwin(ABC):
     Any concrete physics backend (PyBullet, Isaac Sim, MuJoCo) must implement this interface.
     """
 
-    def __init__(self, joint_angle_offsets: Optional[List[float]] = None):
+    def __init__(self, joint_angle_offsets: Optional[List[float]] = None, ee_offset: Optional[List[float]] = None):
         """
         :param joint_angle_offsets: Per-joint zero offsets [rad] between the measured joint angles of
                                     the controlled robot and the twin's (Franka DH) robot model:
                                     q_twin = q_measured + offset. Every joint value crossing the twin
                                     interface is in the measured space.
+        :param ee_offset: Flange -> TCP translation [m] of the robot profile (None: FrankaKinematics default).
         """
+        self.ee_offset = np.asarray(ee_offset, dtype=np.float64).reshape(3) if ee_offset is not None else None
         self.state_lock = threading.RLock()
         self.joint_angle_offsets = (
             np.asarray(joint_angle_offsets, dtype=np.float64).reshape(7)

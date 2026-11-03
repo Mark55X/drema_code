@@ -46,7 +46,8 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         table_in_collision_costs: bool = True,
         obstacle_convex_decomposition: bool = True,
         vhacd_resolution: int = 100000,
-        vhacd_concavity: float = 0.05
+        vhacd_concavity: float = 0.05,
+        ee_offset: Optional[List[float]] = None
     ):
         """
         :param obstacle_convex_decomposition: Dynamic PyBullet bodies collide through the convex hull of their mesh,
@@ -55,7 +56,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         :param vhacd_resolution: V-HACD voxel resolution.
         :param vhacd_concavity: V-HACD maximum concavity per part: higher values give fewer, coarser parts.
         """
-        super().__init__(joint_angle_offsets)
+        super().__init__(joint_angle_offsets, ee_offset)
         self.table_in_collision_costs = bool(table_in_collision_costs)
         self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
         self.vhacd_resolution = int(vhacd_resolution)

@@ -1,0 +1,6 @@
+# Physical Franka Panda with the Franka Hand. NOMINAL values (libfranka default F_T_EE): calibrate the TCP for the
+# fingers actually mounted before use; the startup self-check reports the residual.
+name: "panda_real"
+joint_angle_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+tcp_offset: [0.0, 0.0, 0.1034]
+tcp_rotation_xyz_deg: [0.0, 0.0, -45.0]

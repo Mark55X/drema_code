@@ -96,7 +96,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         table_in_collision_costs: bool = True,
         obstacle_convex_decomposition: bool = True,
         vhacd_resolution: int = 100000,
-        vhacd_concavity: float = 0.05
+        vhacd_concavity: float = 0.05,
+        ee_offset: Optional[List[float]] = None
     ):
         """
         :param robot_model_path: Panda MJCF (default: MuJoCo Menagerie franka_emika_panda); only its collision
@@ -110,7 +111,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 "Please run: pip install mujoco glfw"
             )
 
-        super().__init__(joint_angle_offsets)
+        super().__init__(joint_angle_offsets, ee_offset)
         self.table_in_collision_costs = bool(table_in_collision_costs)
         self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
         self.vhacd_resolution = int(vhacd_resolution)
@@ -175,7 +176,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.last_collision_timings: Dict[str, Any] = {}
 
         # Kinematics analytical helper
-        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets)
+        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets,
+                                    ee_offset=self.ee_offset)
 
         # MuJoCo internal handles
         self.model: Optional[mujoco.MjModel] = None
@@ -231,7 +233,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             if name in used:
                 assets.append(f'<mesh name="{name}" file="{os.path.join(mesh_dir, mesh.get("file"))}"/>')
         link7 = link0.find(".//body[@name='link7']")
-        ox, oy, oz = (float(v) for v in FrankaKinematics.EE_OFFSET)
+        ox, oy, oz = (float(v) for v in self.kin.EE_OFFSET)
         ET.SubElement(link7, 'site', {'name': 'tcp', 'pos': f"{ox:.6f} {oy:.6f} {0.107 + oz:.6f}"})
         self._robot_mjcf = (ET.tostring(defaults, encoding='unicode'), assets, ET.tostring(link0, encoding='unicode'))
         return self._robot_mjcf
@@ -442,7 +444,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.robot_base_quat = _xyzw_to_wxyz(base_orientation)
         self.robot_loaded = True
         self.robot_id = 1
-        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets)
+        self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets,
+                                    ee_offset=self.ee_offset)
 
         self._rebuild_model()
 

@@ -176,6 +176,21 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
   Se le dita si chiudono quasi del tutto, la presa è "a vuoto" e non si aggancia niente.
 - Al rilascio l'oggetto viene sganciato e la percezione torna a comandare; resta RELEASED finché il TCP non è a 3 cm.
 
+### Rotazione della pinza (simmetria a 180°)
+- La pinza parallela è simmetrica: ruotata di 180° attorno al proprio asse afferra allo stesso modo. Per ogni keyframe
+  il server sceglie la yaw data o quella ruotata: quella che l'IK raggiunge, con margine dai fine corsa dei giunti e
+  più vicina alla configurazione attuale.
+- Con un oggetto in mano la rotazione non è più neutra: un oggetto preso fuori asse si sposta di molto (una scatola
+  ~10 cm, la bottiglia ~20 cm) e una scatola tenuta con la pinza orizzontale si capovolge. Per questo il server
+  mantiene la yaw del keyframe precedente se la rotazione sposterebbe l'oggetto tenuto di più di 3 cm (95° percentile
+  dei suoi punti), purché resti raggiungibile; altrimenti ruota comunque, perché un braccio fermo è un fallimento
+  certo, mentre un oggetto ruotato si può ancora posare.
+- Gli oggetti simmetrici rispetto all'asse (cubi, blocchi, anello, coperchio) si spostano al massimo di 1,2 cm su 36
+  casi misurati: per loro non cambia niente.
+- Misura: in put_groceries la rotazione con la scatola in mano spiegava 3 fallimenti su 10; con la regola la scatola
+  resta dritta. In place_wine non peggiora: dove la yaw mantenuta è raggiungibile la mantiene, altrimenti ruota come
+  prima. Limite: si guarda solo che la yaw mantenuta sia raggiungibile, non quanto margine lascia ai giunti.
+
 ### Hold e revoca
 - Al cambio di keyframe, un oggetto che la mano o l'oggetto tenuto toccano ancora (entro 3,5 cm) mantiene il suo ruolo,
   anche se la nuova zona gli darebbe un ruolo più basso. Esempio reale: in shape_sorter un oggetto vicino era

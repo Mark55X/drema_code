@@ -93,8 +93,57 @@ def subsample_point_cloud(
     return cloud
 
 
+def object_scan_points(
+    scan_frames: List[Dict[str, Any]],
+    target_obj_id: int,
+    depth_near: float,
+    depth_far: float,
+    voxel_size: float
+) -> Tuple[np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """
+    The object's pixels of every scan view, back-projected and averaged per voxel, with the mean centre of the cameras
+    that saw each voxel (to orient the normals) and its mean colour in [0, 1] (None without rgb): the object surface
+    as the cameras measure it.
+    """
+    pts, extra = [], []
+    has_rgb = all(f.get('rgb') is not None for f in scan_frames)
+    for f in scan_frames:
+        if f.get('mask') is None or f.get('depth') is None:
+            continue
+        mask_np, depth_np = to_numpy(f['mask']), to_numpy(f['depth'])
+        if mask_np.ndim == 3:
+            mask_np = mask_np.squeeze(0)
+        if depth_np.ndim == 3:
+            depth_np = depth_np.squeeze(0)
+        sel = (mask_np == target_obj_id) & (depth_np > depth_near) & (depth_np < depth_far)
+        if not np.any(sel):
+            continue
+        v, u = np.nonzero(sel)
+        z = depth_np[v, u].astype(np.float64)
+        K = np.asarray(to_numpy(f['intrinsics']), dtype=np.float64)
+        c2w = np.asarray(to_numpy(f['extrinsics']), dtype=np.float64)
+        p = np.stack([(u - K[0, 2]) * z / K[0, 0], (v - K[1, 2]) * z / K[1, 1], z], -1) @ c2w[:3, :3].T + c2w[:3, 3]
+        rgb = np.zeros((len(p), 3))
+        if has_rgb:
+            img = to_numpy(f['rgb'])
+            if img.ndim == 3 and img.shape[0] == 3 and img.shape[-1] != 3:
+                img = img.transpose(1, 2, 0)
+            rgb = img[v, u].astype(np.float64)
+            if rgb.max() > 1.0:
+                rgb /= 255.0
+        # averaged per view first: a full-resolution view holds far more pixels than the model needs
+        p, rgb = voxel_average(p, voxel_size, rgb)
+        pts.append(p)
+        extra.append(np.hstack([np.repeat(c2w[None, :3, 3], len(p), 0), rgb]))
+    if not pts:
+        return np.zeros((0, 3)), np.zeros((0, 3)), None
+    p, ex = voxel_average(np.vstack(pts), voxel_size, np.vstack(extra))
+    return p, ex[:, :3], (ex[:, 3:] if has_rgb else None)
+
+
 import mcubes
 from vgmapping_drema.tsdf import TSDFVoxelMap
+from vgmapping_drema.object_tracker import GaussNewtonObjectTracker, estimate_normals, fuse_scan_and_mesh, voxel_average
 from .base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult, DiscoveredObstacle
 from ..vg_mapping.closed_loop_pipeline import DREMAClosedLoopVGMappingPipeline, rotation_matrix_to_quaternion
 from ..config import ConfigDict
@@ -381,6 +430,31 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         self.se3_subsample = int(tr_cfg.get("subsample", 256))
         self.se3_lr = float(tr_cfg.get("learning_rate", 0.003))
         self.se3_tol = float(tr_cfg.get("tolerance", 0.0001))
+        self.tracking_method = str(tr_cfg.get("method", "gauss_newton")).lower()
+        self.gn_model = str(tr_cfg.get("gn_model", "fused")).lower()
+        self.gn_model_voxel = float(tr_cfg.get("gn_model_voxel", 0.003))
+        self.gn_mesh_samples = int(tr_cfg.get("gn_mesh_samples", 20000))
+        self.gn_params = dict(
+            iterations=int(tr_cfg.get("gn_iterations", 8)),
+            observation_voxel=float(tr_cfg.get("gn_observation_voxel", 0.004)),
+            max_distance=float(tr_cfg.get("gn_max_distance", 0.01)),
+            initial_max_distance=float(tr_cfg.get("gn_initial_max_distance", 0.05)),
+            huber=float(tr_cfg.get("gn_huber", 0.003)),
+            motion_prior=bool(tr_cfg.get("gn_motion_prior", True)),
+            measurement_sigma=float(tr_cfg.get("gn_measurement_sigma", 0.003)),
+            motion_sigma_rot_deg=float(tr_cfg.get("gn_motion_sigma_rot_deg", 5.0)),
+            motion_sigma_trans=float(tr_cfg.get("gn_motion_sigma_trans", 0.02)),
+            motion_retry=float(tr_cfg.get("gn_motion_retry", 0.003)),
+            grid_cell=float(tr_cfg.get("gn_grid_cell", 0.003)),
+            grid_margin=float(tr_cfg.get("gn_grid_margin", 0.06)),
+            photometric=bool(tr_cfg.get("gn_photometric", False)),
+            photometric_weight=float(tr_cfg.get("gn_photometric_weight", 1.0)),
+            photometric_sigma=float(tr_cfg.get("gn_photometric_sigma", 0.1)),
+            photometric_huber=float(tr_cfg.get("gn_photometric_huber", 0.1)),
+            photometric_depth_tolerance=float(tr_cfg.get("gn_photometric_depth_tolerance", 0.01)),
+            photometric_max_points=int(tr_cfg.get("gn_photometric_max_points", 2000))
+        )
+        self.object_tracker: Optional[GaussNewtonObjectTracker] = None
 
         # Mapping & Raycast Pruning configuration
         map_cfg = config.get_nested("perception.mapping", {})
@@ -483,6 +557,73 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         depth_masked, mask_t = self._apply_semantic_robot_mask(depth_t=depth_t, mask_np=c_data.get('mask'))
         return {'depth': depth_t, 'intrinsics': intrinsics_t, 'pose': pose_t,
                 'depth_masked': depth_masked, 'mask': mask_t}
+
+    def _object_track_model(
+        self,
+        mesh_world: trimesh.Trimesh,
+        scan_frames: Optional[List[Dict[str, Any]]],
+        obj_id: int,
+        color_reference: Optional[Tuple[np.ndarray, np.ndarray]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Surface model the Gauss-Newton tracker aligns each frame to, in the world frame of the scan (tracking.gn_model):
+        'scan' the object's scan pixels, 'mesh' samples of its mesh, 'fused' the scan points lying on the mesh plus the
+        mesh where the scan saw nothing (inside holes, faces turned away from every scan camera).
+        Colours (photometric term) come from the scan pixels; mesh samples take the colour of the nearest scan point,
+        or of the nearest point of color_reference (points, colours) when the scan has none.
+        """
+        mesh_pts, face_idx = trimesh.sample.sample_surface_even(mesh_world, self.gn_mesh_samples, seed=0)
+        mesh_nrm = mesh_world.face_normals[face_idx]
+        pts, nrm, rgb = mesh_pts, mesh_nrm, None
+        scan_pts, scan_cams, scan_rgb = np.zeros((0, 3)), None, None
+        if self.gn_model != "mesh" and scan_frames is not None:
+            scan_pts, scan_cams, scan_rgb = object_scan_points(scan_frames, obj_id, self.depth_near, self.depth_far,
+                                                               self.gn_model_voxel)
+        if scan_rgb is not None and len(scan_pts) >= 3:
+            color_reference = (scan_pts, scan_rgb)
+        mesh_rgb = None
+        if color_reference is not None and len(color_reference[0]) > 0:
+            ref_pts, ref_rgb = (np.asarray(a, dtype=np.float64) for a in color_reference)
+            mesh_rgb = ref_rgb[cKDTree(ref_pts).query(mesh_pts, workers=-1)[1]]
+            rgb = mesh_rgb
+        if len(scan_pts) >= 3:
+            scan_nrm = estimate_normals(scan_pts, scan_cams)
+            if self.gn_model == "scan":
+                pts, nrm, rgb = scan_pts, scan_nrm, scan_rgb
+            else:
+                pts, nrm, rgb = fuse_scan_and_mesh(scan_pts, scan_nrm, mesh_pts, mesh_nrm,
+                                                   scan_colors=scan_rgb, mesh_colors=mesh_rgb)
+        model = {'xyz': np.asarray(pts, dtype=np.float32), 'normal': np.asarray(nrm, dtype=np.float32)}
+        if rgb is not None:
+            model['rgb'] = np.clip(np.asarray(rgb, dtype=np.float32), 0.0, 1.0)
+        return model
+
+    def _init_object_tracker(self) -> None:
+        """Gauss-Newton tracker over the surface models of the tracked objects (after a scan or a cache restore)."""
+        self.object_tracker = None
+        if self.tracking_method != "gauss_newton" or not self.tracked_objects:
+            return
+        t0 = time.perf_counter()
+        for oid, obj in self.tracked_objects.items():
+            if obj.get('track_model') is None and os.path.exists(obj.get('mesh_path', '')):
+                # cache saved before the tracker existed: the exported mesh is centred on the initial position
+                mesh = trimesh.load(obj['mesh_path'], force='mesh', process=False)
+                mesh.apply_translation(np.asarray(obj['initial_pos'], dtype=np.float64))
+                vertex_rgb = getattr(mesh.visual, 'vertex_colors', None)
+                reference = (mesh.vertices, np.asarray(vertex_rgb)[:, :3] / 255.0) \
+                    if vertex_rgb is not None and len(vertex_rgb) == len(mesh.vertices) else None
+                obj['track_model'] = self._object_track_model(mesh, None, oid, reference)
+        models = {oid: (obj['track_model']['xyz'], obj['track_model']['normal'], obj['track_model'].get('rgb'))
+                  for oid, obj in self.tracked_objects.items()
+                  if obj.get('track_model') is not None and len(obj['track_model']['xyz']) >= 3}
+        if not models:
+            return
+        self.object_tracker = GaussNewtonObjectTracker(device=self.device, **self.gn_params)
+        self.object_tracker.set_models(models)
+        print(f"[VGMapping Perception] Gauss-Newton object tracker ({self.gn_model} model"
+              f"{', photometric term on' if self.gn_params['photometric'] else ''}): {len(models)} objects, "
+              f"{sum(len(m[0]) for m in models.values()):,} model points, built in "
+              f"{(time.perf_counter() - t0) * 1000.0:.0f}ms")
 
     def _prepare_tracking_views(
         self,
@@ -1076,6 +1217,11 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                     'opacity': c_opacity.clone()
                 }
             }
+            if self.tracking_method == "gauss_newton":
+                # no semantic mask in this fallback: the mesh is the only model of the object
+                self.tracked_objects[c_idx]['track_model'] = self._object_track_model(
+                    trimesh.Trimesh(vertices=comp_verts, faces=comp_faces), None, c_idx,
+                    (to_numpy(c_xyz), to_numpy(c_rgb)))
 
             self.discovered_obstacles.append(DiscoveredObstacle(
                 oid=c_idx,
@@ -1442,6 +1588,9 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                             'opacity': c_opacity.clone()
                         }
                     }
+                    if self.tracking_method == "gauss_newton":
+                        self.tracked_objects[obj_id]['track_model'] = self._object_track_model(
+                            mesh, scan_frames, obj_id, (to_numpy(c_xyz), to_numpy(c_rgb)))
 
                     # Object-Centric separation: Remove dynamic object primitives from static scene_gaussians
                     if torch.any(obj_g_mask):
@@ -1481,6 +1630,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 z_table=z_table,
                 act_z_max=act_z_max
             )
+        self._init_object_tracker()
 
         # 8. Save to cache if enabled
         if self.cache_save_on_scan:
@@ -1827,7 +1977,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
             t_sgd_total = self._optimize_photometric_sgd_streaming(camera_views=camera_views)
             t_vdc_total = t_prune_total + t_render_total + t_detect_total + t_sgd_total
 
-        # Step 3: RecurGS SE(3) Tracking & Digital Twin Synchronization
+        # Step 3: SE(3) object tracking & digital twin synchronization
         if len(self.tracked_objects) > 0:
             t_s3 = time.perf_counter()
             objects_source = {}
@@ -1882,23 +2032,36 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 if len(tgt_xyz) < 4:
                     continue
 
+                initial_T_coarse_dict[oid] = obj_info.get('last_T', torch.eye(4, device=self.device))
+                if self.object_tracker is not None:
+                    objects_target[oid] = tgt_xyz
+                    continue
+
                 # Budget-constrained subsampling for real-time SE(3) tracking
                 objects_source[oid] = subsample_point_cloud({'xyz': src_xyz, 'rgb': src_rgb}, max_points=self.se3_subsample)
                 objects_target[oid] = subsample_point_cloud({'xyz': tgt_xyz, 'rgb': tgt_rgb}, max_points=self.se3_subsample)
 
-                initial_T_coarse_dict[oid] = obj_info.get('last_T', torch.eye(4, device=self.device))
-
-            if len(objects_source) > 0 and len(objects_target) > 0:
-                T_fine_dict = self.vg_pipeline.step_3_estimate_multi_se3_motion(
-                    objects_source=objects_source,
-                    objects_target=objects_target,
-                    initial_T_coarse_dict=initial_T_coarse_dict,
-                    z_table=z_tab,
-                    num_iterations=self.se3_iterations,
-                    icp_max_iters=self.se3_icp_iterations,
-                    lr=self.se3_lr,
-                    tol=self.se3_tol
-                )
+            if len(objects_target) > 0 and (self.object_tracker is not None or len(objects_source) > 0):
+                if self.object_tracker is not None:
+                    views = None
+                    if self.gn_params['photometric']:
+                        luma = torch.tensor([0.299, 0.587, 0.114], device=self.device)
+                        views = [{'gray': (tv['rgb'].float() / (255.0 if tv['rgb_scale_255'] else 1.0)) @ luma,
+                                  'depth': tv['depth'], 'mask': tv['mask'], 'fx': tv['fx'], 'fy': tv['fy'],
+                                  'cx': tv['cx'], 'cy': tv['cy'], 'R_c2w': tv['R_c2w'], 't_c2w': tv['t_c2w']}
+                                 for tv in tracking_views if tv['rgb'] is not None]
+                    T_fine_dict = self.object_tracker.track(initial_T_coarse_dict, objects_target, views)
+                else:
+                    T_fine_dict = self.vg_pipeline.step_3_estimate_multi_se3_motion(
+                        objects_source=objects_source,
+                        objects_target=objects_target,
+                        initial_T_coarse_dict=initial_T_coarse_dict,
+                        z_table=z_tab,
+                        num_iterations=self.se3_iterations,
+                        icp_max_iters=self.se3_icp_iterations,
+                        lr=self.se3_lr,
+                        tol=self.se3_tol
+                    )
 
                 for oid, T_fine in T_fine_dict.items():
                     self.tracked_objects[oid]['last_T'] = T_fine.detach()
@@ -1965,7 +2128,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                 for oid, d_p in tracked_deltas.items():
                     name_o = self.tracked_objects[oid]['name']
                     pos_o = self.tracked_objects[oid]['last_pos']
-                    print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
+                    print(f"  ├─ Step 3 (SE(3) Object Tracking): {t_se3_total:.1f}ms | Obj #{oid} ('{name_o}'): pos=[{pos_o[0]:.3f}, {pos_o[1]:.3f}, {pos_o[2]:.3f}] | delta=[{d_p[0]:+.4f}, {d_p[1]:+.4f}, {d_p[2]:+.4f}]m")
 
                     # Object-Centric tracking verification
                     active_on_obj = len(self.tracked_objects[oid].get('gaussians', {}).get('xyz', []))
@@ -1983,7 +2146,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                                 pred_str = f" -> Forecast(+0.75s): [{p_fut[0]:.3f}, {p_fut[1]:.3f}, {p_fut[2]:.3f}]"
                             print(f"  │    └─ [Kalman Predictor]: v=[{vel[0]:+.3f}, {vel[1]:+.3f}, {vel[2]:+.3f}]m/s (|v|={speed:.3f}m/s){pred_str}")
             else:
-                print(f"  ├─ Step 3 (RecurGS Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
+                print(f"  ├─ Step 3 (SE(3) Object Tracking): {t_se3_total:.1f}ms | No objects actively tracked")
             print(f"  ├─ TSDF Voxel Grid: {tsdf_active_voxels:,} surface voxels | W_max: {w_max:.1f} | W_mean: {w_mean:.1f}")
             vram_str = ""
             if torch.cuda.is_available() and str(self.device).startswith('cuda'):
@@ -2248,6 +2411,8 @@ class VGMappingPerceptionModule(BasePerceptionModule):
                         if obs.oid in self.tracked_objects:
                             self.tracked_objects[obs.oid]['pybullet_id'] = pb_id
 
+            self._init_object_tracker()
+
             t_elapsed = time.time() - t_start
             retained_count = len(self.scene_gaussians['xyz'])
             print(f"[VGMapping Perception Cache] Restored {retained_count:,} Gaussians, TSDF grid {self.grid_dim}, and {len(self.discovered_obstacles)} obstacles in {t_elapsed:.3f}s!")
@@ -2283,6 +2448,7 @@ class VGMappingPerceptionModule(BasePerceptionModule):
         }
         self.tracked_objects.clear()
         self.discovered_obstacles.clear()
+        self.object_tracker = None
 
     def shutdown(self) -> None:
         """Cleans up perception tensors."""

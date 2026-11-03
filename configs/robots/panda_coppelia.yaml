@@ -1,0 +1,10 @@
+# Panda as modelled by CoppeliaSim/RLBench. Values in the measured joint space of the client and in the flange frame.
+name: "panda_coppelia"
+# theta_DH = q_measured + offset [rad]: the RLBench joint 4 zero is 3.92 deg off the Franka DH zero
+# (fitted on joint axes, joint origins and Panda_tip).
+joint_angle_offsets: [0.0, 0.0, 0.0, 0.0683, 0.0, 0.0, 0.0]
+# Flange -> TCP translation [m], flange frame: Panda_tip fitted over 41 configurations (0.6 mm mean residual).
+tcp_offset: [0.00139, 0.00144, 0.11003]
+# Rotation of the hand frame the client reports (Panda_tip) relative to the flange, xyz Euler [deg]. Only checked
+# at startup: the server measures it online.
+tcp_rotation_xyz_deg: [0.0, 0.0, 135.0]

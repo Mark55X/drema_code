@@ -21,6 +21,7 @@ import argparse
 from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
+from scipy.spatial import cKDTree
 from scipy.spatial.transform import Rotation
 import torch
 import trimesh
@@ -168,9 +169,21 @@ class DremaDynamicSystem:
         kp_rot = float(config.get_nested("digital_twin.kp_rot", 15.0))
         kd_rot = float(config.get_nested("digital_twin.kd_rot", 1.5))
         sim_substeps = int(config.get_nested("digital_twin.sim_substeps", 2))
-        # Shared by the controller kinematics and the twin robot model (theta_DH = q_measured + offset)
+        # Robot profile, shared by the controller kinematics and the twin robot model (theta_DH = q_measured + offset)
         self.joint_angle_offsets = [float(x) for x in config.get_nested("robot.joint_angle_offsets", [0.0] * 7)]
-        print(f"[DREMA DYNAMIC SYSTEM] Robot joint angle offsets [rad]: {self.joint_angle_offsets}")
+        tcp_offset = config.get_nested("robot.tcp_offset", None)
+        self.tcp_offset = [float(x) for x in tcp_offset] if tcp_offset is not None else None
+        tcp_rotation = config.get_nested("robot.tcp_rotation_xyz_deg", None)
+        self.tcp_rotation_R = (Rotation.from_euler('xyz', [float(x) for x in tcp_rotation], degrees=True).as_matrix()
+                               if tcp_rotation is not None else None)
+        self.self_check_enabled = bool(config.get_nested("robot.self_check.enabled", True))
+        self.self_check_max_position = float(config.get_nested("robot.self_check.max_position_error", 0.003))
+        self.self_check_max_rotation = float(config.get_nested("robot.self_check.max_rotation_error_deg", 2.0))
+        self.self_check_stop = str(config.get_nested("robot.self_check.on_failure", "stop")).lower() == "stop"
+        self._self_check_result: Optional[bool] = None
+        print(f"[DREMA DYNAMIC SYSTEM] Robot profile: {config.get_nested('robot.name', 'none')} "
+              f"({config.get_nested('robot.profile', 'no profile file')}) | joint angle offsets [rad]: "
+              f"{self.joint_angle_offsets} | TCP offset [m]: {self.tcp_offset or 'FrankaKinematics default'}")
 
         if twin_engine == "pybullet":
             self.digital_twin: BaseDigitalTwin = PyBulletDigitalTwin(
@@ -187,7 +200,8 @@ class DremaDynamicSystem:
                 joint_angle_offsets=self.joint_angle_offsets,
                 obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
                 vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
-                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05))
+                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05)),
+                ee_offset=self.tcp_offset
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
         elif twin_engine in ["mujoco", "mjx"]:
@@ -209,7 +223,8 @@ class DremaDynamicSystem:
                 joint_angle_offsets=self.joint_angle_offsets,
                 obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
                 vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
-                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05))
+                vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05)),
+                ee_offset=self.tcp_offset
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
 
@@ -225,7 +240,8 @@ class DremaDynamicSystem:
         self._mpc_lock = threading.Lock()
         self._last_action: Optional[drema_comm_pb2.ControlAction] = None
         self._last_action_time = 0.0
-        self.mpc_controller = MPCController.from_config(ctrl_cfg, self.digital_twin, self.joint_angle_offsets)
+        self.mpc_controller = MPCController.from_config(ctrl_cfg, self.digital_twin, self.joint_angle_offsets,
+                                                        self.tcp_offset)
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 
         # Object roles: environment permissions + keyframe policy contact + held objects -> twin collision policies
@@ -237,6 +253,7 @@ class DremaDynamicSystem:
         self._tip_offset_R: Optional[np.ndarray] = None
         self._yaw_choice: Dict[int, bool] = {}
         self.yaw_symmetry = bool(roles_cfg.get("yaw_symmetry", True))
+        self.yaw_symmetry_held_limit = float(roles_cfg.get("yaw_symmetry_held_limit", 0.0))
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Object roles {'enabled' if self.role_registry else 'disabled'}.")
 
         # 3. Initialize Modular Perception Backend
@@ -421,6 +438,7 @@ class DremaDynamicSystem:
         if self.role_registry is not None:
             self.role_registry.reset(self.digital_twin)
         self._yaw_choice.clear()
+        self._self_check_result = None
         self.digital_twin.reset()
         with self._mpc_lock:
             self.mpc_controller.reset()
@@ -746,6 +764,19 @@ class DremaDynamicSystem:
         if len(robot_state.robot_base_pos) >= 3:
             self.robot_base_pos = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
 
+        if self.self_check_enabled and self._self_check_result is None:
+            self._kinematic_self_check(robot_state)
+        if self._self_check_result is False and self.self_check_stop:
+            return drema_comm_pb2.ControlAction(
+                timestamp=time.time(),
+                timestep=robot_state.timestep,
+                joint_velocities=[0.0] * 7,
+                gripper_action=robot_state.gripper_open,
+                safety_stop=True,
+                status_message="ROBOT PROFILE SELF-CHECK FAILED: the kinematic model does not match the measured hand "
+                               "pose (see the server log); fix robot.profile or set robot.self_check.on_failure: warn"
+            )
+
         # Target orientation in the FrankaKinematics EE convention used by the MPC and by the hand footprint of the roles
         mpc_state = self._target_in_flange_frame(robot_state)
 
@@ -812,6 +843,31 @@ class DremaDynamicSystem:
 
         return action
 
+    def _kinematic_self_check(self, robot_state: drema_comm_pb2.RobotState) -> None:
+        """
+        The hand pose predicted by the kinematic model from the measured joints against the hand pose the client
+        measures: a robot profile that does not match the robot (joint offsets, TCP, base) shows up here, before the
+        first motion, instead of as a missed grasp. Runs on the first state carrying both, after every reset.
+        """
+        if len(robot_state.ee_pose) < 7 or len(robot_state.joint_positions) != 7:
+            return
+        kin = self.mpc_controller.kinematics
+        if kin.base_position is None and len(robot_state.robot_base_pos) >= 3:
+            kin.base_position = np.array(robot_state.robot_base_pos[:3], dtype=np.float32)
+        p_fk, R_fk = kin.forward_kinematics_ee(np.asarray(robot_state.joint_positions, dtype=np.float64))
+        position_error = float(np.linalg.norm(np.asarray(p_fk, dtype=np.float64) - np.asarray(robot_state.ee_pose[:3])))
+        ok = position_error <= self.self_check_max_position
+        rotation_note = "hand frame rotation not in the profile"
+        if self.tcp_rotation_R is not None:
+            R_hand = np.asarray(R_fk, dtype=np.float64).T @ Rotation.from_quat(robot_state.ee_pose[3:7]).as_matrix()
+            rotation_error = float(np.degrees(np.linalg.norm(Rotation.from_matrix(self.tcp_rotation_R.T @ R_hand).as_rotvec())))
+            ok = ok and rotation_error <= self.self_check_max_rotation
+            rotation_note = f"hand frame rotation error {rotation_error:.2f} deg (max {self.self_check_max_rotation:.1f})"
+        self._self_check_result = ok
+        verdict = "OK" if ok else ("FAILED, control stopped" if self.self_check_stop else "FAILED, continuing (on_failure: warn)")
+        print(f"[DREMA DYNAMIC SYSTEM] Robot profile self-check {verdict}: TCP position error {position_error * 1000:.1f} mm "
+              f"(max {self.self_check_max_position * 1000:.1f}), {rotation_note}")
+
     def _target_in_flange_frame(self, robot_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.RobotState:
         """
         Converts a Panda_tip target orientation (RLBench gripper_pose, PerAct keyposes) to the EE convention of
@@ -863,13 +919,43 @@ class DremaDynamicSystem:
                 margin = float(np.min(np.minimum(q_sol - kin.Q_MIN, kin.Q_MAX - q_sol)))
                 scored.append((bool(ok), margin, float(np.linalg.norm(q_sol - q_now)), flip))
             best = max(scored, key=lambda s: (s[0], s[1] >= self.YAW_MIN_LIMIT_MARGIN, -s[2]))
-            self._yaw_choice[key] = best[3]
-            print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: gripper yaw {'turned by 180 deg' if best[3] else 'as given'} "
+            choice, kept = best[3], ""
+            if self.yaw_symmetry_held_limit > 0 and self._yaw_choice:
+                previous = max(self._yaw_choice)
+                inherited = self._yaw_choice[previous]
+                moved = self._held_turn_displacement() if choice != inherited else 0.0
+                if moved > self.yaw_symmetry_held_limit:
+                    # An unreachable kept yaw would stall the arm for good; a turned held object may still be placed.
+                    if scored[1 if inherited else 0][0]:
+                        choice = inherited
+                        kept = f", kept from keyframe {previous}: the turn would move the held object by {moved * 100:.1f} cm"
+                    else:
+                        kept = (f", turned although it moves the held object by {moved * 100:.1f} cm: the yaw of "
+                                f"keyframe {previous} is unreachable here")
+            self._yaw_choice[key] = choice
+            print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: gripper yaw {'turned by 180 deg' if choice else 'as given'} "
                   f"(IK ok / joint-limit margin: as given {scored[0][0]}/{scored[0][1]:.2f} rad, "
-                  f"turned {scored[1][0]}/{scored[1][1]:.2f} rad)")
+                  f"turned {scored[1][0]}/{scored[1][1]:.2f} rad){kept}")
         if self._yaw_choice[key]:
             return R_target @ Rotation.from_euler('z', np.pi).as_matrix()
         return R_target
+
+    def _held_turn_displacement(self) -> float:
+        """
+        How far the held objects move (95th percentile over their points) when the gripper turns by 180 deg about its
+        axis: about zero for objects symmetric about it (cubes, rings grasped at the centre), large for one held off-axis.
+        """
+        if self.role_registry is None or not self.role_registry.held:
+            return 0.0
+        turn = np.diag([-1.0, -1.0, 1.0])
+        worst = 0.0
+        for obj_id, tcp_T_obj in self.role_registry.held.items():
+            local = self.digital_twin.object_body_points(obj_id)
+            if local is None or not len(local):
+                continue
+            pts = np.asarray(local, dtype=np.float64) @ tcp_T_obj[:3, :3].T + tcp_T_obj[:3, 3]
+            worst = max(worst, float(np.percentile(cKDTree(pts).query(pts @ turn.T)[0], 95)))
+        return worst
 
     def _try_startup_cache_restore(self) -> bool:
         """

@@ -56,7 +56,8 @@ class MPCController:
         evade_imminent_distance: float = 0.06,
         evade_retreat_speed: float = 0.15,
         evade_lift_speed: float = 0.12,
-        joint_angle_offsets: Optional[List[float]] = None  # theta_DH = q_measured + offset (see FrankaKinematics)
+        joint_angle_offsets: Optional[List[float]] = None,  # theta_DH = q_measured + offset (see FrankaKinematics)
+        ee_offset: Optional[List[float]] = None             # Flange -> TCP translation of the robot profile [m]
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
@@ -67,7 +68,8 @@ class MPCController:
         self.alpha_rot = alpha_rot
 
         # Kinematics & MP-PMPPI engine
-        self.kinematics = FrankaKinematics(base_position=None, joint_angle_offsets=joint_angle_offsets)
+        self.kinematics = FrankaKinematics(base_position=None, joint_angle_offsets=joint_angle_offsets,
+                                           ee_offset=ee_offset)
         self.engine = MPPMPPIEngine(
             kinematics=self.kinematics,
             horizon=horizon,
@@ -104,7 +106,8 @@ class MPCController:
 
     @classmethod
     def from_config(cls, ctrl_cfg: Dict[str, Any], digital_twin: Optional[Any] = None,
-                    joint_angle_offsets: Optional[List[float]] = None) -> "MPCController":
+                    joint_angle_offsets: Optional[List[float]] = None,
+                    ee_offset: Optional[List[float]] = None) -> "MPCController":
         """Controller built from the 'controller' section of the DREMA config (shared by the server and the benchmarks)."""
         c = ctrl_cfg or {}
         return cls(
@@ -135,7 +138,8 @@ class MPCController:
             evade_imminent_distance=float(c.get("evade_imminent_distance", 0.06)),
             evade_retreat_speed=float(c.get("evade_retreat_speed", 0.15)),
             evade_lift_speed=float(c.get("evade_lift_speed", 0.12)),
-            joint_angle_offsets=joint_angle_offsets
+            joint_angle_offsets=joint_angle_offsets,
+            ee_offset=ee_offset
         )
 
     def set_digital_twin(self, digital_twin: Any) -> None:

@@ -108,14 +108,19 @@ class FrankaKinematics:
         for a, al, d, th in MDH_PARAMS
     ]
 
-    def __init__(self, base_position: Optional[np.ndarray] = None, joint_angle_offsets: Optional[np.ndarray] = None):
+    def __init__(self, base_position: Optional[np.ndarray] = None, joint_angle_offsets: Optional[np.ndarray] = None,
+                 ee_offset: Optional[np.ndarray] = None):
         """
         :param base_position: 3D coordinates [x, y, z] of the robot base in world frame.
         :param joint_angle_offsets: Per-joint zero offsets [rad] added to the measured joint angles
                                     before the DH chain (theta_DH = q + offset). Joint limits,
                                     commands and IK solutions stay in the measured joint space.
+        :param ee_offset: Flange -> TCP translation [m] in the flange frame (robot profile); the
+                          CoppeliaSim fit EE_OFFSET when omitted.
         """
         self.base_position = np.array(base_position, dtype=np.float32) if base_position is not None else None
+        self.EE_OFFSET = (np.asarray(ee_offset, dtype=np.float32).reshape(3) if ee_offset is not None
+                          else FrankaKinematics.EE_OFFSET.copy())
         self.joint_angle_offsets = (
             np.asarray(joint_angle_offsets, dtype=np.float64).reshape(7)
             if joint_angle_offsets is not None else np.zeros(7, dtype=np.float64)

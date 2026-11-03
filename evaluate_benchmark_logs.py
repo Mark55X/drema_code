@@ -47,7 +47,7 @@ def parse_log_file(filepath: str) -> dict:
     re_total = re.compile(r"Total Step Latency:\s*([\d\.]+)ms\s*\(([\d\.]+)\s*Hz\)(?:\s*\|\s*GPU VRAM:\s*([\d\.]+)MB)?")
     re_step1 = re.compile(r"Step 1 \(TSDF Ingest\):\s*([\d\.]+)ms")
     re_step2 = re.compile(r"Step 2 \(VDC Mapping\):\s*([\d\.]+)ms\s*\[Prune:\s*([\d\.]+)ms\s*\|\s*3DGS Render:\s*([\d\.]+)ms\s*\|\s*Init:\s*([\d\.]+)ms.*?\]\s*\|\s*Pruned:\s*(\d+)\s*\|\s*Evicted:\s*(\d+)\s*\|\s*Added:\s*(\d+)\s*\|\s*Active 3DGS:\s*([\d\,]+)")
-    re_step3 = re.compile(r"Step 3 \(RecurGS Tracking\):\s*([\d\.]+)ms")
+    re_step3 = re.compile(r"Step 3 \((?:RecurGS|SE\(3\) Object) Tracking\):\s*([\d\.]+)ms")
     re_tsdf = re.compile(r"W_mean:\s*([\d\.]+)")
     re_stray = re.compile(r"(\d+)\s*stray in static background")
 

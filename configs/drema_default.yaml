@@ -98,13 +98,37 @@ perception:
     lambda_ssim: 0.2                 # Weight for SSIM loss (paper Eq. 10: lambda = 0.2)
     prune_opacity_threshold: 0.05    # Opacity threshold below which Gaussians are pruned
 
-  # RecurGS SE(3) Rigid Object Tracking (Calibrate for GPU balance with MuJoCo controller)
+  # SE(3) Rigid Object Tracking
   tracking:
+    method: "gauss_newton"           # "gauss_newton" (robust point-to-plane Gauss-Newton on a fixed surface model, deterministic) or "recurgs_adam" (RecurGS Lie-algebra Adam refinement on randomly subsampled points)
+    # recurgs_adam
     se3_iterations: 12               # Lie algebra gradient optimization iterations per frame
     se3_icp_iterations: 8            # Coarse ICP alignment iterations
     subsample: 256                   # Subsampled points per object (increase to 512/1024 for higher accuracy)
     learning_rate: 0.003             # Step size in se(3) tangent space
     tolerance: 0.0001                # Convergence criterion
+    # gauss_newton
+    gn_model: "fused"                # Surface model per object, built after the scan: "fused" (scan points on the mesh + mesh where the scan saw nothing), "scan", "mesh"
+    gn_model_voxel: 0.003            # Scan points averaged per voxel of this size [m]
+    gn_mesh_samples: 20000           # Points sampled on the object mesh
+    gn_iterations: 8                 # Gauss-Newton iterations per frame (fewer once every object has converged)
+    gn_observation_voxel: 0.004      # Observed points averaged per voxel [m]: same view, same result, whatever the pixel count
+    gn_max_distance: 0.01            # Final correspondence gate [m]
+    gn_initial_max_distance: 0.05    # First-iteration gate, shrinking by 0.6 per iteration [m]
+    gn_huber: 0.003                  # Robust kernel threshold on the point-to-plane residual [m]
+    gn_motion_prior: true            # Penalise the motion from the previous pose: directions the view does not constrain (yaw of a cylinder) stay still
+    gn_measurement_sigma: 0.003      # Residual scale the motion prior is weighed against [m]
+    gn_motion_sigma_rot_deg: 5.0     # Motion prior per update, rotation [deg]
+    gn_motion_sigma_trans: 0.02      # Motion prior per update, translation [m]
+    gn_motion_retry: 0.003           # An object that moved more than this [m] in its last update is also solved from the constant-velocity prediction (0 disables)
+    gn_grid_cell: 0.003              # Cell of the precomputed nearest-model-point grid [m]
+    gn_grid_margin: 0.06             # Grid extent beyond the model [m]: farther observations get no correspondence
+    gn_photometric: false            # Add the photometric term (model colours vs camera images) in the fine iterations; off in simulation (flat textures, exact masks), meant for real cameras
+    gn_photometric_weight: 1.0       # Weight of the photometric term relative to the geometric one
+    gn_photometric_sigma: 0.1        # Intensity residual scale (grey level in [0, 1]) the weight is expressed against
+    gn_photometric_huber: 0.1        # Robust kernel threshold on the intensity residual
+    gn_photometric_depth_tolerance: 0.01 # A model point counts as seen when its depth matches the image depth within this [m]
+    gn_photometric_max_points: 2000  # Coloured model points used per object (evenly thinned)
     proximity_search_radius: 0.25    # Bounding sphere search radius around last known position in meters
 
   # Initial Scan (t=0) Caching (Instant restoration in <0.1s without re-streaming over SSH)
@@ -117,9 +141,14 @@ perception:
 # 3b. Robot Model Calibration (shared by MPC kinematics and Digital Twin robot)
 # ------------------------------------------------------------------------------
 robot:
-  # theta_DH = q_measured + offset [rad]. CoppeliaSim/RLBench Panda: joint 4 zero is 3.92 deg off
-  # the Franka DH zero (fitted on joint axes and Panda_tip, 0.6 mm residual). Real Franka: all zeros.
-  joint_angle_offsets: [0.0, 0.0, 0.0, 0.0683, 0.0, 0.0, 0.0]
+  # Robot instance: joint angle offsets, flange -> TCP offset, hand frame rotation (configs/robots/).
+  # Keys written here override the profile's.
+  profile: "configs/robots/panda_coppelia.yaml"   # Physical arm: configs/robots/panda_real.yaml
+  self_check:                        # Model hand pose vs measured hand pose on the first state of each episode
+    enabled: true
+    max_position_error: 0.003        # [m]
+    max_rotation_error_deg: 2.0
+    on_failure: "stop"               # "stop": safety stop until the next reset | "warn": log only
 
 # ------------------------------------------------------------------------------
 # 4. Digital Twin Engine
@@ -190,6 +219,7 @@ roles:
   enabled: true                      # Master switch: false = every object is an obstacle, nothing is ever held
   verbose: true
   yaw_symmetry: true                 # Tip-frame keyframes may be turned by 180 deg about the gripper axis when easier to reach
+  yaw_symmetry_held_limit: 0.03      # While holding, no turn moving the held object more than this [m] unless the kept yaw is unreachable (0 = off)
   permissions:                       # Permissions sent by the environment (roles_env.yaml)
     enabled: true
   touch_exempts_arm: false           # A human TOUCH also lets the arm links (not only hand and fingers) touch the object
