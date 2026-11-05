@@ -185,11 +185,35 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
   mantiene la yaw del keyframe precedente se la rotazione sposterebbe l'oggetto tenuto di più di 3 cm (95° percentile
   dei suoi punti), purché resti raggiungibile; altrimenti ruota comunque, perché un braccio fermo è un fallimento
   certo, mentre un oggetto ruotato si può ancora posare.
+- Subito dopo la presa il registro dei ruoli non ha ancora registrato l'oggetto tenuto (si aggiorna dopo la scelta
+  della yaw): una pinza chiusa senza oggetto registrato basta per mantenere la yaw precedente.
 - Gli oggetti simmetrici rispetto all'asse (cubi, blocchi, anello, coperchio) si spostano al massimo di 1,2 cm su 36
   casi misurati: per loro non cambia niente.
 - Misura: in put_groceries la rotazione con la scatola in mano spiegava 3 fallimenti su 10; con la regola la scatola
   resta dritta. In place_wine non peggiora: dove la yaw mantenuta è raggiungibile la mantiene, altrimenti ruota come
   prima. Limite: si guarda solo che la yaw mantenuta sia raggiungibile, non quanto margine lascia ai giunti.
+
+### Postura del keyframe (IK globale)
+- L'IK locale (DLS) parte dalla configurazione attuale e scende verso la posa: trova solo le soluzioni della "famiglia"
+  in cui si trova già il braccio. Su pose raggiungibili fallisce spesso: 30% su pose lontane, 13% su pose vicine,
+  0,6% sui keyframe reali delle demo. Un fallimento qui non significa che la posa sia irraggiungibile.
+- All'inizio di ogni keyframe usiamo un'IK globale analitica, GeoFIK (Lopez-Custodio et al. 2025): fissato il giunto 7,
+  restituisce in forma chiusa tutte le soluzioni (fino a 8). Il giunto 7 si campiona su tutta la corsa (33 valori, 10°;
+  un secondo passaggio a 2,5° solo se il primo non trova niente): 100% delle pose raggiungibili, pochi ms, una volta
+  per keyframe. Nessuna soluzione significa davvero fuori portata.
+- Fra le soluzioni con almeno 0,2 rad dai fine corsa si sceglie la postura con il costo più basso: movimento dei giunti
+  + 10 rad/m × quanto il TCP esce dalla retta verso la posa finale, lungo la linea nei giunti su cui la guida tira il
+  braccio. Delle 8 migliori si prende la prima la cui linea resta a 2 cm dagli ostacoli dei ruoli attuali. Così si
+  evitano posture vicine nei giunti che fanno salire o sbandare la mano. La postura scelta diventa il punto di
+  partenza dell'IK locale, che continua a guidare l'MPPI a ogni ciclo: il globale decide la postura, il locale la
+  insegue. Vale anche per la scelta della yaw della pinza.
+- Il modello è lo stesso dei costi dell'MPPI (profilo del robot: offset dei giunti, TCP, base): FK identica entro
+  0,2 µm. È un pacchetto separato (`packages/panda_global_ik`), riusabile su qualsiasi Panda; si attiva con
+  `controller.ik.global_search` ("off" torna all'IK locale).
+- Misura (stesse scene, twin PyBullet): place_wine 2/3 → 3/3, put_groceries 0/3 → 2/3, nessun fallimento dell'IK per
+  ciclo. Con la scelta della postura in base al percorso: put_groceries 3/5 contro 1/5 con la postura più vicina.
+  Limiti: il controllo guarda la linea ideale nei giunti, che l'MPPI non segue esattamente, e segnala come non libero
+  anche il contatto voluto alla fine di una presa o di un inserimento.
 
 ### Hold e revoca
 - Al cambio di keyframe, un oggetto che la mano o l'oggetto tenuto toccano ancora (entro 3,5 cm) mantiene il suo ruolo,

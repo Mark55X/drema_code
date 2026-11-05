@@ -135,9 +135,13 @@ class MPPMPPIEngine:
         evade_min_speed: float = 0.03,
         evade_imminent_distance: float = 0.06,
         evade_retreat_speed: float = 0.15,
-        evade_lift_speed: float = 0.12
+        evade_lift_speed: float = 0.12,
+        random_seed: Optional[int] = None
     ):
         self.kin = kinematics if kinematics is not None else FrankaKinematics()
+        # Seeded, every episode draws the same samples: runs differing only in a setting are directly comparable.
+        self.random_seed = random_seed
+        self.rng = np.random.default_rng(random_seed)
         self.H = horizon
         self.dt = dt
         self.M = num_samples_per_planner
@@ -250,6 +254,7 @@ class MPPMPPIEngine:
             self.planner_distributions[name]['sigma'].fill(self.init_noise_std ** 2)
         self.mixing_weights = {name: 1.0 / self.num_planners for name in self.planner_names}
         self.last_ik_solution = None
+        self.rng = np.random.default_rng(self.random_seed)
 
     def solve(
         self,
@@ -337,13 +342,13 @@ class MPPMPPIEngine:
         for name in self.planner_names:
             mu_n = self.planner_distributions[name]['mu']
             std_n = np.sqrt(np.maximum(self.planner_distributions[name]['sigma'], 1e-6))
-            noise = np.random.randn(self.M, self.H, 7).astype(np.float32)
+            noise = self.rng.standard_normal((self.M, self.H, 7)).astype(np.float32)
             u_n = mu_n[None, :, :] + noise * std_n[None, :, :]
             sample_batches.append(u_n)
 
         # 2b. Mixed distribution samples (Eq. 20)
         std_mixed = np.sqrt(np.maximum(self.sigma_mixed, 1e-6))
-        noise_mixed = np.random.randn(self.M, self.H, 7).astype(np.float32)
+        noise_mixed = self.rng.standard_normal((self.M, self.H, 7)).astype(np.float32)
         u_mixed = self.mu_mixed[None, :, :] + noise_mixed * std_mixed[None, :, :]
         sample_batches.append(u_mixed)
 

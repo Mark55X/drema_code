@@ -57,7 +57,8 @@ class MPCController:
         evade_retreat_speed: float = 0.15,
         evade_lift_speed: float = 0.12,
         joint_angle_offsets: Optional[List[float]] = None,  # theta_DH = q_measured + offset (see FrankaKinematics)
-        ee_offset: Optional[List[float]] = None             # Flange -> TCP translation of the robot profile [m]
+        ee_offset: Optional[List[float]] = None,            # Flange -> TCP translation of the robot profile [m]
+        random_seed: Optional[int] = None                   # MPPI sampling seed, reapplied at every reset (None: random)
     ):
         self.digital_twin = digital_twin
         self.num_joints = num_joints
@@ -101,7 +102,8 @@ class MPCController:
             evade_min_speed=evade_min_speed,
             evade_imminent_distance=evade_imminent_distance,
             evade_retreat_speed=evade_retreat_speed,
-            evade_lift_speed=evade_lift_speed
+            evade_lift_speed=evade_lift_speed,
+            random_seed=random_seed
         )
 
     @classmethod
@@ -139,7 +141,8 @@ class MPCController:
             evade_retreat_speed=float(c.get("evade_retreat_speed", 0.15)),
             evade_lift_speed=float(c.get("evade_lift_speed", 0.12)),
             joint_angle_offsets=joint_angle_offsets,
-            ee_offset=ee_offset
+            ee_offset=ee_offset,
+            random_seed=None if c.get("random_seed") is None else int(c.get("random_seed"))
         )
 
     def set_digital_twin(self, digital_twin: Any) -> None:

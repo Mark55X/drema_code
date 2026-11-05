@@ -40,6 +40,7 @@ from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
 from drema.perception.base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
+from drema.controller.global_ik import GlobalIK
 from drema.roles import ObjectRoleRegistry
 from drema.visualization import build_visualization_hub
 
@@ -254,6 +255,26 @@ class DremaDynamicSystem:
         self._yaw_choice: Dict[int, bool] = {}
         self.yaw_symmetry = bool(roles_cfg.get("yaw_symmetry", True))
         self.yaw_symmetry_held_limit = float(roles_cfg.get("yaw_symmetry_held_limit", 0.0))
+        ik_cfg = ctrl_cfg.get("ik", {}) or {}
+        self.global_ik: Optional[GlobalIK] = None
+        self._keyframe_posture: Dict[int, Optional[np.ndarray]] = {}
+        if str(ik_cfg.get("global_search", "off")).lower() == "geofik":
+            try:
+                self.global_ik = GlobalIK(self.mpc_controller.kinematics, int(ik_cfg.get("q7_samples", 33)))
+            except ImportError as e:
+                print(f"[DREMA DYNAMIC SYSTEM] panda_global_ik not available ({e}): keyframe postures from the local IK "
+                      f"(pip install packages/panda_global_ik)")
+        print(f"[DREMA DYNAMIC SYSTEM] Keyframe posture search: {'GeoFIK, global' if self.global_ik else 'local DLS'}")
+        posture_cfg = ik_cfg.get("posture_selection", {}) or {}
+        self.posture_scoring = bool(posture_cfg.get("enabled", True))
+        self.posture_path_weight = float(posture_cfg.get("path_weight", 10.0))
+        self.posture_path_samples = int(posture_cfg.get("path_samples", 5))
+        self.posture_candidates = int(posture_cfg.get("candidates_checked", 8))
+        self.posture_clearance = float(posture_cfg.get("clearance", 0.02))
+        if self.global_ik is not None:
+            print(f"[DREMA DYNAMIC SYSTEM] Keyframe posture choice: " + (
+                f"joint motion + {self.posture_path_weight:.0f} rad/m x TCP path deviation, clear path"
+                if self.posture_scoring else "closest posture"))
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Object roles {'enabled' if self.role_registry else 'disabled'}.")
 
         # 3. Initialize Modular Perception Backend
@@ -438,6 +459,7 @@ class DremaDynamicSystem:
         if self.role_registry is not None:
             self.role_registry.reset(self.digital_twin)
         self._yaw_choice.clear()
+        self._keyframe_posture.clear()
         self._self_check_result = None
         self.digital_twin.reset()
         with self._mpc_lock:
@@ -779,6 +801,7 @@ class DremaDynamicSystem:
 
         # Target orientation in the FrankaKinematics EE convention used by the MPC and by the hand footprint of the roles
         mpc_state = self._target_in_flange_frame(robot_state)
+        self._seed_keyframe_posture(mpc_state)
 
         # 0. Object roles: policies and held objects must be in place before the robot (and what it holds) is synced
         if self.role_registry is not None:
@@ -912,33 +935,125 @@ class DremaDynamicSystem:
             kin = self.mpc_controller.kinematics
             q_now = np.asarray(robot_state.joint_positions, dtype=np.float64)
             pos = np.asarray(robot_state.target_pose[:3], dtype=np.float64)
-            scored = []
+            scored, picks = [], {}
             for flip in (False, True):
                 R = R_target @ Rotation.from_euler('z', np.pi).as_matrix() if flip else R_target
-                q_sol, ok = kin.solve_dls_ik(q_now.astype(np.float32), pos, R)
+                if self.global_ik is not None:
+                    pick = self._choose_posture(self.global_ik.solutions(pos, R), q_now)
+                    picks[flip] = pick
+                    ok, q_sol = pick is not None, (pick[0] if pick is not None else q_now)
+                else:
+                    q_sol, ok = kin.solve_dls_ik(q_now.astype(np.float32), pos, R)
                 margin = float(np.min(np.minimum(q_sol - kin.Q_MIN, kin.Q_MAX - q_sol)))
-                scored.append((bool(ok), margin, float(np.linalg.norm(q_sol - q_now)), flip))
+                cost = picks[flip][2] if picks.get(flip) is not None else float(np.linalg.norm(q_sol - q_now))
+                scored.append((bool(ok), margin, cost, flip, q_sol))
             best = max(scored, key=lambda s: (s[0], s[1] >= self.YAW_MIN_LIMIT_MARGIN, -s[2]))
             choice, kept = best[3], ""
             if self.yaw_symmetry_held_limit > 0 and self._yaw_choice:
                 previous = max(self._yaw_choice)
                 inherited = self._yaw_choice[previous]
+                # Right after a grasp the role registry registers the held object only after this decision: a gripper
+                # that is not open with nothing registered may hold something whose turn cannot be measured yet.
+                pending = (robot_state.gripper_open < 0.9 and
+                           not (self.role_registry is not None and self.role_registry.held))
                 moved = self._held_turn_displacement() if choice != inherited else 0.0
+                if choice != inherited and pending:
+                    moved = float('inf')
                 if moved > self.yaw_symmetry_held_limit:
+                    reason = ("the gripper is closed on an object not registered yet" if pending else
+                              f"the turn would move the held object by {moved * 100:.1f} cm")
                     # An unreachable kept yaw would stall the arm for good; a turned held object may still be placed.
                     if scored[1 if inherited else 0][0]:
                         choice = inherited
-                        kept = f", kept from keyframe {previous}: the turn would move the held object by {moved * 100:.1f} cm"
+                        kept = f", kept from keyframe {previous}: {reason}"
                     else:
-                        kept = (f", turned although it moves the held object by {moved * 100:.1f} cm: the yaw of "
-                                f"keyframe {previous} is unreachable here")
+                        kept = f", turned although {reason}: the yaw of keyframe {previous} is unreachable here"
             self._yaw_choice[key] = choice
+            if self.global_ik is not None:
+                chosen = scored[1 if choice else 0]
+                self._keyframe_posture[key] = chosen[4] if chosen[0] else None
+                if chosen[0]:
+                    self.mpc_controller.engine.last_ik_solution = chosen[4].astype(np.float32)
+                kept += (", global IK posture " + self._posture_note(picks[choice])) if chosen[0] else ", no global IK solution"
             print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: gripper yaw {'turned by 180 deg' if choice else 'as given'} "
                   f"(IK ok / joint-limit margin: as given {scored[0][0]}/{scored[0][1]:.2f} rad, "
                   f"turned {scored[1][0]}/{scored[1][1]:.2f} rad){kept}")
         if self._yaw_choice[key]:
             return R_target @ Rotation.from_euler('z', np.pi).as_matrix()
         return R_target
+
+    def _choose_posture(self, solutions: List[np.ndarray], q_now: np.ndarray) -> Optional[Tuple]:
+        """
+        Of the global IK solutions at least YAW_MIN_LIMIT_MARGIN from the joint limits (all of them when none is): the
+        lowest joint motion plus path_weight times the largest distance of the TCP from the straight segment to its
+        final position, along the joint-space line the guidance pulls the arm on; of the best few, the first whose
+        line keeps the arm and what it holds clearance away from the obstacles of the current roles. Without posture
+        scoring, the closest solution. Returns (q, margin, cost, joint distance, TCP deviation, clear path).
+        """
+        if not solutions:
+            return None
+        kin = self.mpc_controller.kinematics
+        q_now = np.asarray(q_now, dtype=np.float64)
+        Q = np.asarray(solutions, dtype=np.float64)
+        margins = np.min(np.minimum(Q - kin.Q_MIN, kin.Q_MAX - Q), axis=1)
+        pool = np.flatnonzero(margins >= self.YAW_MIN_LIMIT_MARGIN)
+        if len(pool) == 0:
+            pool = np.arange(len(Q))
+        distances = np.linalg.norm(Q - q_now, axis=1)
+        if not self.posture_scoring:
+            i = int(pool[np.argmin(distances[pool])])
+            return Q[i], float(margins[i]), float(distances[i]), float(distances[i]), 0.0, True
+        s = np.linspace(0.0, 1.0, 11)
+        lines = q_now[None, None, :] + s[None, :, None] * (Q[pool] - q_now)[:, None, :]
+        P = np.asarray(kin.batch_forward_kinematics_ee(lines.astype(np.float32)), dtype=np.float64)
+        seg = P[:, -1:, :] - P[:, :1, :]
+        t = np.clip(np.sum((P - P[:, :1, :]) * seg, axis=2) / np.maximum(np.sum(seg * seg, axis=2), 1e-12), 0.0, 1.0)
+        deviations = np.max(np.linalg.norm(P - (P[:, :1, :] + t[..., None] * seg), axis=2), axis=1)
+        costs = distances[pool] + self.posture_path_weight * deviations
+        ranked = np.argsort(costs)
+        for r in ranked[:self.posture_candidates]:
+            i = int(pool[r])
+            if self._path_clear(q_now, Q[i]):
+                return Q[i], float(margins[i]), float(costs[r]), float(distances[i]), float(deviations[r]), True
+        r = int(ranked[0])
+        i = int(pool[r])
+        return Q[i], float(margins[i]), float(costs[r]) + 10.0, float(distances[i]), float(deviations[r]), False
+
+    def _path_clear(self, q_from: np.ndarray, q_to: np.ndarray) -> bool:
+        """Arm and held objects clearance away from every obstacle at path_samples points of the joint-space line."""
+        engine = self.mpc_controller.engine
+        s = np.linspace(0.0, 1.0, self.posture_path_samples + 1)[1:]
+        Q = (q_from[None, :] + s[:, None] * (q_to - q_from)[None, :]).astype(np.float32)[None]
+        coll_p, _ = self.digital_twin.compute_trajectory_collision_costs(
+            Q=Q, QD=np.zeros_like(Q), sigma_1=min(engine.sigma_1, self.posture_clearance),
+            sigma_2=self.posture_clearance, kappa=engine.kappa, rho=engine.rho, kin_helper=engine.kin, dt=engine.dt)
+        return bool(np.all(coll_p <= 0.0))
+
+    @staticmethod
+    def _posture_note(pick: Tuple) -> str:
+        return (f"{pick[3]:.2f} rad from the current one, TCP off the straight line by {pick[4] * 100:.1f} cm, "
+                f"joint-limit margin {pick[1]:.2f} rad, {'clear' if pick[5] else 'NOT clear'} path")
+
+    def _seed_keyframe_posture(self, mpc_state: drema_comm_pb2.RobotState) -> None:
+        """
+        Once per keyframe, for targets without the yaw choice: the global IK posture closest to the current one becomes
+        the warm start of the per-cycle local IK, which otherwise stays in the joint-space family it started in.
+        """
+        if self.global_ik is None or not mpc_state.target_available or len(mpc_state.target_pose) < 7:
+            return
+        key = int(mpc_state.keyframe_index)
+        if key in self._keyframe_posture:
+            return
+        kin = self.mpc_controller.kinematics
+        q_now = np.asarray(mpc_state.joint_positions, dtype=np.float64)
+        pick = self._choose_posture(self.global_ik.solutions(np.asarray(mpc_state.target_pose[:3], dtype=np.float64),
+                                                            Rotation.from_quat(mpc_state.target_pose[3:7]).as_matrix()),
+                                    q_now)
+        self._keyframe_posture[key] = None if pick is None else pick[0]
+        if pick is not None:
+            self.mpc_controller.engine.last_ik_solution = pick[0].astype(np.float32)
+        print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: global IK posture " + (
+            self._posture_note(pick) if pick is not None else "none: the target is out of reach"))
 
     def _held_turn_displacement(self) -> float:
         """

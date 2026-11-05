@@ -1,0 +1,16 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "panda-global-ik"
+version = "0.1.0"
+description = "All inverse kinematics solutions of the Franka Emika Panda (GeoFIK, joint-7 sampling, verified)"
+requires-python = ">=3.9"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.setuptools]
+packages = ["panda_global_ik"]

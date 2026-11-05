@@ -194,7 +194,17 @@ controller:
   approach_cone_base_radius: 0.01    # Approach cone radius at the goal [m]
   log_interval_actions: 10           # Telemetry print interval for served control actions (every N actions)
   max_action_age_s: 0.20             # Max age [s] of a solved action that may still be replayed as zero-order hold while the MPC is busy
+  random_seed: null                  # MPPI sampling seed, reapplied every episode (null: random; an integer makes runs repeatable)
   debug_dump_dir: "logs/mpc_dumps"   # Saves the MPC solve inputs (robot state, goal, obstacle poses and forecasts) as .npz per action, in a timestamped subfolder ("" disables)
+  ik:
+    global_search: "geofik"         # Keyframe posture from the analytical IK over the joint-7 range (pip install packages/panda_global_ik; "off": local DLS from the current posture)
+    q7_samples: 33                  # Joint-7 values sampled over its range (10 deg step; a 2.5 deg pass follows when none solves)
+    posture_selection:               # Keyframe posture among the global IK solutions
+      enabled: true                  # false: the closest one with joint-limit margin
+      path_weight: 10.0              # [rad/m] cost of the TCP leaving the straight line, added to the joint motion
+      path_samples: 5                # points of the joint-space line checked for collisions
+      candidates_checked: 8          # best-ranked postures whose line is checked
+      clearance: 0.02                # [m] arm and held object clearance along that line
   debug_dump_interval: 1             # Dump every N served actions
   sigma_1: 0.015                     # Inscribed hard safety collision margin [m] (1.5cm physical buffer)
   sigma_2: 0.035                     # Inflation radius [m] - compact buffer calibrated for tabletop precision
