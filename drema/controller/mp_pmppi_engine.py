@@ -240,6 +240,8 @@ class MPPMPPIEngine:
 
         # Cached last IK solution (initialized to None, eliminating redundant boolean flags)
         self.last_ik_solution: Optional[np.ndarray] = None
+        # Joint-space waypoint of a transit path: replaces the IK of the target as guidance while set.
+        self.guidance_q: Optional[np.ndarray] = None
 
         # Optional read-only hook (e.g. drema.visualization): called once per solve with references to the
         # sampled rollouts and their costs. Must not modify the arrays; None disables it at no cost.
@@ -254,6 +256,7 @@ class MPPMPPIEngine:
             self.planner_distributions[name]['sigma'].fill(self.init_noise_std ** 2)
         self.mixing_weights = {name: 1.0 / self.num_planners for name in self.planner_names}
         self.last_ik_solution = None
+        self.guidance_q = None
         self.rng = np.random.default_rng(self.random_seed)
 
     def solve(
@@ -306,7 +309,9 @@ class MPPMPPIEngine:
         # (e.g. PyBullet's grasptarget is rotated by -45 deg), which would make q_des and the
         # Cartesian term pull towards different configurations.
         q_des_t = None
-        if target_pos is not None:
+        if self.guidance_q is not None:
+            q_des_t = np.asarray(self.guidance_q, dtype=np.float32)
+        elif target_pos is not None:
             q_init_ik = self.last_ik_solution if self.last_ik_solution is not None else q_curr
             # Warm-started solves converge in a few iterations; the cap bounds the cost of
             # unreachable targets, which exhaust the iterations on every control cycle.

@@ -41,6 +41,9 @@ from drema.perception.base_perception import BasePerceptionModule, InitialScanRe
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
 from drema.controller.global_ik import GlobalIK
+from drema.controller.route_clearance import clearance_matrix, densify, route_violations
+from drema.controller.transit_worker import TransitPlannerService
+from drema.visualization.imagination import _link_skeletons
 from drema.roles import ObjectRoleRegistry
 from drema.visualization import build_visualization_hub
 
@@ -78,6 +81,7 @@ class DremaDynamicSystem:
 
     # Joint-limit clearance [rad] below which an equivalent (180 deg) gripper yaw is preferred
     YAW_MIN_LIMIT_MARGIN = 0.2
+    ROUTE_RESOLUTION = 0.04
 
     def __init__(
         self,
@@ -268,9 +272,35 @@ class DremaDynamicSystem:
         posture_cfg = ik_cfg.get("posture_selection", {}) or {}
         self.posture_scoring = bool(posture_cfg.get("enabled", True))
         self.posture_path_weight = float(posture_cfg.get("path_weight", 10.0))
-        self.posture_path_samples = int(posture_cfg.get("path_samples", 5))
         self.posture_candidates = int(posture_cfg.get("candidates_checked", 8))
         self.posture_clearance = float(posture_cfg.get("clearance", 0.02))
+        rs = ik_cfg.get("transit_planner", {}) or {}
+        steps_per_s = 1.0 / float(ctrl_cfg.get("dt", 0.05))
+        self.route_enabled = bool(rs.get("enabled", False))
+        self.route_trigger = float(rs.get("trigger_clearance", 0.01))
+        sigma_2 = float(ctrl_cfg.get("sigma_2", 0.035))
+        self.route_levels = [float(c) for c in (rs.get("clearance_levels") or [sigma_2, 0.025, 0.015])]
+        self.route_check_steps = int(round(float(rs.get("check_interval_s", 0.5)) * steps_per_s))
+        self.route_stall_steps = int(round(float(rs.get("stall_window_s", 2.0)) * steps_per_s))
+        self.route_stall_progress = float(rs.get("stall_progress", 0.05))
+        self.route_stall_min = float(rs.get("stall_min_distance", 0.15))
+        self.route_static_steps = int(round(float(rs.get("static_after_s", 1.0)) * steps_per_s))
+        self.route_scene_change = float(rs.get("scene_change", 0.01))
+        self.route_max_plans = int(rs.get("max_plans_per_keyframe", 5))
+        self.route_attempts = int(rs.get("attempts", 6))
+        self.route_budget = float(rs.get("budget_s", 6.0))
+        self.route_switch = float(rs.get("switch_distance", 0.2))
+        self.route_wrist_weight = float(rs.get("wrist_weight", 1.0))
+        self.route_staging_back = float(rs.get("staging_back", 0.1))
+        self.route_staging_max = float(rs.get("staging_max", 0.4))
+        self._route: Optional[dict] = None
+        self._route_service: Optional[TransitPlannerService] = None
+        self._route_requests = 0
+        self._route_moved_at: Dict[int, int] = {}
+        self._viz: Dict[str, Any] = {}
+        print(f"[DREMA DYNAMIC SYSTEM] Route supervisor: {'on' if self.route_enabled else 'off'} (route through an obstacle "
+              f"within {self.route_trigger * 100:.0f} cm or stall -> RRT-Connect in a separate process, clearances "
+              f"{[round(c * 100, 1) for c in self.route_levels]} cm)")
         if self.global_ik is not None:
             print(f"[DREMA DYNAMIC SYSTEM] Keyframe posture choice: " + (
                 f"joint motion + {self.posture_path_weight:.0f} rad/m x TCP path deviation, clear path"
@@ -290,7 +320,8 @@ class DremaDynamicSystem:
             config, self.mpc_controller, self.digital_twin, viser_server=self.viser_server,
             scene_info=lambda: {'table_z': getattr(self.perception, 'z_table', None),
                                 'table_bounds': getattr(self.perception, 'table_bounds', None)},
-            roles_status=lambda: self.role_registry.status if self.role_registry is not None else []
+            roles_status=lambda: self.role_registry.status if self.role_registry is not None else [],
+            annotations=self._viz_annotations
         )
 
         # Frame queue & perception worker thread
@@ -460,6 +491,9 @@ class DremaDynamicSystem:
             self.role_registry.reset(self.digital_twin)
         self._yaw_choice.clear()
         self._keyframe_posture.clear()
+        self._route = None
+        self._route_moved_at.clear()
+        self.mpc_controller.engine.guidance_q = None
         self._self_check_result = None
         self.digital_twin.reset()
         with self._mpc_lock:
@@ -801,12 +835,14 @@ class DremaDynamicSystem:
 
         # Target orientation in the FrankaKinematics EE convention used by the MPC and by the hand footprint of the roles
         mpc_state = self._target_in_flange_frame(robot_state)
-        self._seed_keyframe_posture(mpc_state)
 
-        # 0. Object roles: policies and held objects must be in place before the robot (and what it holds) is synced
+        # 0. Object roles: policies and held objects must be in place before the keyframe decisions, which check the
+        # postures against them, and before the robot (and what it holds) is synced
         if self.role_registry is not None:
             self.role_registry.update(mpc_state, self.digital_twin, self.mpc_controller.kinematics)
+        mpc_state = self._keyframe_decisions(robot_state, mpc_state)
         self.digital_twin.sync_gripper(robot_state.gripper_open)
+        self._route_supervise(mpc_state)
 
         # 1. Update Digital Twin robot configuration
         needs_robot_load = (
@@ -844,6 +880,8 @@ class DremaDynamicSystem:
             action.object_roles.extend(self.role_registry.status_protos(drema_comm_pb2))
             action.roles_revision_applied = self.role_registry.roles_revision
             action.status_message = f"{action.status_message} | {self.role_registry.summary()}"
+        if self._route is not None and self._route['status']:
+            action.status_message = f"{action.status_message} | route: {self._route['status']}"
 
         if self.total_actions_served <= 3 or (self.log_interval_actions > 0 and self.total_actions_served % self.log_interval_actions == 0):
             print(f"[DREMA DYNAMIC SYSTEM] Action #{self.total_actions_served:05d} (Timestep {robot_state.timestep:04d}) -> MPC: {action.status_message}")
@@ -914,8 +952,8 @@ class DremaDynamicSystem:
             return robot_state
         R_target_tip = Rotation.from_quat(robot_state.target_pose[3:7]).as_matrix()
         R_target_ee = R_target_tip @ self._tip_offset_R.T
-        if self.yaw_symmetry and robot_state.HasField('yaw_symmetric') and robot_state.yaw_symmetric:
-            R_target_ee = self._reachable_gripper_yaw(robot_state, R_target_ee)
+        if self._yaw_symmetric(robot_state) and self._yaw_choice.get(int(robot_state.keyframe_index)):
+            R_target_ee = R_target_ee @ Rotation.from_euler('z', np.pi).as_matrix()
         quat_ee = Rotation.from_matrix(R_target_ee).as_quat()
         converted = drema_comm_pb2.RobotState()
         converted.CopyFrom(robot_state)
@@ -923,6 +961,29 @@ class DremaDynamicSystem:
         converted.target_pose.extend([float(x) for x in robot_state.target_pose[:3]] + [float(x) for x in quat_ee])
         converted.target_frame = drema_comm_pb2.FRAME_FLANGE
         return converted
+
+    def _yaw_symmetric(self, robot_state: drema_comm_pb2.RobotState) -> bool:
+        return bool(self.yaw_symmetry and robot_state.HasField('yaw_symmetric') and robot_state.yaw_symmetric)
+
+    def _keyframe_decisions(self, robot_state: drema_comm_pb2.RobotState,
+                            mpc_state: drema_comm_pb2.RobotState) -> drema_comm_pb2.RobotState:
+        """
+        First cycle of a keyframe, with its roles in place: the gripper yaw of tip-frame targets symmetric about the
+        gripper axis (the hand footprint the roles use is symmetric about it too), then the global IK posture.
+        """
+        key = int(robot_state.keyframe_index)
+        if mpc_state is not robot_state and self._yaw_symmetric(robot_state) and key not in self._yaw_choice:
+            R_given = Rotation.from_quat(mpc_state.target_pose[3:7]).as_matrix()
+            self._reachable_gripper_yaw(robot_state, R_given)
+            if self._yaw_choice[key]:
+                quat = Rotation.from_matrix(R_given @ Rotation.from_euler('z', np.pi).as_matrix()).as_quat()
+                turned = drema_comm_pb2.RobotState()
+                turned.CopyFrom(mpc_state)
+                del turned.target_pose[:]
+                turned.target_pose.extend([float(x) for x in mpc_state.target_pose[:3]] + [float(x) for x in quat])
+                mpc_state = turned
+        self._seed_keyframe_posture(mpc_state)
+        return mpc_state
 
     def _reachable_gripper_yaw(self, robot_state: drema_comm_pb2.RobotState, R_target: np.ndarray) -> np.ndarray:
         """
@@ -946,14 +1007,15 @@ class DremaDynamicSystem:
                     q_sol, ok = kin.solve_dls_ik(q_now.astype(np.float32), pos, R)
                 margin = float(np.min(np.minimum(q_sol - kin.Q_MIN, kin.Q_MAX - q_sol)))
                 cost = picks[flip][2] if picks.get(flip) is not None else float(np.linalg.norm(q_sol - q_now))
-                scored.append((bool(ok), margin, cost, flip, q_sol))
-            best = max(scored, key=lambda s: (s[0], s[1] >= self.YAW_MIN_LIMIT_MARGIN, -s[2]))
+                reachable = picks[flip][6] if picks.get(flip) is not None else bool(ok)
+                scored.append((bool(ok), margin, cost, flip, q_sol, reachable))
+            best = max(scored, key=lambda s: (s[0], s[5], s[1] >= self.YAW_MIN_LIMIT_MARGIN, -s[2]))
             choice, kept = best[3], ""
             if self.yaw_symmetry_held_limit > 0 and self._yaw_choice:
                 previous = max(self._yaw_choice)
                 inherited = self._yaw_choice[previous]
-                # Right after a grasp the role registry registers the held object only after this decision: a gripper
-                # that is not open with nothing registered may hold something whose turn cannot be measured yet.
+                # A gripper that is not open with nothing registered may still be closing on something whose turn
+                # cannot be measured yet.
                 pending = (robot_state.gripper_open < 0.9 and
                            not (self.role_registry is not None and self.role_registry.held))
                 moved = self._held_turn_displacement() if choice != inherited else 0.0
@@ -978,17 +1040,19 @@ class DremaDynamicSystem:
             print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: gripper yaw {'turned by 180 deg' if choice else 'as given'} "
                   f"(IK ok / joint-limit margin: as given {scored[0][0]}/{scored[0][1]:.2f} rad, "
                   f"turned {scored[1][0]}/{scored[1][1]:.2f} rad){kept}")
+            self._route_start(key, pos, (R_target @ Rotation.from_euler('z', np.pi).as_matrix()) if choice else R_target,
+                              f"gripper yaw {'turned by 180 deg' if choice else 'as given'}{kept}")
         if self._yaw_choice[key]:
             return R_target @ Rotation.from_euler('z', np.pi).as_matrix()
         return R_target
 
     def _choose_posture(self, solutions: List[np.ndarray], q_now: np.ndarray) -> Optional[Tuple]:
         """
-        Of the global IK solutions at least YAW_MIN_LIMIT_MARGIN from the joint limits (all of them when none is): the
-        lowest joint motion plus path_weight times the largest distance of the TCP from the straight segment to its
-        final position, along the joint-space line the guidance pulls the arm on; of the best few, the first whose
-        line keeps the arm and what it holds clearance away from the obstacles of the current roles. Without posture
-        scoring, the closest solution. Returns (q, margin, cost, joint distance, TCP deviation, clear path).
+        Of the global IK solutions at least YAW_MIN_LIMIT_MARGIN from the joint limits (all of them when none is) and
+        not in collision with the current roles: the lowest joint motion plus path_weight times the largest distance of
+        the TCP from the straight segment to its final position, along the joint-space line the guidance pulls the arm
+        on; of the best few, the first whose line follows the route rule at the posture clearance. Without posture
+        scoring, the closest solution. Returns (q, margin, cost, joint distance, TCP deviation, clear path, reachable).
         """
         if not solutions:
             return None
@@ -1002,7 +1066,7 @@ class DremaDynamicSystem:
         distances = np.linalg.norm(Q - q_now, axis=1)
         if not self.posture_scoring:
             i = int(pool[np.argmin(distances[pool])])
-            return Q[i], float(margins[i]), float(distances[i]), float(distances[i]), 0.0, True
+            return Q[i], float(margins[i]), float(distances[i]), float(distances[i]), 0.0, True, True
         s = np.linspace(0.0, 1.0, 11)
         lines = q_now[None, None, :] + s[None, :, None] * (Q[pool] - q_now)[:, None, :]
         P = np.asarray(kin.batch_forward_kinematics_ee(lines.astype(np.float32)), dtype=np.float64)
@@ -1011,28 +1075,343 @@ class DremaDynamicSystem:
         deviations = np.max(np.linalg.norm(P - (P[:, :1, :] + t[..., None] * seg), axis=2), axis=1)
         costs = distances[pool] + self.posture_path_weight * deviations
         ranked = np.argsort(costs)
-        for r in ranked[:self.posture_candidates]:
+        free = ~np.any(self._clearances(Q[pool], self.posture_clearance)[0] <= 0.0, axis=1)
+        usable = [int(r) for r in ranked if free[r]]
+        for r in usable[:self.posture_candidates]:
             i = int(pool[r])
-            if self._path_clear(q_now, Q[i]):
-                return Q[i], float(margins[i]), float(costs[r]), float(distances[i]), float(deviations[r]), True
-        r = int(ranked[0])
+            if self._route_clear(q_now, Q[i], self.posture_clearance):
+                return Q[i], float(margins[i]), float(costs[r]), float(distances[i]), float(deviations[r]), True, True
+        r = usable[0] if usable else int(ranked[0])
         i = int(pool[r])
-        return Q[i], float(margins[i]), float(costs[r]) + 10.0, float(distances[i]), float(deviations[r]), False
+        return (Q[i], float(margins[i]), float(costs[r]) + 10.0, float(distances[i]), float(deviations[r]), False,
+                bool(usable))
 
-    def _path_clear(self, q_from: np.ndarray, q_to: np.ndarray) -> bool:
-        """Arm and held objects clearance away from every obstacle at path_samples points of the joint-space line."""
+    def _clearances(self, Q: np.ndarray, cap: float) -> Tuple[np.ndarray, np.ndarray]:
         engine = self.mpc_controller.engine
-        s = np.linspace(0.0, 1.0, self.posture_path_samples + 1)[1:]
-        Q = (q_from[None, :] + s[:, None] * (q_to - q_from)[None, :]).astype(np.float32)[None]
-        coll_p, _ = self.digital_twin.compute_trajectory_collision_costs(
-            Q=Q, QD=np.zeros_like(Q), sigma_1=min(engine.sigma_1, self.posture_clearance),
-            sigma_2=self.posture_clearance, kappa=engine.kappa, rho=engine.rho, kin_helper=engine.kin, dt=engine.dt)
-        return bool(np.all(coll_p <= 0.0))
+        return clearance_matrix(self.digital_twin, engine.kin, Q, max(cap, 1e-3), sigma_1=engine.sigma_1,
+                                kappa=engine.kappa, rho=engine.rho, dt=engine.dt)
+
+    def _route_clear(self, q_from: np.ndarray, q_to: np.ndarray, clearance: float) -> bool:
+        """The straight joint-space line follows the route rule at the given clearance."""
+        D, _ = self._clearances(densify([q_from, q_to], self.ROUTE_RESOLUTION), clearance)
+        return not route_violations(D, clearance).any()
 
     @staticmethod
     def _posture_note(pick: Tuple) -> str:
+        path = "clear path" if pick[5] else ("NOT clear path" if pick[6] else "every posture of the target in collision")
         return (f"{pick[3]:.2f} rad from the current one, TCP off the straight line by {pick[4] * 100:.1f} cm, "
-                f"joint-limit margin {pick[1]:.2f} rad, {'clear' if pick[5] else 'NOT clear'} path")
+                f"joint-limit margin {pick[1]:.2f} rad, {path}")
+
+    def _route_start(self, key: int, pos: np.ndarray, R: np.ndarray, note: str) -> None:
+        """New keyframe: the route is the straight joint line to the chosen posture until a check says otherwise."""
+        self.mpc_controller.engine.guidance_q = None
+        q_goal = self._keyframe_posture.get(key)
+        self._viz = {'key': key, 'posture': note}
+        self._route = None
+        if not self.route_enabled or self.global_ik is None or q_goal is None:
+            return
+        self._route = {'key': key, 'goal': np.asarray(q_goal, dtype=np.float64), 'pos': np.asarray(pos, dtype=np.float64),
+                       'R': np.asarray(R, dtype=np.float64), 'state': 'straight', 'wps': None, 'i': 0, 'plans': 0,
+                       'hist': [], 'last_check': None, 'notes': set(), 'status': ''}
+
+    def _route_say(self, r: dict, text: str, once: Optional[str] = None) -> None:
+        """Log line (once per keyframe when `once` is given), status for the client and the video banner."""
+        if once is not None:
+            if once in r['notes']:
+                return
+            r['notes'].add(once)
+        r['status'] = text
+        self._viz['transit'] = text
+        print(f"[DREMA DYNAMIC SYSTEM] Keyframe {r['key']}: {text}")
+
+    def _route_check(self, r: dict, q: np.ndarray, clearance: float) -> Dict[str, Any]:
+        """
+        Remaining route (current configuration, then the remaining waypoints or the chosen posture) checked with the
+        route rule: where it first breaks it ('at', fraction of the joint length, None when it does not) and the
+        objects there ('blockers'), the objects the arrival collides with ('occupied') or lies within the clearance
+        of ('goal_band'), the TCP polyline ('tcp') and the samples breaking the rule ('bad').
+        """
+        kin = self.mpc_controller.kinematics
+        nodes = [q] + ([np.asarray(w) for w in r['wps'][r['i']:]] if r['state'] == 'following' else [r['goal']])
+        Q = densify(nodes, self.ROUTE_RESOLUTION)
+        tcp = np.asarray(kin.batch_forward_kinematics_ee(Q[None].astype(np.float32)), dtype=np.float64)[0]
+        D, ids = self._clearances(Q, clearance)
+        bad = route_violations(D, clearance)
+        rows = bad.any(axis=1)
+        out = {'at': None, 'blockers': set(), 'occupied': {int(o) for o in ids[D[-1] <= 0.0]},
+               'goal_band': {int(o) for o in ids[D[-1] < clearance]}, 'tcp': tcp, 'bad': rows}
+        if rows.any():
+            first = int(np.argmax(rows))
+            out['at'] = float(np.sum(np.linalg.norm(np.diff(Q[:first + 1], axis=0), axis=1)) /
+                              max(np.sum(np.linalg.norm(np.diff(Q, axis=0), axis=1)), 1e-9))
+            out['blockers'] = {int(o) for o in ids[bad[first]]}
+        return out
+
+    def _object_static(self, oid: int, ts: int) -> bool:
+        if oid < 0:
+            return True
+        return ts - self._route_moved_at.get(oid, -10 ** 9) >= self.route_static_steps
+
+    def _route_track_motion(self, ts: int) -> None:
+        tw = self.digital_twin
+        predictor = getattr(tw, 'predictor', None)
+        if predictor is None:
+            return
+        limit = self.role_registry.policy_contact_max_speed if self.role_registry is not None else 0.03
+        with tw.state_lock:
+            for oid in list(tw.tracked_objects):
+                st = predictor.get_estimated_state(oid)
+                if st is not None and 'velocity' in st and float(np.linalg.norm(st['velocity'])) > limit:
+                    self._route_moved_at[int(oid)] = ts
+
+    def _scene_signature(self) -> Dict[int, np.ndarray]:
+        tw = self.digital_twin
+        out = {}
+        for oid in list(tw.tracked_objects):
+            pose = tw.tracked_object_pose(oid)
+            if pose is not None and oid not in tw.attachments:
+                out[int(oid)] = np.asarray(pose[0], dtype=np.float64)
+        return out
+
+    def _names(self, ids: set) -> str:
+        tw = self.digital_twin
+        return ", ".join(sorted("table" if i < 0 else str(tw.tracked_objects.get(i, {}).get('name', i)) for i in ids)) or "?"
+
+    def _route_request(self, r: dict, q: np.ndarray, start: np.ndarray, why: str) -> None:
+        """Plans a route from `start` to the keyframe posture (any usable posture as fallback) in the background."""
+        engine, kin = self.mpc_controller.engine, self.mpc_controller.kinematics
+        if r['plans'] >= self.route_max_plans:
+            self._route_block(r, q, f"{why}; planning attempts exhausted ({r['plans']})")
+            return
+        S = np.asarray(self.global_ik.solutions(r['pos'], r['R']), dtype=np.float64)
+        usable = S[np.min(np.minimum(S - kin.Q_MIN, kin.Q_MAX - S), axis=1) >= self.YAW_MIN_LIMIT_MARGIN] if len(S) else S
+        reachable = lambda G: ~np.any(self._clearances(G, self.route_levels[0])[0] <= 0.0, axis=1)
+        goals = usable[reachable(usable)] if len(usable) else usable
+        if not len(goals):
+            self._route_block(r, q, f"{why}; every posture of the keyframe target is in collision")
+            return
+        if self._route_service is None:
+            self._route_service = TransitPlannerService(os.path.dirname(os.path.abspath(__file__)))
+        self._route_requests += 1
+        preferred = r['goal'] if reachable(r['goal'][None])[0] else None
+        req = dict(self._twin_snapshot(), key=r['key'], request_id=self._route_requests, start=start, goals=goals,
+                   preferred_goal=preferred, clearance_levels=list(self.route_levels), base=np.asarray(kin.base_position, dtype=np.float64),
+                   offsets=[float(x) for x in self.joint_angle_offsets], ee_offset=[float(x) for x in kin.EE_OFFSET],
+                   urdf=self.digital_twin.robot_urdf_path, kappa=engine.kappa, rho=engine.rho, seed=1000 * r['key'] + r['plans'],
+                   attempts=self.route_attempts, budget_s=self.route_budget, shortcut_tries=60,
+                   wrist_weight=self.route_wrist_weight)
+        self._route_service.submit(req)
+        r.update(state='planning', request_id=self._route_requests, t_request=time.monotonic(), plans=r['plans'] + 1,
+                 wps=None, i=0, hold=np.asarray(start, dtype=np.float64), hist=[])
+        engine.guidance_q = np.asarray(start, dtype=np.float32)
+        if np.linalg.norm(start - q) > 1e-6:
+            self._viz['staging_skeleton'] = _link_skeletons(kin, np.asarray(start)[None])[0].astype(np.float32)
+        self._viz.pop('path_tcp', None)
+        self._viz.pop('wp_skeletons', None)
+        self._route_say(r, f"{why}: planning a collision-free route in the background (attempt {r['plans']})"
+                           + (", moving to a safe staging point" if np.linalg.norm(start - q) > 1e-6 else ", holding"))
+
+    def _route_no_route(self, r: dict, q: np.ndarray, why: str) -> None:
+        """A block only when the direct route collides with an obstacle; otherwise a narrow passage for the MPPI."""
+        chk = self._route_check(dict(r, state='straight'), q, 0.0)
+        if chk['at'] is not None:
+            self._route_block(r, q, f"{why}; the direct route collides with {self._names(chk['blockers'])}")
+            return
+        r.update(state='narrow', wps=None, i=0, hist=[])
+        self.mpc_controller.engine.guidance_q = None
+        self._viz.pop('staging_skeleton', None)
+        self._route_say(r, f"{why}, but the direct route does not collide: narrow passage, the MPPI continues")
+
+    def _route_block(self, r: dict, q: np.ndarray, why: str) -> None:
+        """No route: hold the current configuration and say why; resumes when the scene changes."""
+        r.update(state='blocked', hold=np.asarray(q, dtype=np.float64), blocked_scene=self._scene_signature(), hist=[])
+        self.mpc_controller.engine.guidance_q = np.asarray(q, dtype=np.float32)
+        self._viz.pop('staging_skeleton', None)
+        self._route_say(r, f"BLOCKED - {why}. Holding; resuming when the scene changes")
+
+    def _route_poll(self, r: dict, q: np.ndarray) -> None:
+        res = self._route_service.poll() if self._route_service is not None else None
+        while res is not None:
+            if r['state'] == 'planning' and res.get('key') == r['key'] and res.get('request_id') == r.get('request_id'):
+                if res.get('path') is None:
+                    self._route_no_route(r, q, f"no route with at least {self.route_levels[-1] * 100:.1f} cm clearance"
+                                               + (f" ({res['error']})" if res.get('error') else ""))
+                else:
+                    info = res['info']
+                    r.update(state='following', wps=[np.asarray(w, dtype=np.float64) for w in res['path']], i=0, hist=[])
+                    self.mpc_controller.engine.guidance_q = r['wps'][0].astype(np.float32)
+                    self._viz_route(r['wps'])
+                    self._route_say(r, f"route ready after {time.monotonic() - r['t_request']:.1f} s to the {info['goal']}: "
+                                       f"{len(r['wps']) - 2} intermediate waypoints, {info['joint_length']:.2f} rad, "
+                                       f"clearance {info['clearance'] * 100:.1f} cm")
+            res = self._route_service.poll()
+        if r['state'] == 'planning' and time.monotonic() - r['t_request'] > self.route_budget + 15.0:
+            self._route_block(r, q, "route planning timed out")
+
+    def _route_advance(self, r: dict, q: np.ndarray) -> None:
+        engine = self.mpc_controller.engine
+        while np.linalg.norm(q - r['wps'][r['i']]) < self.route_switch:
+            if r['i'] == len(r['wps']) - 1:
+                r.update(state='done', hist=[], goal=r['wps'][-1])
+                engine.guidance_q = None
+                engine.last_ik_solution = r['wps'][-1].astype(np.float32)
+                self._viz['wp_index'] = len(r['wps'])
+                self._route_say(r, "planned route completed: the MPPI goes to the keyframe target as usual")
+                return
+            r['i'] += 1
+            r['hist'] = []
+            engine.guidance_q = r['wps'][r['i']].astype(np.float32)
+            self._viz['wp_index'] = r['i']
+            self._route_say(r, f"following the planned route: waypoint {r['i'] + 1} of {len(r['wps'])} "
+                               f"(the green dashed arm is the current waypoint)")
+
+    def _route_supervise(self, mpc_state: drema_comm_pb2.RobotState) -> None:
+        """
+        Every cycle, after the role update: collects planned routes, advances waypoints, checks the remaining route
+        every check interval (static blockers -> plan, moving ones -> wait), watches for stalls and, after a declared
+        block, replans only once the scene has changed.
+        """
+        r = self._route
+        if r is None:
+            return
+        engine, kin = self.mpc_controller.engine, self.mpc_controller.kinematics
+        if int(mpc_state.keyframe_index) != r['key']:
+            self._route = None
+            engine.guidance_q = None
+            return
+        ts = int(mpc_state.timestep)
+        q = np.asarray(mpc_state.joint_positions, dtype=np.float64)
+        self._route_track_motion(ts)
+        self._route_poll(r, q)
+        if r['state'] == 'following':
+            self._route_advance(r, q)
+        due = r['last_check'] is None or ts - r['last_check'] >= self.route_check_steps
+        if r['state'] == 'blocked':
+            if due:
+                r['last_check'] = ts
+                now = self._scene_signature()
+                moved = max((float(np.linalg.norm(p - r['blocked_scene'][o])) for o, p in now.items()
+                             if o in r['blocked_scene']), default=0.0)
+                if set(now) != set(r['blocked_scene']) or moved >= self.route_scene_change:
+                    r['blocked_scene'] = self._scene_signature()
+                    chk = self._route_check(dict(r, state='straight'), q, self.route_trigger)
+                    if chk['at'] is None:
+                        r.update(state='straight', wps=None, i=0, hist=[])
+                        engine.guidance_q = None
+                        self._route_say(r, "the scene changed and the route is clear again: resuming")
+                    elif all(self._object_static(o, ts) for o in chk['blockers']):
+                        self._route_request(r, q, q, f"the scene changed, route still blocked by "
+                                                     f"{self._names(chk['blockers'])}")
+            return
+        if r['state'] == 'planning':
+            return
+        if due and r['state'] != 'narrow':
+            r['last_check'] = ts
+            chk = self._route_check(r, q, self.route_trigger)
+            blk, ids = chk['at'], chk['blockers']
+            self._viz['line_tcp'], self._viz['line_blocked'] = chk['tcp'].astype(np.float32), chk['bad']
+            occupying = {o for o in chk['occupied'] if not self._object_static(o, ts)}
+            if occupying:
+                if r['state'] != 'occupied':
+                    r.update(state='occupied', hold=np.asarray(q, dtype=np.float64), hist=[])
+                    engine.guidance_q = np.asarray(q, dtype=np.float32)
+                self._route_say(r, f"waiting: the keyframe posture is occupied by moving {self._names(occupying)}; "
+                                   f"holding", once=f"occupied:{sorted(occupying)}")
+                return
+            if r['state'] == 'occupied':
+                r.update(state='straight', hist=[])
+                engine.guidance_q = None
+            if blk is None:
+                if r['status'].startswith('waiting'):
+                    self._route_say(r, "route clear again")
+                elif not r['status']:
+                    self._route_say(r, "route to the keyframe posture is clear: no planning needed")
+            elif not all(self._object_static(o, ts) for o in ids):
+                self._route_say(r, f"waiting: the route is crossed by moving {self._names(ids)} (the MPPI avoids it)",
+                                once=f"wait:{sorted(ids)}")
+            else:
+                stop = max(0.0, blk - self.route_staging_back)
+                start = q if (stop <= 0.0 or r['state'] == 'following') else q + min(stop, self.route_staging_max) * (r['goal'] - q)
+                self._route_request(r, q, start, f"route through {self._names(ids)} (static) from {blk * 100:.0f}%")
+                return
+        if r['state'] == 'occupied':
+            return
+        hist = r['hist']
+        guide = r['wps'][r['i']] if r['state'] == 'following' else (
+            np.asarray(engine.last_ik_solution, dtype=np.float64) if engine.last_ik_solution is not None else r['goal'])
+        d = float(np.linalg.norm(q - guide))
+        hist.append((ts, d))
+        while hist and ts - hist[0][0] > self.route_stall_steps:
+            hist.pop(0)
+        gripper_busy = mpc_state.HasField('gripper_moving') and mpc_state.gripper_moving
+        near_target = (mpc_state.target_available and len(mpc_state.target_pose) >= 3 and
+                       float(np.linalg.norm(np.asarray(kin.forward_kinematics_ee(q)[0]) - np.asarray(mpc_state.target_pose[:3]))) < 0.03)
+        if (len(hist) < 2 or ts - hist[0][0] < self.route_stall_steps or gripper_busy or near_target
+                or d < self.route_stall_min or hist[0][1] - d >= self.route_stall_progress):
+            return
+        r['hist'] = []
+        if r['state'] == 'narrow':
+            self._route_say(r, f"stall in the narrow passage ({d:.2f} rad to the guidance): left to the MPPI",
+                            once="stall:narrow")
+            return
+        chk = self._route_check(r, q, float(engine.sigma_2))
+        ids = chk['blockers']
+        if chk['at'] is None and chk['goal_band']:
+            self._route_say(r, f"stall at the arrival: the keyframe target lies within the collision band of "
+                               f"{self._names(chk['goal_band'])} (a role matter, not a route one)",
+                            once=f"goalband:{sorted(chk['goal_band'])}")
+        elif chk['at'] is None:
+            self._route_say(r, f"stall without any obstacle within the MPPI collision band ({d:.2f} rad to the guidance)",
+                            once="stall:none")
+        elif not all(self._object_static(o, ts) for o in ids):
+            self._route_say(r, f"waiting: stalled next to moving {self._names(ids)}", once=f"wait:{sorted(ids)}")
+        else:
+            self._route_request(r, q, q, f"stall {d:.2f} rad from the guidance, {self._names(ids)} in the collision band")
+
+    def _twin_snapshot(self) -> dict:
+        """What the transit worker needs to rebuild the collision scene: objects, poses, roles, held objects, table."""
+        tw = self.digital_twin
+        with tw.state_lock:
+            objects = []
+            for oid, obj in tw.tracked_objects.items():
+                pose = tw.tracked_object_pose(oid)
+                if pose is None or obj.get('body_id', -1) < 0:
+                    continue
+                objects.append((int(oid), str(obj['mesh_path']), str(obj.get('name', oid)),
+                                [float(x) for x in pose[0]], [float(x) for x in pose[1]], bool(obj.get('is_target', False))))
+            snap = {'objects': objects, 'policies': dict(tw.object_policies),
+                    'table_policy': getattr(tw, 'table_policy', None),
+                    'held': {int(k): np.asarray(v, dtype=np.float64) for k, v in tw.attachments.items()},
+                    'table_in_costs': bool(tw.table_in_collision_costs),
+                    'vhacd': (bool(tw.obstacle_convex_decomposition), int(tw.vhacd_resolution), float(tw.vhacd_concavity))}
+        bounds = getattr(self.perception, 'table_bounds', None)
+        snap['table_z'] = float(getattr(self.perception, 'z_table', None) or tw.table_z)
+        snap['table_bounds'] = None if bounds is None else [float(b) for b in bounds]
+        return snap
+
+    def _viz_route(self, wps: list) -> None:
+        kin = self.mpc_controller.kinematics
+        dense = [w0[None] + np.linspace(0.0, 1.0, max(2, int(np.ceil(np.linalg.norm(w1 - w0) / 0.05))))[:, None] * (w1 - w0)[None]
+                 for w0, w1 in zip(wps[:-1], wps[1:])]
+        self._viz['path_tcp'] = np.asarray(kin.batch_forward_kinematics_ee(np.concatenate(dense)[None].astype(np.float32)),
+                                           dtype=np.float32)[0]
+        self._viz['wp_skeletons'] = _link_skeletons(kin, np.asarray(wps, dtype=np.float64)).astype(np.float32)
+        self._viz['wp_index'] = 0
+        self._viz.pop('staging_skeleton', None)
+
+    def _viz_annotations(self) -> Dict[str, Any]:
+        """Per-action notes for the imagination video: keyframe decisions and route supervisor state."""
+        v = self._viz
+        if not v:
+            return {}
+        out = {'viz_keyframe': np.int64(v.get('key', -1)), 'viz_posture': np.array(str(v.get('posture', ''))),
+               'viz_transit': np.array(str(v.get('transit', '')))}
+        for name in ('line_tcp', 'line_blocked', 'path_tcp', 'wp_skeletons', 'staging_skeleton'):
+            if name in v:
+                out[f'viz_{name}'] = np.asarray(v[name])
+        if 'wp_index' in v:
+            out['viz_wp_index'] = np.int64(v['wp_index'])
+        return out
 
     def _seed_keyframe_posture(self, mpc_state: drema_comm_pb2.RobotState) -> None:
         """
@@ -1054,6 +1433,9 @@ class DremaDynamicSystem:
             self.mpc_controller.engine.last_ik_solution = pick[0].astype(np.float32)
         print(f"[DREMA DYNAMIC SYSTEM] Keyframe {key}: global IK posture " + (
             self._posture_note(pick) if pick is not None else "none: the target is out of reach"))
+        self._route_start(key, np.asarray(mpc_state.target_pose[:3], dtype=np.float64),
+                          Rotation.from_quat(mpc_state.target_pose[3:7]).as_matrix(),
+                          "global IK posture " + (self._posture_note(pick) if pick is not None else "none: out of reach"))
 
     def _held_turn_displacement(self) -> float:
         """

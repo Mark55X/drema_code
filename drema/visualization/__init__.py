@@ -51,7 +51,8 @@ def build_visualization_hub(
     digital_twin: Any,
     viser_server: Optional[Any] = None,
     scene_info: Optional[Callable[[], Dict[str, Any]]] = None,
-    roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None
+    roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None,
+    annotations: Optional[Callable[[], Dict[str, Any]]] = None
 ) -> VisualizationHub:
     """
     Reads controller.debug_dump_* and visualization.imagination.* from the config:
@@ -87,7 +88,8 @@ def build_visualization_hub(
             max_rollouts=int(img_cfg.get("max_rollouts", 40)),
             ghost_count=int(img_cfg.get("ghost_count", 3)),
             scene_info=scene_info,
-            roles_status=roles_status
+            roles_status=roles_status,
+            annotations=annotations
         )
     return VisualizationHub(controller, digital_twin, dumper=dumper, imagination=imagination)
 

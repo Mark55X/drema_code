@@ -203,8 +203,9 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
   per keyframe. Nessuna soluzione significa davvero fuori portata.
 - Fra le soluzioni con almeno 0,2 rad dai fine corsa si sceglie la postura con il costo più basso: movimento dei giunti
   + 10 rad/m × quanto il TCP esce dalla retta verso la posa finale, lungo la linea nei giunti su cui la guida tira il
-  braccio. Delle 8 migliori si prende la prima la cui linea resta a 2 cm dagli ostacoli dei ruoli attuali. Così si
-  evitano posture vicine nei giunti che fanno salire o sbandare la mano. La postura scelta diventa il punto di
+  braccio. Delle 8 migliori si prende la prima la cui linea resta a 2 cm dagli ostacoli dei ruoli attuali, tranne
+  l'ultimo tratto (TCP a meno di 10 cm dalla posizione finale), dove in una presa o in un inserimento il contatto è
+  voluto. Così si evitano posture vicine nei giunti che fanno salire o sbandare la mano. La postura scelta diventa il punto di
   partenza dell'IK locale, che continua a guidare l'MPPI a ogni ciclo: il globale decide la postura, il locale la
   insegue. Vale anche per la scelta della yaw della pinza.
 - Il modello è lo stesso dei costi dell'MPPI (profilo del robot: offset dei giunti, TCP, base): FK identica entro
@@ -212,8 +213,7 @@ regola *hold*. La correzione vera è compito del modulo di percezione."
   `controller.ik.global_search` ("off" torna all'IK locale).
 - Misura (stesse scene, twin PyBullet): place_wine 2/3 → 3/3, put_groceries 0/3 → 2/3, nessun fallimento dell'IK per
   ciclo. Con la scelta della postura in base al percorso: put_groceries 3/5 contro 1/5 con la postura più vicina.
-  Limiti: il controllo guarda la linea ideale nei giunti, che l'MPPI non segue esattamente, e segnala come non libero
-  anche il contatto voluto alla fine di una presa o di un inserimento.
+  Limite: il controllo guarda la linea ideale nei giunti, che l'MPPI non segue esattamente.
 
 ### Hold e revoca
 - Al cambio di keyframe, un oggetto che la mano o l'oggetto tenuto toccano ancora (entro 3,5 cm) mantiene il suo ruolo,

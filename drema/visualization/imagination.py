@@ -54,7 +54,8 @@ class ImaginationRecorder:
         max_rollouts: int = 40,
         ghost_count: int = 3,
         scene_info: Optional[Callable[[], Dict[str, Any]]] = None,
-        roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None
+        roles_status: Optional[Callable[[], List[Dict[str, Any]]]] = None,
+        annotations: Optional[Callable[[], Dict[str, Any]]] = None
     ):
         self.engine = engine
         self.twin = digital_twin
@@ -63,6 +64,7 @@ class ImaginationRecorder:
         self.ghost_count = max(0, int(ghost_count))
         self.scene_info = scene_info
         self.roles_status = roles_status
+        self.annotations = annotations
         self._context: Dict[str, Any] = {}
         self._scene_ids: Optional[set] = None
         self.dropped = 0
@@ -96,6 +98,11 @@ class ImaginationRecorder:
         if status:
             self._context['role_ids'] = np.array([int(r['object_id']) for r in status], dtype=np.int64)
             self._context['role_names'] = np.array([str(r['role']) for r in status])
+        if self.annotations is not None:
+            try:
+                self._context.update(self.annotations() or {})
+            except Exception as e:
+                warn_limited(self, f"annotations failed: {e}")
 
     def close(self) -> None:
         self.detach()

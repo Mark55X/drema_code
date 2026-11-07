@@ -202,9 +202,25 @@ controller:
     posture_selection:               # Keyframe posture among the global IK solutions
       enabled: true                  # false: the closest one with joint-limit margin
       path_weight: 10.0              # [rad/m] cost of the TCP leaving the straight line, added to the joint motion
-      path_samples: 5                # points of the joint-space line checked for collisions
       candidates_checked: 8          # best-ranked postures whose line is checked
-      clearance: 0.02                # [m] arm and held object clearance along that line
+      clearance: 0.02                # [m] arm and held object clearance along that line (closer only while leaving the start or approaching the posture)
+    transit_planner:                 # Route supervisor: checks the route to the keyframe posture, plans with RRT-Connect when blocked
+      enabled: true
+      trigger_clearance: 0.01        # [m] the route counts as blocked when it passes this close to an obstacle
+      clearance_levels: []           # [m] planning clearances tried in order ([] = the MPPI band sigma_2, then 0.025, 0.015)
+      check_interval_s: 0.5          # [s] remaining-route check period
+      stall_window_s: 2.0            # [s] no progress over this window = stall
+      stall_progress: 0.05           # [rad] progress towards the guidance required over the window
+      stall_min_distance: 0.15       # [rad] closer than this to the guidance: settling, not a stall
+      static_after_s: 1.0            # [s] slower than the roles' max_speed for this long = static object
+      scene_change: 0.01             # [m] after a declared block, replan only once an object moved this much
+      max_plans_per_keyframe: 5      # safety bound on planning requests per keyframe
+      attempts: 6                    # RRT-Connect runs per stage, best shortcut path kept
+      budget_s: 6.0                  # [s] planning budget per request (background process)
+      switch_distance: 0.2           # [rad] next waypoint once this close
+      wrist_weight: 1.0              # extra path cost per rad of joint 7 (turns a held object)
+      staging_back: 0.1              # staging point this fraction of the route before the blocked point
+      staging_max: 0.4               # staging point at most this fraction along the straight route
   debug_dump_interval: 1             # Dump every N served actions
   sigma_1: 0.015                     # Inscribed hard safety collision margin [m] (1.5cm physical buffer)
   sigma_2: 0.035                     # Inflation radius [m] - compact buffer calibrated for tabletop precision

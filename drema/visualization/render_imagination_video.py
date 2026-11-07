@@ -16,9 +16,10 @@ Usage:
 """
 
 import argparse
+import textwrap
 import glob
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import matplotlib
@@ -41,6 +42,10 @@ ROLE_COLORS = {'TARGET': (0.1, 0.65, 0.25), 'NEAR': (0.95, 0.55, 0.1), 'HELD': (
                'RELEASED': (0.45, 0.8, 0.45), 'FRAGILE': (0.85, 0.1, 0.1)}
 DEFAULT_MESH_COLOR = (0.62, 0.62, 0.62)
 GOAL_GRIPPER_COLOR = (0.0, 0.5, 0.55)
+PATH_COLOR = (0.05, 0.45, 0.95)
+LINE_FREE_COLOR = (0.45, 0.45, 0.45)
+LINE_BLOCKED_COLOR = (0.9, 0.05, 0.05)
+STAGING_COLOR = (0.95, 0.6, 0.0)
 
 # Panda gripper in the hand frame (z along the approach, y along the finger opening, origin at the TCP)
 HAND_R = Rotation.from_euler('z', PANDA_HAND_FOOTPRINT['finger_axis_yaw_deg'], degrees=True).as_matrix()
@@ -187,15 +192,16 @@ class ImaginationRenderer:
         name = self.scene.get(f"obs{oid}_name")
         return str(name) if name is not None else f"obstacle {oid}"
 
-    def _scene_limits(self, zoom: Optional[float]) -> Tuple[np.ndarray, float]:
-        """Close-up cube around the lowest goal (the grasp) or, without zoom, a cube enclosing the whole arm."""
+    def _scene_limits(self, zoom: Optional[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """Close-up cube around the lowest goal (the grasp) or, without zoom, a box fitted to the arm and the goals."""
         goals = np.array([fr['target_pos'] for fr in self.frames if 'target_pos' in fr])
         if zoom and len(goals):
             center = goals[np.argmin(goals[:, 2])] + np.array([-0.05, 0.0, 0.12])
-            return center, float(zoom)
+            return center, np.full(3, float(zoom))
         pts = np.concatenate([fr['skeleton'] for fr in self.frames[::max(1, len(self.frames) // 20)]] +
-                             ([goals[:1]] if len(goals) else []), axis=0)
-        return 0.5 * (pts.min(axis=0) + pts.max(axis=0)), 0.55 * float(np.max(pts.max(axis=0) - pts.min(axis=0)))
+                             ([goals] if len(goals) else []), axis=0)
+        half = 0.5 * (pts.max(axis=0) - pts.min(axis=0)) + 0.06
+        return 0.5 * (pts.min(axis=0) + pts.max(axis=0)), np.maximum(half, 0.6 * half.max())
 
     def _inside(self, pts: np.ndarray) -> np.ndarray:
         return np.all((pts >= self.lo) & (pts <= self.hi), axis=-1)
@@ -350,11 +356,47 @@ class ImaginationRenderer:
         if 'plan_tcp' in fr:
             self._polylines(ax, [fr['plan_tcp']], [(0.0, 0.0, 0.0, 1.0)], lw=3.2, zorder=6)
 
-    def _draw_3d(self, ax, fr) -> None:
+    def _draw_transit(self, ax, fr) -> List[Tuple[Any, str]]:
+        """Straight joint line (red where it goes through an obstacle), planned path, waypoints, staging point."""
+        items = []
+        if 'viz_line_tcp' in fr:
+            line, blocked = np.asarray(fr['viz_line_tcp'], np.float64), np.asarray(fr['viz_line_blocked'], bool)
+            segs = [line[i:i + 2] for i in range(len(line) - 1)]
+            cols = [(*(LINE_BLOCKED_COLOR if (blocked[i] or blocked[i + 1]) else LINE_FREE_COLOR), 0.9) for i in range(len(segs))]
+            self._polylines(ax, segs, cols, lw=2.0, ls='dotted', zorder=7)
+            items.append((plt.Line2D([], [], color=LINE_FREE_COLOR, lw=2, ls=':'),
+                          'route to the posture (TCP, checked every 0.5 s)'))
+            items.append((plt.Line2D([], [], color=LINE_BLOCKED_COLOR, lw=2, ls=':'),
+                          '... part through a static obstacle'))
+        if 'viz_path_tcp' in fr:
+            path = np.asarray(fr['viz_path_tcp'], np.float64)
+            self._polylines(ax, [path], [(*PATH_COLOR, 0.95)], lw=3.0, zorder=7)
+            sk = np.asarray(fr['viz_wp_skeletons'], np.float64)
+            idx = int(fr.get('viz_wp_index', 0))
+            self._polylines(ax, list(sk), [(*PATH_COLOR, 0.18)] * len(sk), lw=2.0, zorder=3)
+            tcps = sk[:, -1]
+            inside = self._inside(tcps)
+            if np.any(inside):
+                ax.scatter(*tcps[inside].T, color=PATH_COLOR, s=40, edgecolor='k', linewidths=0.5, depthshade=False, zorder=8)
+            if 0 <= idx < len(tcps) and self._inside(tcps[idx:idx + 1])[0]:
+                ax.scatter(*tcps[idx], color=(1.0, 0.85, 0.0), s=150, marker='o', edgecolor='k', linewidths=1.0,
+                           depthshade=False, zorder=9)
+            items.append((plt.Line2D([], [], color=PATH_COLOR, lw=3, marker='o', markersize=6, markeredgecolor='k'),
+                          'planned path (RRT-Connect) and waypoints'))
+            items.append((plt.Line2D([], [], color=(1.0, 0.85, 0.0), marker='o', ls='', markersize=10, markeredgecolor='k'),
+                          'current waypoint (MPPI guidance)'))
+        if 'viz_staging_skeleton' in fr:
+            self._polylines(ax, [np.asarray(fr['viz_staging_skeleton'], np.float64)], [(*STAGING_COLOR, 0.9)], lw=2.5,
+                            ls='dashed', zorder=6)
+            items.append((plt.Line2D([], [], color=STAGING_COLOR, lw=2.5, ls='--'),
+                          'staging point (arm waits while planning)'))
+        return items
+
+    def _draw_3d(self, ax, fr) -> List[Tuple[str, list, list]]:
         ax.set_xlim(self.lo[0], self.hi[0])
         ax.set_ylim(self.lo[1], self.hi[1])
         ax.set_zlim(self.lo[2], self.hi[2])
-        ax.set_box_aspect((1, 1, 1))
+        ax.set_box_aspect(tuple(self.hi - self.lo), zoom=1.05)
         ax.view_init(elev=self.view[0], azim=self.view[1])
         ax.set_xlabel('x [m]'); ax.set_ylabel('y [m]'); ax.set_zlabel('z [m]')
         ax.tick_params(labelsize=8)
@@ -362,6 +404,7 @@ class ImaginationRenderer:
         self._draw_obstacles(ax, fr)
         self._draw_goal(ax, fr)
         self._draw_rollouts(ax, fr)
+        transit_items = self._draw_transit(ax, fr)
         self._draw_robot(ax, fr)
         handles = [plt.Line2D([], [], color=(0.12, 0.12, 0.12), lw=5, marker='o', markersize=4),
                    plt.Line2D([], [], color=(0.12, 0.12, 0.12), lw=2, marker='s', markersize=7, fillstyle='none'),
@@ -377,15 +420,40 @@ class ImaginationRenderer:
         labels = ['arm (current configuration)', 'gripper (measured opening)', 'object (perceived mesh and colour)',
                   'active goal', 'gripper pose at the goal', 'approach cone']
         labels += [f"rollouts: {g}" for g in GROUP_LABELS]
-        labels += ['executed plan (TCP path)', 'imagined arm along the plan', 'IK guidance posture q_des',
+        following = 'viz_path_tcp' in fr and 'completed' not in str(fr.get('viz_transit', ''))
+        labels += ['executed plan (TCP path)', 'imagined arm along the plan',
+                   'MPPI guidance posture = current waypoint' if following else 'IK guidance posture q_des',
                    'forecast obstacle (+0.25 / 0.5 / 0.7 s)', 'arm points inside the collision margin']
-        main_legend = ax.legend(handles, labels, loc='upper left', fontsize=8.5, framealpha=0.85)
         role_names = list(ROLE_COLORS)
         role_handles = [Patch(facecolor='none', edgecolor=ROLE_COLORS[r], lw=1.6) for r in role_names]
         role_handles.append(Patch(facecolor='none', edgecolor=ROLE_COLORS['HELD'], lw=1.2, ls='--'))
-        ax.legend(role_handles, [f"role {r}" for r in role_names] + ['held object along the plan'],
-                  loc='lower left', fontsize=8.5, framealpha=0.85, title='object outline', title_fontsize=8.5)
-        ax.add_artist(main_legend)
+        groups = [("Scene and MPC", handles, labels),
+                  ("Object outline (role)", role_handles, [f"role {r}" for r in role_names] + ['held object along the plan'])]
+        if transit_items:
+            groups.append(("Route supervisor", [h for h, _ in transit_items], [lbl for _, lbl in transit_items]))
+        return groups
+
+    @staticmethod
+    def _draw_legend(ax, groups: List[Tuple[str, list, list]]) -> None:
+        """One legend with a bold title per section, in its own axes so it never covers the plots."""
+        ax.axis('off')
+        blank = plt.Line2D([], [], alpha=0.0)
+        handles, labels, titles = [], [], []
+        for n, (title, hs, ls) in enumerate(groups):
+            if n:
+                handles.append(blank)
+                labels.append(' ')
+            titles.append(len(labels))
+            handles.append(blank)
+            labels.append(title)
+            handles += list(hs)
+            labels += list(ls)
+        leg = ax.legend(handles, labels, loc='upper left', bbox_to_anchor=(0.0, 1.0), fontsize=8.5, frameon=False,
+                        handlelength=2.6, borderaxespad=0.0, labelspacing=0.45)
+        for i, text in enumerate(leg.get_texts()):
+            if i in titles:
+                text.set_fontweight('bold')
+                text.set_fontsize(9.5)
 
     def _draw_sim(self, ax, fr) -> None:
         ax.axis('off')
@@ -435,21 +503,30 @@ class ImaginationRenderer:
     def render(self, k: int) -> np.ndarray:
         fig = self.fig
         fig.clf()
-        gs = GridSpec(2, 3, figure=fig, height_ratios=[1.0, 1.15],
-                      left=0.03, right=0.99, top=0.93, bottom=0.05, wspace=0.12, hspace=0.18)
+        gs = GridSpec(1, 3, figure=fig, width_ratios=[0.31, 0.50, 0.19],
+                      left=0.025, right=0.995, top=0.87, bottom=0.05, wspace=0.06)
+        left = GridSpecFromSubplotSpec(2, 1, subplot_spec=gs[0, 0], height_ratios=[0.78, 1.25], hspace=0.10)
         fr = self.frames[k]
-        self._draw_sim(fig.add_subplot(gs[0, 0]), fr)
-        self._draw_3d(fig.add_subplot(gs[:, 1:], projection='3d'), fr)
-        fig.text(0.665, 0.012,
+        sim_ax = fig.add_subplot(left[0])
+        sim_ax.set_anchor('N')
+        self._draw_sim(sim_ax, fr)
+        groups = self._draw_3d(fig.add_subplot(gs[0, 1], projection='3d'), fr)
+        self._draw_legend(fig.add_subplot(gs[0, 2]), groups)
+        fig.text(0.585, 0.012,
                  "Rollouts: TCP paths (gripper centre point) sampled by the MPC over the next 0.75 s; opacity = softmax "
                  "weight. Each cycle only the first step of the executed plan is applied, then the MPC replans.",
                  ha='center', va='bottom', fontsize=9, color=(0.3, 0.3, 0.3))
-        sub = GridSpecFromSubplotSpec(3, 1, subplot_spec=gs[1, 0], hspace=0.55)
+        sub = GridSpecFromSubplotSpec(3, 1, subplot_spec=left[1], hspace=0.6)
         self._draw_telemetry([fig.add_subplot(sub[i]) for i in range(3)], k)
         funnel = {1: 'on', 0: 'off'}.get(int(fr.get('approach_funnel', -1)), 'default')
         fig.suptitle(f"DREMA Dynamic System  |  t = {float(fr['timestep']) * self.dt:5.2f} s (step {int(fr['timestep'])})"
                      f"  |  chosen: {fr.get('best_label', '')}  |  w_greedy {fr['mixing_weights'][0]:.2f}"
                      f" / w_sensitive {fr['mixing_weights'][1]:.2f}  |  approach cone {funnel}", fontsize=13)
+        if 'viz_keyframe' in fr:
+            posture = textwrap.fill(f"Keyframe {int(fr['viz_keyframe'])}  -  {str(fr.get('viz_posture', ''))}", 185)
+            fig.text(0.5, 0.952, f"{posture}\nPath: {str(fr.get('viz_transit', ''))}",
+                     ha='center', va='top', fontsize=10.5, color=(0.1, 0.1, 0.1),
+                     bbox=dict(boxstyle='round,pad=0.3', facecolor=(1.0, 0.97, 0.85), edgecolor=(0.8, 0.7, 0.4)))
         fig.canvas.draw()
         return np.asarray(fig.canvas.buffer_rgba())[..., :3].copy()
 
