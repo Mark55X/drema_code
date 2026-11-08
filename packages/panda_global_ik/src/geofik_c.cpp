@@ -4,7 +4,18 @@
 #include <iostream>
 #include "geofik.h"
 
+extern array<double, 7> q_low;
+extern array<double, 7> q_up;
+
 extern "C" {
+
+// Joint limits (in GeoFIK's joint space) outside which a solution is dropped: they hold for every following call.
+void geofik_set_limits(const double* low, const double* up) {
+    for (int i = 0; i < 7; ++i) {
+        q_low[i] = low[i];
+        q_up[i] = up[i];
+    }
+}
 
 // q7-locked IK for the Franka Hand frame: up to 8 solutions, rows of NaN for the missing ones.
 int geofik_ik_q7(const double* r, const double* R_rowmajor, double q7, double q1_sing, double* out) {

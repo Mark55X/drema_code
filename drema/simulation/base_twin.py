@@ -11,6 +11,7 @@ from typing import Optional, Tuple, List, Dict, Any, Union
 import numpy as np
 from scipy.spatial.transform import Rotation
 
+from ..controller.franka_kinematics import FrankaKinematics
 from ..roles.types import FULL_CONTACT, ObjectCollisionPolicy
 
 
@@ -95,14 +96,21 @@ class BaseDigitalTwin(ABC):
     Any concrete physics backend (PyBullet, Isaac Sim, MuJoCo) must implement this interface.
     """
 
-    def __init__(self, joint_angle_offsets: Optional[List[float]] = None, ee_offset: Optional[List[float]] = None):
+    def __init__(self, joint_angle_offsets: Optional[List[float]] = None, ee_offset: Optional[List[float]] = None,
+                 joint_limits: Optional[Dict[str, List[float]]] = None):
         """
         :param joint_angle_offsets: Per-joint zero offsets [rad] between the measured joint angles of
                                     the controlled robot and the twin's (Franka DH) robot model:
                                     q_twin = q_measured + offset. Every joint value crossing the twin
                                     interface is in the measured space.
         :param ee_offset: Flange -> TCP translation [m] of the robot profile (None: FrankaKinematics default).
+        :param joint_limits: {'q_min', 'q_max', 'qd_max'} of the robot profile (None: the Panda's).
         """
+        self.joint_limits = dict(joint_limits) if joint_limits else None
+        limits = FrankaKinematics(joint_limits=self.joint_limits)
+        self.q_min = limits.Q_MIN.astype(np.float64)
+        self.q_max = limits.Q_MAX.astype(np.float64)
+        self.q_rest = limits.Q_REST.astype(np.float64)
         self.ee_offset = np.asarray(ee_offset, dtype=np.float64).reshape(3) if ee_offset is not None else None
         self.state_lock = threading.RLock()
         self.joint_angle_offsets = (

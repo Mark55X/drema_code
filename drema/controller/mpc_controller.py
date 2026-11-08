@@ -58,6 +58,7 @@ class MPCController:
         evade_lift_speed: float = 0.12,
         joint_angle_offsets: Optional[List[float]] = None,  # theta_DH = q_measured + offset (see FrankaKinematics)
         ee_offset: Optional[List[float]] = None,            # Flange -> TCP translation of the robot profile [m]
+        joint_limits: Optional[Dict[str, List[float]]] = None,  # q_min / q_max / qd_max of the robot profile
         random_seed: Optional[int] = None                   # MPPI sampling seed, reapplied at every reset (None: random)
     ):
         self.digital_twin = digital_twin
@@ -70,7 +71,7 @@ class MPCController:
 
         # Kinematics & MP-PMPPI engine
         self.kinematics = FrankaKinematics(base_position=None, joint_angle_offsets=joint_angle_offsets,
-                                           ee_offset=ee_offset)
+                                           ee_offset=ee_offset, joint_limits=joint_limits)
         self.engine = MPPMPPIEngine(
             kinematics=self.kinematics,
             horizon=horizon,
@@ -109,7 +110,8 @@ class MPCController:
     @classmethod
     def from_config(cls, ctrl_cfg: Dict[str, Any], digital_twin: Optional[Any] = None,
                     joint_angle_offsets: Optional[List[float]] = None,
-                    ee_offset: Optional[List[float]] = None) -> "MPCController":
+                    ee_offset: Optional[List[float]] = None,
+                    joint_limits: Optional[Dict[str, List[float]]] = None) -> "MPCController":
         """Controller built from the 'controller' section of the DREMA config (shared by the server and the benchmarks)."""
         c = ctrl_cfg or {}
         return cls(
@@ -142,6 +144,7 @@ class MPCController:
             evade_lift_speed=float(c.get("evade_lift_speed", 0.12)),
             joint_angle_offsets=joint_angle_offsets,
             ee_offset=ee_offset,
+            joint_limits=joint_limits,
             random_seed=None if c.get("random_seed") is None else int(c.get("random_seed"))
         )
 

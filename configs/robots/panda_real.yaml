@@ -4,3 +4,13 @@ name: "panda_real"
 joint_angle_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 tcp_offset: [0.0, 0.0, 0.1034]
 tcp_rotation_xyz_deg: [0.0, 0.0, -45.0]
+# Joint limits [rad] and joint speed limits [rad/s] (franka_ros panda joint_limits.yaml)
+joint_limits:
+  q_min: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
+  q_max: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
+  qd_max: [2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100]
+# Robot model of the digital twin (digital_twin.urdf_path / mujoco_model_path override it)
+twin:
+  pybullet_urdf: "franka_panda/panda.urdf"
+  mujoco_model: "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml"
+  mujoco_hand_bodies: ["hand", "left_finger", "right_finger"]

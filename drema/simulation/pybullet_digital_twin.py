@@ -47,16 +47,21 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         obstacle_convex_decomposition: bool = True,
         vhacd_resolution: int = 100000,
         vhacd_concavity: float = 0.05,
-        ee_offset: Optional[List[float]] = None
+        ee_offset: Optional[List[float]] = None,
+        joint_limits: Optional[Dict[str, List[float]]] = None
     ):
         """
+        :param robot_urdf_path: Robot model of the robot profile: link0 as root and the 7 arm joints first, so that
+            PyBullet link i is arm link i+1 and links from 7 on are the hand (pybullet_data's Panda, the FR3 twin URDF).
         :param obstacle_convex_decomposition: Dynamic PyBullet bodies collide through the convex hull of their mesh,
             which fills concave shapes (e.g. the free space under an arch). When True, obstacle meshes are split into
             convex parts with V-HACD (cached next to the mesh) and the compound is used for collision queries.
         :param vhacd_resolution: V-HACD voxel resolution.
         :param vhacd_concavity: V-HACD maximum concavity per part: higher values give fewer, coarser parts.
+        :param joint_limits: Joint limits of the robot profile (None: the Panda's).
         """
-        super().__init__(joint_angle_offsets, ee_offset)
+        super().__init__(joint_angle_offsets, ee_offset, joint_limits)
+        self.tcp_link_index = -1
         self.table_in_collision_costs = bool(table_in_collision_costs)
         self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
         self.vhacd_resolution = int(vhacd_resolution)
@@ -137,11 +142,14 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
         # Load URDF at the exact base position received dynamically
         try:
             self.robot_id = p.loadURDF(self.robot_urdf_path, list(base_position), list(base_orientation), useFixedBase=True)
+            self._index_robot_links()
             self.robot_loaded = True
             self._open_fingers()
-            print(f"[PYBULLET DIGITAL TWIN] Dynamically loaded Franka Panda URDF at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
+            print(f"[PYBULLET DIGITAL TWIN] Dynamically loaded robot URDF {self.robot_urdf_path} at [{base_position[0]:.3f}, {base_position[1]:.3f}, {base_position[2]:.3f}] (ID: {self.robot_id})")
         except Exception as e:
-            print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to load Franka Panda URDF: {e}")
+            print(f"[PYBULLET DIGITAL TWIN ERROR] Failed to load robot URDF {self.robot_urdf_path}: {e}")
+            if self.robot_id >= 0:
+                p.removeBody(self.robot_id)
             self.robot_id = -1
             self.robot_loaded = False
             return False
@@ -150,6 +158,16 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             self.sync_robot_state(joint_positions)
 
         return True
+
+    def _index_robot_links(self) -> None:
+        """Checks the link layout the collision costs rely on and finds the TCP link (grasp target / hand TCP)."""
+        infos = [p.getJointInfo(self.robot_id, j) for j in range(p.getNumJoints(self.robot_id))]
+        movable = [j for j, info in enumerate(infos) if info[2] != p.JOINT_FIXED]
+        if movable[:7] != list(range(7)):
+            raise ValueError(f"the 7 arm joints must be the first joints of the model (link0 as root), found the "
+                             f"movable joints at {movable[:7]}")
+        tcp = [j for j, info in enumerate(infos) if info[12].decode().endswith(("grasptarget", "hand_tcp"))]
+        self.tcp_link_index = tcp[0] if tcp else len(infos) - 1
 
     def _open_fingers(self, opening: float = 0.04) -> None:
         """The URDF loads with the fingers closed; the twin keeps the gripper open like the controlled robot."""
@@ -736,15 +754,15 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
                     kwargs["targetOrientation"] = [float(x) for x in tq.flatten()]
 
             num_j = p.getNumJoints(self.robot_id)
-            ee_idx = 11 if num_j > 11 else max(0, num_j - 1)
+            ee_idx = self.tcp_link_index
 
-            # Supply Franka Panda joint limits and rest poses (expressed in the twin's joint space).
+            # Supply the profile's joint limits and rest poses (expressed in the twin's joint space).
             # PyBullet only enables null-space IK when these lists have one entry per movable DoF
             # (7 arm joints + 2 fingers); with any other length they are silently ignored.
             offsets = self.joint_angle_offsets
-            q_min_7 = (FrankaKinematics.Q_MIN + offsets).tolist()
-            q_max_7 = (FrankaKinematics.Q_MAX + offsets).tolist()
-            rest_7 = (FrankaKinematics.Q_REST + offsets).tolist()
+            q_min_7 = (self.q_min + offsets).tolist()
+            q_max_7 = (self.q_max + offsets).tolist()
+            rest_7 = (self.q_rest + offsets).tolist()
             num_dofs = sum(1 for j in range(num_j) if p.getJointInfo(self.robot_id, j)[2] != p.JOINT_FIXED)
             extra_j = max(0, num_dofs - 7)
 
@@ -767,7 +785,7 @@ class PyBulletDigitalTwin(BaseDigitalTwin):
             q_cand = (np.array(pb_ik[:7], dtype=np.float64) - offsets).astype(np.float32)
 
             # Verify that candidate strictly satisfies physical joint limits
-            if np.any(q_cand < (FrankaKinematics.Q_MIN - 1e-3)) or np.any(q_cand > (FrankaKinematics.Q_MAX + 1e-3)):
+            if np.any(q_cand < (self.q_min - 1e-3)) or np.any(q_cand > (self.q_max + 1e-3)):
                 return None
             return q_cand
         except Exception:

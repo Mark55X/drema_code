@@ -91,9 +91,10 @@ def _build(req: Dict[str, Any]):
     from drema.controller.franka_kinematics import FrankaKinematics
     from drema.simulation.pybullet_digital_twin import PyBulletDigitalTwin
     kin = FrankaKinematics(base_position=np.asarray(req['base'], np.float64), joint_angle_offsets=req['offsets'],
-                           ee_offset=req['ee_offset'])
+                           ee_offset=req['ee_offset'], joint_limits=req.get('joint_limits'))
     tw = PyBulletDigitalTwin(visualize=False, table_z=float(req['table_z']), robot_urdf_path=req['urdf'],
                              joint_angle_offsets=req['offsets'], ee_offset=req['ee_offset'],
+                             joint_limits=req.get('joint_limits'),
                              table_in_collision_costs=req['table_in_costs'],
                              obstacle_convex_decomposition=req['vhacd'][0], vhacd_resolution=req['vhacd'][1],
                              vhacd_concavity=req['vhacd'][2])

@@ -1,0 +1,18 @@
+# Franka Research 3 with the Franka Hand (lab robot). Same DH chain and hand as the Panda: only the joint limits and
+# the link geometry differ. NOMINAL TCP (libfranka default F_T_EE): calibrate it for the fingers mounted.
+name: "fr3_real"
+joint_angle_offsets: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+tcp_offset: [0.0, 0.0, 0.1034]
+tcp_rotation_xyz_deg: [0.0, 0.0, -45.0]
+# Joint limits [rad] of the FR3 datasheet / franka_description fr3 (robot-stack's fr3.urdf in Drema2). Newer
+# franka_description releases allow wider ranges (e.g. q1 +-2.9007, q6 0.4398..4.6216): these narrower ones hold on
+# every FR3. Speed limits [rad/s] from the same URDF.
+joint_limits:
+  q_min: [-2.7437, -1.7837, -2.9007, -3.0421, -2.8065, 0.5445, -3.0159]
+  q_max: [2.7437, 1.7837, 2.9007, -0.1518, 2.8065, 4.5169, 3.0159]
+  qd_max: [2.62, 2.62, 2.62, 2.62, 5.26, 4.18, 5.26]
+# FR3 twin models, built from Drema2's by scripts/build_fr3_assets.py
+twin:
+  pybullet_urdf: "assets/franka_fr3/fr3_twin.urdf"
+  mujoco_model: "assets/franka_fr3/fr3.xml"
+  mujoco_hand_bodies: ["right_hand", "fr3_leftfinger", "fr3_rightfinger"]

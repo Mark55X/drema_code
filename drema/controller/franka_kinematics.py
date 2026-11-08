@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 """
-Franka Panda Kinematics & Differential Kinematics Module.
+Franka Kinematics & Differential Kinematics Module (Panda; the FR3 shares the DH chain, its joint limits come from
+its robot profile).
 
 Provides:
 - Analytical Forward Kinematics (FK) for all 7 links and end-effector.
@@ -109,7 +110,7 @@ class FrankaKinematics:
     ]
 
     def __init__(self, base_position: Optional[np.ndarray] = None, joint_angle_offsets: Optional[np.ndarray] = None,
-                 ee_offset: Optional[np.ndarray] = None):
+                 ee_offset: Optional[np.ndarray] = None, joint_limits: Optional[Dict[str, List[float]]] = None):
         """
         :param base_position: 3D coordinates [x, y, z] of the robot base in world frame.
         :param joint_angle_offsets: Per-joint zero offsets [rad] added to the measured joint angles
@@ -117,7 +118,14 @@ class FrankaKinematics:
                                     commands and IK solutions stay in the measured joint space.
         :param ee_offset: Flange -> TCP translation [m] in the flange frame (robot profile); the
                           CoppeliaSim fit EE_OFFSET when omitted.
+        :param joint_limits: {'q_min', 'q_max', 'qd_max'} of the robot profile (e.g. the FR3's, same DH chain);
+                             each missing entry keeps the Panda value of the class.
         """
+        for key, attr in (('q_min', 'Q_MIN'), ('q_max', 'Q_MAX'), ('qd_max', 'QD_MAX')):
+            if joint_limits and joint_limits.get(key) is not None:
+                setattr(self, attr, np.asarray(joint_limits[key], dtype=np.float32).reshape(7))
+        if np.any(self.Q_REST < self.Q_MIN) or np.any(self.Q_REST > self.Q_MAX):
+            self.Q_REST = np.clip(FrankaKinematics.Q_REST, self.Q_MIN + 0.05, self.Q_MAX - 0.05).astype(np.float32)
         self.base_position = np.array(base_position, dtype=np.float32) if base_position is not None else None
         self.EE_OFFSET = (np.asarray(ee_offset, dtype=np.float32).reshape(3) if ee_offset is not None
                           else FrankaKinematics.EE_OFFSET.copy())

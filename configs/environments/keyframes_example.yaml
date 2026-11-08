@@ -1,0 +1,21 @@
+# Keyframes for run_lab_client.py --keyframes file (lab.keyframes.file). Poses in the world frame, hand convention of
+# the measured hand pose (frame: tip), [x, y, z, qx, qy, qz, qw]. Placeholder values: replace with poses taught on
+# the robot (e.g. read from the joints bridge) before running with --actuate.
+keyframes:
+  - name: "above"
+    pose: [0.45, 0.0, 0.35, 1.0, 0.0, 0.0, 0.0]
+    frame: "tip"
+    gripper_open: 1.0
+  - name: "pre_grasp"
+    pose: [0.45, 0.0, 0.20, 1.0, 0.0, 0.0, 0.0]
+    frame: "tip"
+    gripper_open: 1.0
+  - name: "grasp"
+    pose: [0.45, 0.0, 0.12, 1.0, 0.0, 0.0, 0.0]
+    frame: "tip"
+    gripper_open: 0.0
+    ignore_collisions: true
+  - name: "lift"
+    pose: [0.45, 0.0, 0.30, 1.0, 0.0, 0.0, 0.0]
+    frame: "tip"
+    gripper_open: 0.0

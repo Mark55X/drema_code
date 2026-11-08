@@ -204,9 +204,9 @@ class StaticKeyframeSource(KeyframeSource):
 
 class PolicyKeyframeSource(KeyframeSource):
     """
-    External keyframe policy. `act` receives the RLBench Observation and returns the PerAct action vector, or None
-    when it considers the episode finished. Load one with --policy module:function; the function is called once
-    with the client (to set itself up) and must return the `act` callable.
+    External keyframe policy. `act` receives the environment's observation (the RLBench Observation in CoppeliaSim)
+    and returns the PerAct action vector, or None when it considers the episode finished. Load one with --policy
+    module:function; the function is called once with the environment (to set itself up) and must return `act`.
     """
 
     def __init__(self, act: Callable[[Any], Optional[np.ndarray]], max_keyframes: int = 25):
@@ -231,10 +231,10 @@ class PolicyKeyframeSource(KeyframeSource):
         self.cache.clear()
 
     @staticmethod
-    def load(spec: str, client: Any) -> "PolicyKeyframeSource":
+    def load(spec: str, env: Any) -> "PolicyKeyframeSource":
         module_name, func_name = spec.split(":", 1)
         factory = getattr(importlib.import_module(module_name), func_name)
-        return PolicyKeyframeSource(factory(client))
+        return PolicyKeyframeSource(factory(env))
 
 
 class KeyframeSequencer:

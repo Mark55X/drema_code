@@ -1,7 +1,7 @@
 """
 Global IK of the keyframe posture: every joint configuration reaching a target pose, from the panda_global_ik package
 (GeoFIK, joint 7 sampled over its range), configured with the robot profile of FrankaKinematics (joint offsets, TCP,
-base) so its solutions are those of the model the MPPI costs use. Unlike the local DLS solver it does not depend on the
+joint limits, base) so its solutions are those of the model the MPPI costs use. Unlike the local DLS solver it does not depend on the
 current posture: no solution means the pose is out of reach. Install: pip install packages/panda_global_ik.
 """
 from typing import List, Optional, Tuple
@@ -16,7 +16,8 @@ class GlobalIK:
         tcp = np.eye(4)
         tcp[:3, 3] = np.asarray(kinematics.EE_OFFSET, dtype=np.float64)
         self._ik = PandaIK(tcp_offset=tcp, joint_offsets=np.asarray(kinematics.joint_angle_offsets, dtype=np.float64),
-                           q7_samples=q7_samples)
+                           q7_samples=q7_samples, q_min=np.asarray(kinematics.Q_MIN, dtype=np.float64),
+                           q_max=np.asarray(kinematics.Q_MAX, dtype=np.float64))
 
     def solutions(self, target_pos: np.ndarray, target_rot: np.ndarray) -> List[np.ndarray]:
         """Joint configurations (measured space, inside the limits) whose TCP pose matches the target."""

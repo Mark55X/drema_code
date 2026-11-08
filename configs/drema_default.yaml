@@ -141,9 +141,9 @@ perception:
 # 3b. Robot Model Calibration (shared by MPC kinematics and Digital Twin robot)
 # ------------------------------------------------------------------------------
 robot:
-  # Robot instance: joint angle offsets, flange -> TCP offset, hand frame rotation (configs/robots/).
-  # Keys written here override the profile's.
-  profile: "configs/robots/panda_coppelia.yaml"   # Physical arm: configs/robots/panda_real.yaml
+  # Robot instance: joint angle offsets, flange -> TCP offset, hand frame rotation, joint limits, twin models
+  # (configs/robots/). Keys written here override the profile's.
+  profile: "configs/robots/panda_coppelia.yaml"   # Physical arms: configs/robots/panda_real.yaml, fr3_real.yaml
   self_check:                        # Model hand pose vs measured hand pose on the first state of each episode
     enabled: true
     max_position_error: 0.003        # [m]
@@ -159,8 +159,8 @@ digital_twin:
   gui: true                          # Show native physics visualizer window (GLFW for MuJoCo, OpenGL for PyBullet)
 
   time_step: 0.002                   # Physics simulation time step in seconds
-  urdf_path: "franka_panda/panda.urdf"                      # Calibrated URDF for PyBullet backend (neutral 0,0,0 base)
-  mujoco_model_path: "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml"  # MuJoCo Menagerie Panda (collision geometry only is used)
+  urdf_path: null                    # PyBullet robot model; null: the robot profile's (robot.twin.pybullet_urdf)
+  mujoco_model_path: null            # MuJoCo robot model (collision geometry only); null: the robot profile's
   tracking_mode: "constraint"        # "constraint" (6-DoF constraint / MuJoCo mocap-weld), "pd_force", or "teleport"
   constraint_max_force: 300.0        # Maximum force for 6-DoF constraint (N)
   kp_pos: 250.0                      # Proportional gain for PD position tracking (N/m)

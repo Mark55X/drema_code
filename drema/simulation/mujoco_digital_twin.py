@@ -97,13 +97,18 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         obstacle_convex_decomposition: bool = True,
         vhacd_resolution: int = 100000,
         vhacd_concavity: float = 0.05,
-        ee_offset: Optional[List[float]] = None
+        ee_offset: Optional[List[float]] = None,
+        joint_limits: Optional[Dict[str, List[float]]] = None,
+        hand_bodies: Optional[List[str]] = None
     ):
         """
-        :param robot_model_path: Panda MJCF (default: MuJoCo Menagerie franka_emika_panda); only its collision
-            geometry is used, so the robot matches the URDF used by the PyBullet twin.
+        :param robot_model_path: Robot MJCF of the robot profile (default: MuJoCo Menagerie franka_emika_panda) with
+            bodies link0..link7 (joints joint1..joint7 first in qpos), finger joints finger_joint1/2 and the hand
+            bodies; only its collision geometry is used, so the robot matches the URDF used by the PyBullet twin.
         :param obstacle_convex_decomposition: MuJoCo collides every mesh geom through its convex hull; when True,
             obstacle meshes are split into V-HACD convex parts, one geom each (same parts as the PyBullet twin).
+        :param joint_limits: Joint limits of the robot profile (None: the Panda's).
+        :param hand_bodies: Bodies of the model that move with the TCP, hand first (None: the Menagerie Panda's).
         """
         if not MUJOCO_AVAILABLE:
             raise ImportError(
@@ -111,7 +116,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 "Please run: pip install mujoco glfw"
             )
 
-        super().__init__(joint_angle_offsets, ee_offset)
+        super().__init__(joint_angle_offsets, ee_offset, joint_limits)
+        self.hand_bodies = tuple(hand_bodies) if hand_bodies else HAND_BODIES
         self.table_in_collision_costs = bool(table_in_collision_costs)
         self.obstacle_convex_decomposition = bool(obstacle_convex_decomposition)
         self.vhacd_resolution = int(vhacd_resolution)
@@ -177,7 +183,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         # Kinematics analytical helper
         self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets,
-                                    ee_offset=self.ee_offset)
+                                    ee_offset=self.ee_offset, joint_limits=self.joint_limits)
 
         # MuJoCo internal handles
         self.model: Optional[mujoco.MjModel] = None
@@ -212,8 +218,9 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
     def _load_robot_mjcf(self) -> Tuple[str, List[str], str]:
         """
-        Collision-only Panda from the Menagerie MJCF: the 'panda' default classes, the collision mesh assets with
-        absolute paths and the link0 body tree, plus a 'tcp' site at the Panda_tip pose of the analytical model.
+        Collision-only robot from its MJCF: the default classes of the model (the Menagerie Panda's 'panda'; none in
+        the FR3 model), the collision mesh assets with absolute paths and the link0 body tree, plus a 'tcp' site at
+        the TCP pose of the analytical model.
         """
         if self._robot_mjcf is not None:
             return self._robot_mjcf
@@ -221,8 +228,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         compiler = root.find('compiler')
         mesh_dir = os.path.join(os.path.dirname(self.robot_model_path),
                                 compiler.get('meshdir', '') if compiler is not None else '')
-        defaults = root.find('default').find("default[@class='panda']")
-        link0 = root.find('worldbody').find("body[@name='link0']")
+        top_default = root.find('default')
+        defaults = top_default.find("default[@class='panda']") if top_default is not None else None
+        link0 = root.find('worldbody').find(".//body[@name='link0']")
+        if link0 is None:
+            raise ValueError(f"[MUJOCO DIGITAL TWIN ERROR] No body 'link0' in {self.robot_model_path}")
         for body in link0.iter('body'):
             for geom in [g for g in body.findall('geom') if g.get('class') == 'visual']:
                 body.remove(geom)
@@ -235,7 +245,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         link7 = link0.find(".//body[@name='link7']")
         ox, oy, oz = (float(v) for v in self.kin.EE_OFFSET)
         ET.SubElement(link7, 'site', {'name': 'tcp', 'pos': f"{ox:.6f} {oy:.6f} {0.107 + oz:.6f}"})
-        self._robot_mjcf = (ET.tostring(defaults, encoding='unicode'), assets, ET.tostring(link0, encoding='unicode'))
+        self._robot_mjcf = (ET.tostring(defaults, encoding='unicode') if defaults is not None else "", assets,
+                            ET.tostring(link0, encoding='unicode'))
         return self._robot_mjcf
 
     def _index_geoms(self) -> None:
@@ -249,7 +260,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             name = m.body(body).name
             if name.startswith('link') and name[4:].isdigit():
                 self._robot_geoms.append((g, body, int(name[4:])))
-            elif name in HAND_BODIES:
+            elif name in self.hand_bodies:
                 self._robot_geoms.append((g, body, 8))
             elif name.startswith('obs_'):
                 try:
@@ -445,7 +456,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         self.robot_loaded = True
         self.robot_id = 1
         self.kin = FrankaKinematics(base_position=self.robot_base_pos, joint_angle_offsets=self.joint_angle_offsets,
-                                    ee_offset=self.ee_offset)
+                                    ee_offset=self.ee_offset, joint_limits=self.joint_limits)
 
         self._rebuild_model()
 
@@ -972,7 +983,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         eval_data = self._eval_data
         if np.all(np.abs(self.data.qpos[:7]) < 1e-2):
-            eval_data.qpos[:7] = FrankaKinematics.Q_REST.astype(np.float64) + self.joint_angle_offsets
+            eval_data.qpos[:7] = self.q_rest + self.joint_angle_offsets
         else:
             eval_data.qpos[:7] = self.data.qpos[:7]
 
@@ -986,7 +997,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 rot_mat = Rotation.from_quat(tq.flatten()).as_matrix().astype(np.float64)
 
         site_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_SITE, "tcp")
-        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, "hand")
+        body_id = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_BODY, self.hand_bodies[0])
         if site_id < 0 and body_id < 0:
             return None
 
@@ -994,8 +1005,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         jacp = np.zeros((3, self.model.nv), dtype=np.float64)
         jacr = np.zeros((3, self.model.nv), dtype=np.float64) if rot_mat is not None else None
 
-        q_min = FrankaKinematics.Q_MIN.astype(np.float64) + self.joint_angle_offsets
-        q_max = FrankaKinematics.Q_MAX.astype(np.float64) + self.joint_angle_offsets
+        q_min = self.q_min + self.joint_angle_offsets
+        q_max = self.q_max + self.joint_angle_offsets
 
         for _ in range(40):
             mujoco.mj_fwdPosition(self.model, eval_data)

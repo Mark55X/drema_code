@@ -28,3 +28,5 @@ scipy
 pillow
 tqdm
 omegaconf
+# Laboratory environment client and bridges (run_lab_client.py, lab_bridges)
+msgpack

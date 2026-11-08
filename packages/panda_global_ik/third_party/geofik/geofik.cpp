@@ -42,8 +42,9 @@
 // max number of points in discretisation for swivel angle solver
 const unsigned int MAX_N_POINTS = 1000;
 
-const array<double, 7> q_low = { -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973 };
-const array<double, 7> q_up = { 2.8973, 1.762, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973 };
+// Joint limits of the arm the solutions must satisfy; the Panda's unless geofik_set_limits (src/geofik_c.cpp) changes them
+array<double, 7> q_low = { -2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973 };
+array<double, 7> q_up = { 2.8973, 1.762, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973 };
 const array<double, 7> q_mid = { 0.0, 0.0, 0.0, -1.5708, 0.0, 1.8675, 0.0 };
 
 // Jacobian at home configuration (orientation only)

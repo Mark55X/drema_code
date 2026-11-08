@@ -1,0 +1,68 @@
+# ==============================================================================
+# Laboratory environment (run_lab_client.py): real FR3 + Franka Hand, calibrated RGB-D cameras
+# Every bridge runs on the robot PC (docs/lab_environment.md); hosts / ports below must match its command line.
+# ==============================================================================
+lab:
+  task_name: "lab"
+  task_description: ""              # Instruction given to the VLM role providers and to keyframe policies
+  control_hz: 20.0                  # Loop rate: one MPC request and one arm command per iteration
+  reachability_radius: 0.855        # FR3 maximum reach [m]
+
+  world:
+    # World frame = robot base frame translated by this vector (the server models the base as a translation only).
+    # The fixed-camera calibrations are T_base_camera, the keyframe files are in the world frame.
+    robot_base_position: [0.0, 0.0, 0.0]
+
+  cameras:                          # Any number; names must be unique. One bridge process per camera.
+    - name: "zed_front"
+      source: "zed"                 # zed: lab_bridges.zed_camera (ZED SDK) | ros2: lab_bridges.ros2_camera (any ROS2 RGB-D driver)
+      host: "127.0.0.1"
+      port: 5002
+      mount: "fixed"                # fixed: calibration = T_base_camera | wrist: calibration = T_link_camera
+      # link: "ee"                  # wrist only: 'ee' (hand pose reported by the robot) or 'flange' (link 8)
+      calibration: "configs/environments/calibrations/zed_front_2026_10_02.txt"   # OpenCV optical frame
+      stream_resolution: [320, null]   # [width, height] streamed at cam_fps; null height keeps the aspect ratio
+      scan_resolution: [1280, null]    # initial scan frames
+      depth_range: [0.2, 2.5]          # depth outside [near, far] m is invalid (0)
+      timeout_s: 5.0
+    # - name: "zed_top"             # e.g. a second ZED above the table: its own bridge, port and calibration
+    #   source: "zed"
+    #   port: 5006
+    #   mount: "fixed"
+    #   calibration: "configs/environments/calibrations/zed_top.txt"
+    #   stream_resolution: [320, null]
+    #   scan_resolution: [1280, null]
+
+  scan:
+    frames_per_camera: 1            # Initial scan = these frames of every camera, with the arm where it stands
+    interval_s: 0.2
+
+  segmentation:
+    robot_mask:
+      enabled: true                 # FR3 rendered at the measured joints into every camera
+      urdf: "assets/franka_fr3/fr3_mask.urdf"
+      dilation_px: 2
+    objects: "none"                 # Object instance masks: not implemented yet (SAM3 + video tracker planned)
+
+  robot:
+    profile: "configs/robots/fr3_real.yaml"     # Same profile as the server: TCP, joint limits
+    joints_bridge: {host: "127.0.0.1", port: 5003, timeout_s: 1.0}
+    command_bridge: {host: "127.0.0.1", port: 5005, timeout_s: 0.5}
+    joint_names: ["fr3_joint1", "fr3_joint2", "fr3_joint3", "fr3_joint4", "fr3_joint5", "fr3_joint6", "fr3_joint7"]
+    finger_joint_names: ["fr3_finger_joint1", "fr3_finger_joint2"]
+    gripper_max_width: 0.08
+    ee_pose: "measured"             # measured: O_T_EE from the joints bridge pose topic | fk: kinematic model + profile TCP
+    max_state_age_s: 0.25           # Older joint states count as missing: the arm holds
+    actuation:
+      interface: "position"         # Must match the command bridge --interface
+      max_lead: 0.06                # [rad] reference ahead of the measured joints at most
+      max_velocity: [0.5, 0.5, 0.5, 0.5, 0.8, 0.8, 0.8]   # [rad/s] the MPC command is scaled down to this
+      limit_margin: 0.05            # [rad] kept from the FR3 joint limits
+    gripper:
+      open_width_threshold: 0.07    # [m] finger width above which the hand counts as open (Drema2's threshold)
+      min_motion_s: 0.3
+      timeout_s: 5.0
+      poll_s: 0.1
+
+  keyframes:
+    file: null                      # e.g. configs/environments/keyframes_example.yaml (--keyframes file)

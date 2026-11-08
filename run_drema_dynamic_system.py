@@ -47,6 +47,14 @@ from drema.visualization.imagination import _link_skeletons
 from drema.roles import ObjectRoleRegistry
 from drema.visualization import build_visualization_hub
 
+REPO_ROOT = os.path.dirname(os.path.abspath(__file__))
+
+
+def _repo_path(path: str) -> str:
+    """A model path relative to the repository root when it exists there; else as given (PyBullet's data path)."""
+    candidate = os.path.join(REPO_ROOT, path)
+    return candidate if not os.path.isabs(path) and not os.path.exists(path) and os.path.exists(candidate) else path
+
 
 def pointcloud_from_depth_and_camera_params(depth: np.ndarray, extrinsics: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
     """Exact equivalent of PyRep VisionSensor.pointcloud_from_depth_and_camera_params (0.0 error)."""
@@ -165,7 +173,17 @@ class DremaDynamicSystem:
         twin_engine = str(config.get_nested("digital_twin.engine", "pybullet")).lower()
         twin_gui = bool(config.get_nested("digital_twin.gui", True))
         table_z = float(config.get_nested("perception.workspace.table_z_prior", 0.75))
-        urdf_path = config.get_nested("digital_twin.urdf_path", "franka_panda/panda.urdf")
+        # Robot model of the twin: the robot profile's, unless digital_twin names one explicitly
+        urdf_path = _repo_path(config.get_nested("digital_twin.urdf_path")
+                               or config.get_nested("robot.twin.pybullet_urdf", "franka_panda/panda.urdf"))
+        self.robot_urdf_path = urdf_path
+        mujoco_model_path = _repo_path(config.get_nested("digital_twin.mujoco_model_path")
+                                       or config.get_nested("robot.twin.mujoco_model",
+                                                            "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml"))
+        hand_bodies = config.get_nested("robot.twin.mujoco_hand_bodies", None)
+        joint_limits = config.get_nested("robot.joint_limits", None)
+        self.joint_limits = {k: [float(x) for x in v] for k, v in joint_limits.items() if v is not None} \
+            if joint_limits else None
 
         tracking_mode = str(config.get_nested("digital_twin.tracking_mode", "constraint")).lower()
         constraint_max_force = float(config.get_nested("digital_twin.constraint_max_force", 300.0))
@@ -188,7 +206,9 @@ class DremaDynamicSystem:
         self._self_check_result: Optional[bool] = None
         print(f"[DREMA DYNAMIC SYSTEM] Robot profile: {config.get_nested('robot.name', 'none')} "
               f"({config.get_nested('robot.profile', 'no profile file')}) | joint angle offsets [rad]: "
-              f"{self.joint_angle_offsets} | TCP offset [m]: {self.tcp_offset or 'FrankaKinematics default'}")
+              f"{self.joint_angle_offsets} | TCP offset [m]: {self.tcp_offset or 'FrankaKinematics default'} | "
+              f"joint limits: {'profile' if self.joint_limits else 'Panda (FrankaKinematics)'} | twin model: "
+              f"{urdf_path if twin_engine == 'pybullet' else mujoco_model_path}")
 
         if twin_engine == "pybullet":
             self.digital_twin: BaseDigitalTwin = PyBulletDigitalTwin(
@@ -206,12 +226,11 @@ class DremaDynamicSystem:
                 obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
                 vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
                 vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05)),
-                ee_offset=self.tcp_offset
+                ee_offset=self.tcp_offset,
+                joint_limits=self.joint_limits
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
         elif twin_engine in ["mujoco", "mjx"]:
-            mujoco_model_path = config.get_nested("digital_twin.mujoco_model_path",
-                                                  "assets/mujoco_menagerie/franka_emika_panda/panda_upstream.xml")
             enable_mjx = bool(config.get_nested("digital_twin.enable_mjx", False)) or (twin_engine == "mjx")
             self.digital_twin: BaseDigitalTwin = MuJoCoDigitalTwin(
                 visualize=twin_gui,
@@ -229,7 +248,9 @@ class DremaDynamicSystem:
                 obstacle_convex_decomposition=bool(config.get_nested("digital_twin.obstacle_convex_decomposition", True)),
                 vhacd_resolution=int(config.get_nested("digital_twin.vhacd_resolution", 100000)),
                 vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05)),
-                ee_offset=self.tcp_offset
+                ee_offset=self.tcp_offset,
+                joint_limits=self.joint_limits,
+                hand_bodies=hand_bodies
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
 
@@ -246,7 +267,7 @@ class DremaDynamicSystem:
         self._last_action: Optional[drema_comm_pb2.ControlAction] = None
         self._last_action_time = 0.0
         self.mpc_controller = MPCController.from_config(ctrl_cfg, self.digital_twin, self.joint_angle_offsets,
-                                                        self.tcp_offset)
+                                                        self.tcp_offset, self.joint_limits)
         print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 3 (MPC Controller) initialized (log_interval: {self.log_interval_actions} actions).")
 
         # Object roles: environment permissions + keyframe policy contact + held objects -> twin collision policies
@@ -1197,7 +1218,8 @@ class DremaDynamicSystem:
         req = dict(self._twin_snapshot(), key=r['key'], request_id=self._route_requests, start=start, goals=goals,
                    preferred_goal=preferred, clearance_levels=list(self.route_levels), base=np.asarray(kin.base_position, dtype=np.float64),
                    offsets=[float(x) for x in self.joint_angle_offsets], ee_offset=[float(x) for x in kin.EE_OFFSET],
-                   urdf=self.digital_twin.robot_urdf_path, kappa=engine.kappa, rho=engine.rho, seed=1000 * r['key'] + r['plans'],
+                   joint_limits={'q_min': kin.Q_MIN.tolist(), 'q_max': kin.Q_MAX.tolist(), 'qd_max': kin.QD_MAX.tolist()},
+                   urdf=self.robot_urdf_path, kappa=engine.kappa, rho=engine.rho, seed=1000 * r['key'] + r['plans'],
                    attempts=self.route_attempts, budget_s=self.route_budget, shortcut_tries=60,
                    wrist_weight=self.route_wrist_weight)
         self._route_service.submit(req)

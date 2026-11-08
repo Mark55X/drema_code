@@ -1,7 +1,8 @@
 """
-Global inverse kinematics of the Franka Emika Panda: every joint configuration reaching a TCP pose, from the analytical
-solver GeoFIK (Lopez-Custodio, Gong, Figueredo, arXiv:2503.03992) sampled over the joint-7 range. Each solution is
-checked with the forward kinematics of this module, so a wrong or out-of-limit solution is never returned.
+Global inverse kinematics of the Franka arms (Panda, FR3: one kinematic chain, different joint limits): every joint
+configuration reaching a TCP pose, from the analytical solver GeoFIK (Lopez-Custodio, Gong, Figueredo,
+arXiv:2503.03992) sampled over the joint-7 range. Each solution is checked with the forward kinematics of this module,
+so a wrong or out-of-limit solution is never returned.
 """
 import ctypes
 import glob
@@ -12,6 +13,7 @@ import numpy as np
 
 __all__ = ['PandaIK', 'Q_MIN', 'Q_MAX', 'FRANKA_HAND_TCP']
 
+# Panda joint limits, the default of PandaIK
 Q_MIN = np.array([-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973])
 Q_MAX = np.array([2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973])
 # Official Franka modified DH parameters (a_{i-1}, alpha_{i-1}, d_i); the last row ends at the flange.
@@ -37,6 +39,7 @@ def _load_geofik() -> ctypes.CDLL:
         raise ImportError('panda_global_ik: compiled GeoFIK library not found, reinstall with `pip install .`')
     lib = ctypes.CDLL(found[0])
     lib.geofik_ik_q7.restype = ctypes.c_int
+    lib.geofik_set_limits.restype = None
     return lib
 
 
@@ -46,7 +49,8 @@ _DOUBLE_P = ctypes.POINTER(ctypes.c_double)
 class PandaIK:
     def __init__(self, tcp_offset: Optional[np.ndarray] = None, joint_offsets: Optional[np.ndarray] = None,
                  base: Optional[np.ndarray] = None, q7_samples: int = 33, q7_refine_samples: int = 133,
-                 position_tolerance: float = 1e-3, rotation_tolerance_deg: float = 0.5):
+                 position_tolerance: float = 1e-3, rotation_tolerance_deg: float = 0.5,
+                 q_min: Optional[np.ndarray] = None, q_max: Optional[np.ndarray] = None):
         """
         :param tcp_offset: 4x4 flange -> TCP transform; default the Franka Hand (0.1034 m along z, -45 deg about z).
         :param joint_offsets: added to the joint values before the kinematic chain; zero on a real Panda, non-zero
@@ -55,14 +59,20 @@ class PandaIK:
         :param q7_samples: joint-7 values sampled over its range (33 = 10 deg step).
         :param q7_refine_samples: denser second pass, only when the first finds nothing: about 0.2 % of the reachable
             poses are reachable only in a joint-7 window narrower than 10 deg (0 left out of 4000 with 133).
+        :param q_min / q_max: joint limits of the arm (measured joint space); default the Panda's.
         """
         self.tcp = np.eye(4) @ (FRANKA_HAND_TCP if tcp_offset is None else np.asarray(tcp_offset, dtype=np.float64))
         self.tcp_inv = np.linalg.inv(self.tcp)
         self.offsets = np.zeros(7) if joint_offsets is None else np.asarray(joint_offsets, dtype=np.float64).reshape(7)
         self.base = np.eye(4) if base is None else np.asarray(base, dtype=np.float64)
         self.base_inv = np.linalg.inv(self.base)
-        self.q7_grid = np.linspace(Q_MIN[6] + 1e-3, Q_MAX[6] - 1e-3, int(q7_samples))
-        self.q7_refine_grid = np.linspace(Q_MIN[6] + 1e-3, Q_MAX[6] - 1e-3, int(q7_refine_samples)) if q7_refine_samples else None
+        self.q_min = Q_MIN.copy() if q_min is None else np.asarray(q_min, dtype=np.float64).reshape(7)
+        self.q_max = Q_MAX.copy() if q_max is None else np.asarray(q_max, dtype=np.float64).reshape(7)
+        # GeoFIK checks its solutions in its own joint space, offsets included
+        self._limits = (np.ascontiguousarray(self.q_min + self.offsets), np.ascontiguousarray(self.q_max + self.offsets))
+        self.q7_grid = np.linspace(self.q_min[6] + 1e-3, self.q_max[6] - 1e-3, int(q7_samples))
+        self.q7_refine_grid = (np.linspace(self.q_min[6] + 1e-3, self.q_max[6] - 1e-3, int(q7_refine_samples))
+                               if q7_refine_samples else None)
         self.position_tolerance = position_tolerance
         self.rotation_tolerance = np.radians(rotation_tolerance_deg)
         self._lib = _load_geofik()
@@ -92,6 +102,8 @@ class PandaIK:
         r = np.ascontiguousarray(hand[:3, 3])
         rot = np.ascontiguousarray(hand[:3, :3]).ravel()
         found = []
+        # The limits are a global of the C library: set them for this instance before every solve
+        self._lib.geofik_set_limits(self._limits[0].ctypes.data_as(_DOUBLE_P), self._limits[1].ctypes.data_as(_DOUBLE_P))
         for q7 in q7_values:
             self._lib.geofik_ik_q7(r.ctypes.data_as(_DOUBLE_P), rot.ctypes.data_as(_DOUBLE_P), ctypes.c_double(q7),
                                    ctypes.c_double(np.pi / 2), self._out.ctypes.data_as(_DOUBLE_P))
@@ -99,7 +111,7 @@ class PandaIK:
                 if not np.all(np.isfinite(theta)):
                     continue
                 q = theta - self.offsets
-                if np.any(q < Q_MIN) or np.any(q > Q_MAX):
+                if np.any(q < self.q_min) or np.any(q > self.q_max):
                     continue
                 if self._reaches(q, target):
                     found.append(q)
@@ -120,10 +132,9 @@ class PandaIK:
         """Shortcut: best(solutions(target), q_current). None means the pose is out of reach."""
         return self.best(self.solutions(target), q_current, min_margin)
 
-    @staticmethod
-    def margin(q: np.ndarray) -> float:
+    def margin(self, q: np.ndarray) -> float:
         """Smallest distance [rad] of q from a joint limit."""
-        return float(np.min(np.minimum(np.asarray(q) - Q_MIN, Q_MAX - np.asarray(q))))
+        return float(np.min(np.minimum(np.asarray(q) - self.q_min, self.q_max - np.asarray(q))))
 
     def _reaches(self, q: np.ndarray, target: np.ndarray) -> bool:
         T = self.fk(q)
