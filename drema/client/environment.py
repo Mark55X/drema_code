@@ -36,7 +36,9 @@ class Environment:
     """
     Camera frames are dicts {'rgb', 'depth', 'extrinsics' (cam-to-world), 'intrinsics', 'near_clipping',
     'far_clipping', 'mask'}; mask pixels hold the ids of `semantic_labels`, whose `label_categories` say robot, object
-    or background, or None when the environment has no segmentation.
+    or background, or None when the environment has no segmentation. `object_physics` maps object ids to what the
+    environment knows of their physics ({'mass' [kg], 'friction', 'static'}); it may be empty, and only the physics
+    rollouts of the twin use it.
     `actuator` exposes apply(joint_velocities) / hold() / reset(); `gripper` exposes command(open_amount), step(),
     reset(), is_open(), done, busy and target, as drema.client.gripper.RLBenchGripperController.
     """
@@ -52,6 +54,7 @@ class Environment:
     reachability_radius: float = 0.95
     semantic_labels: Dict[str, int]
     label_categories: Dict[int, str]
+    object_physics: Dict[int, Dict[str, Any]]
     actuator: Any = None
     gripper: Any = None
 

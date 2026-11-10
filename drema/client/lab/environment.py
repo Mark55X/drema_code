@@ -123,6 +123,7 @@ class LabEnvironment(Environment):
         self.keyframes_cfg = cfg.get("keyframes", {}) or {}
         self.semantic_labels: Dict[str, int] = {}
         self.label_categories: Dict[int, str] = {}
+        self.object_physics: Dict[int, Dict] = {}
         self._t0 = time.monotonic()
         self.cameras: List[LabCamera] = []
         self.workers: List[CameraWorker] = []
@@ -225,6 +226,7 @@ class LabEnvironment(Environment):
     def _update_labels(self) -> None:
         self.semantic_labels = self.segmentation.semantic_labels
         self.label_categories = self.segmentation.label_categories
+        self.object_physics = self.segmentation.object_physics
 
     # -------------------------------------------------------------------------
     # Sensing

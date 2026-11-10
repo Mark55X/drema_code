@@ -1075,7 +1075,7 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
 
         if self.model is None or self.data is None:
             self.last_collision_timings = {
-                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'backend': self._collision_backend_label(),
                 'pred_ms': 0.0,
                 'backend_ms': 0.0,
                 'gvm_ms': 0.0,
@@ -1089,15 +1089,13 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         # plus the held objects, which move with the TCP.
         probes, obstacles, allowed, margins = self._collision_pairs(include_table=self.table_in_collision_costs)
         obstacle_geoms = [g for g, _ in obstacles]
-        geom_to_obj_id = {g: obj_id for g, obj_id in obstacles if obj_id >= 0}
         slots: Dict[int, int] = {}
-        geom_slot = {g: slots.setdefault(obj_id, len(slots)) for g, obj_id in obstacles}
-        max_margin = max(0.0, float(margins.max())) if margins.size else 0.0
-        held_ids = sorted({pr[5] for pr in probes if pr[5] is not None})
+        for _, obj_id in obstacles:
+            slots.setdefault(obj_id, len(slots))
 
         if not obstacle_geoms:
             self.last_collision_timings = {
-                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'backend': self._collision_backend_label(),
                 'pred_ms': 0.0,
                 'backend_ms': 0.0,
                 'gvm_ms': 0.0,
@@ -1105,13 +1103,11 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
             }
             return coll_p, coll_gvm
 
-        robot_geom_ids = np.array([pr[0] for pr in probes], dtype=np.int64)
-        obstacle_geom_ids = np.array(obstacle_geoms, dtype=np.int64)
         n_bodies = self.model.nbody
 
         if not probes:
             self.last_collision_timings = {
-                'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
+                'backend': self._collision_backend_label(),
                 'pred_ms': 0.0,
                 'backend_ms': 0.0,
                 'gvm_ms': 0.0,
@@ -1137,9 +1133,82 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         )
         t_pred_ms = (time.perf_counter() - t_pred_start) * 1000.0
 
-        t_mj_total = 0.0
+        # Subsample lookahead waypoints to sustain high control frequency
+        step_stride = max(1, H // 5)
+        eval_steps = list(range(0, H, step_stride))
+        if (H - 1) not in eval_steps:
+            eval_steps.append(H - 1)
+        record_points = self.record_collision_points
+        rec, t_mj_total = self._collision_records(Q, eval_steps, predictions, probes, obstacles, allowed, margins,
+                                                  sigma_2, eval_data, record_points)
+        rec_k, rec_e, rec_group, rec_slot, rec_d = rec['k'], rec['e'], rec['group'], rec['slot'], rec['d']
+        rec_normal, rec_v_obs, rec_point, rec_obj = rec['normal'], rec['v_obs'], rec['point'], rec['obj']
+        total_contact_pts = len(rec_d)
         t_gvm_total = 0.0
-        total_contact_pts = 0
+
+        if record_points:
+            self.last_collision_points = {
+                'rollout': np.asarray(rec_k, dtype=np.int64),
+                'step': np.asarray(eval_steps, dtype=np.int64)[np.asarray(rec_e, dtype=np.int64)],
+                'position': np.asarray(rec_point, dtype=np.float64).reshape(-1, 3),
+                'distance': np.asarray(rec_d, dtype=np.float64),
+                'obstacle': np.asarray(rec_obj, dtype=np.int64),
+            }
+
+        t_gvm_s = time.perf_counter()
+        coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(
+            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_group, rec_slot, rec_d, rec_normal, rec_v_obs,
+            n_groups=max(1, len(slots)) * n_bodies, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho,
+            kin_helper=kin_helper
+        )
+        coll_p[:, eval_steps] = coll_p_eval
+        coll_gvm[:, eval_steps] = coll_gvm_eval
+        t_gvm_total = time.perf_counter() - t_gvm_s
+
+        self.last_collision_timings = {
+            'backend': self._collision_backend_label(),
+            'pred_ms': t_pred_ms,
+            'backend_ms': t_mj_total * 1000.0,
+            'gvm_ms': t_gvm_total * 1000.0,
+            'pts_count': total_contact_pts
+        }
+
+        # Restore eval_data mocap poses to instantaneous state (t=0)
+        if hasattr(eval_data, 'mocap_pos') and hasattr(self.data, 'mocap_pos'):
+            eval_data.mocap_pos[:] = self.data.mocap_pos[:]
+            eval_data.mocap_quat[:] = self.data.mocap_quat[:]
+
+        # Interpolate across un-evaluated lookahead steps
+        for h in range(H):
+            if h not in eval_steps:
+                prev_h = max([s for s in eval_steps if s <= h], default=0)
+                coll_p[:, h] = coll_p[:, prev_h]
+                coll_gvm[:, h] = coll_gvm[:, prev_h]
+
+        return coll_p, coll_gvm
+
+    def _collision_backend_label(self) -> str:
+        return 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo'
+
+    def _collision_records(self, Q: np.ndarray, eval_steps: List[int], predictions: Dict[int, Any], probes: list,
+                           obstacles: list, allowed: np.ndarray, margins: np.ndarray, sigma_2: float,
+                           eval_data: "mujoco.MjData", record_points: bool) -> Tuple[Dict[str, list], float]:
+        """
+        Closest-point records of the configurations Q[:, eval_steps] closer than sigma_2 to an allowed obstacle
+        (per-pair margins applied), as lists keyed k, e, group, slot, d, normal (obstacle -> robot), v_obs, point,
+        obj; plus the time spent in MuJoCo [s].
+        """
+        K = Q.shape[0]
+        obstacle_geoms = [g for g, _ in obstacles]
+        geom_to_obj_id = {g: obj_id for g, obj_id in obstacles if obj_id >= 0}
+        slots: Dict[int, int] = {}
+        geom_slot = {g: slots.setdefault(obj_id, len(slots)) for g, obj_id in obstacles}
+        max_margin = max(0.0, float(margins.max())) if margins.size else 0.0
+        held_ids = sorted({pr[5] for pr in probes if pr[5] is not None})
+        robot_geom_ids = np.array([pr[0] for pr in probes], dtype=np.int64)
+        obstacle_geom_ids = np.array(obstacle_geoms, dtype=np.int64)
+        n_bodies = self.model.nbody
+        t_mj_total = 0.0
 
         # Pre-cache mocap indices for tracked obstacles
         obj_mocap_map = {}
@@ -1155,11 +1224,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                 if m_idx >= 0:
                     obj_mocap_map[obj_id] = m_idx
 
-        # Subsample lookahead waypoints to sustain high control frequency
-        step_stride = max(1, H // 5)
-        eval_steps = list(range(0, H, step_stride))
-        if (H - 1) not in eval_steps:
-            eval_steps.append(H - 1)
         n_eval = len(eval_steps)
         # Held object poses for every evaluated configuration, indexed k * n_eval + e
         held_poses = self.attached_poses(Q[:, eval_steps].reshape(-1, 7)) if held_ids else {}
@@ -1176,7 +1240,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
         rec_v_obs: List[Any] = []
         rec_point: List[Any] = []
         rec_obj: List[int] = []
-        record_points = self.record_collision_points
         zero_vel = np.zeros(3, dtype=np.float64)
 
         for e, h in enumerate(eval_steps):
@@ -1227,7 +1290,6 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                     if d >= sigma_2:
                         continue
 
-                    total_contact_pts += 1
                     rec_k.append(k)
                     rec_e.append(e)
                     rec_group.append(geom_slot[og] * n_bodies + rbody)
@@ -1240,46 +1302,8 @@ class MuJoCoDigitalTwin(BaseDigitalTwin):
                         rec_point.append(fromto[0:3].copy())
                         rec_obj.append(geom_to_obj_id.get(og, -1))
 
-        if record_points:
-            self.last_collision_points = {
-                'rollout': np.asarray(rec_k, dtype=np.int64),
-                'step': np.asarray(eval_steps, dtype=np.int64)[np.asarray(rec_e, dtype=np.int64)],
-                'position': np.asarray(rec_point, dtype=np.float64).reshape(-1, 3),
-                'distance': np.asarray(rec_d, dtype=np.float64),
-                'obstacle': np.asarray(rec_obj, dtype=np.int64),
-            }
-
-        t_gvm_s = time.perf_counter()
-        coll_p_eval, coll_gvm_eval = aggregate_gvm_costs(
-            Q[:, eval_steps], QD[:, eval_steps], rec_k, rec_e, rec_group, rec_slot, rec_d, rec_normal, rec_v_obs,
-            n_groups=max(1, len(slots)) * n_bodies, sigma_1=sigma_1, sigma_2=sigma_2, kappa=kappa, rho=rho,
-            kin_helper=kin_helper
-        )
-        coll_p[:, eval_steps] = coll_p_eval
-        coll_gvm[:, eval_steps] = coll_gvm_eval
-        t_gvm_total = time.perf_counter() - t_gvm_s
-
-        self.last_collision_timings = {
-            'backend': 'MJX' if getattr(self, 'enable_mjx', False) else 'MuJoCo',
-            'pred_ms': t_pred_ms,
-            'backend_ms': t_mj_total * 1000.0,
-            'gvm_ms': t_gvm_total * 1000.0,
-            'pts_count': total_contact_pts
-        }
-
-        # Restore eval_data mocap poses to instantaneous state (t=0)
-        if hasattr(eval_data, 'mocap_pos') and hasattr(self.data, 'mocap_pos'):
-            eval_data.mocap_pos[:] = self.data.mocap_pos[:]
-            eval_data.mocap_quat[:] = self.data.mocap_quat[:]
-
-        # Interpolate across un-evaluated lookahead steps
-        for h in range(H):
-            if h not in eval_steps:
-                prev_h = max([s for s in eval_steps if s <= h], default=0)
-                coll_p[:, h] = coll_p[:, prev_h]
-                coll_gvm[:, h] = coll_gvm[:, prev_h]
-
-        return coll_p, coll_gvm
+        return {"k": rec_k, "e": rec_e, "group": rec_group, "slot": rec_slot, "d": rec_d, "normal": rec_normal,
+                "v_obs": rec_v_obs, "point": rec_point, "obj": rec_obj}, t_mj_total
 
     # -------------------------------------------------------------------------
     # Lifecycle Cleanup

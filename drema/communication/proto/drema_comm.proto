@@ -25,6 +25,14 @@ enum LabelCategory {
   BACKGROUND = 3;  // fixed scene (table, walls): static map only
 }
 
+// Physical properties of a scene object, as the environment knows them (simulator, or a model in the lab).
+// Only the physics rollouts of the twin use them; 0 means unknown (the server default applies).
+message ObjectPhysics {
+  double mass = 1;       // kg
+  double friction = 2;   // sliding friction coefficient
+  bool is_static = 3;    // fixed in the scene (e.g. a cupboard): never moved by contacts
+}
+
 // Multi-view observation captured at a given timestep
 message FrameObservation {
   int64 timestep = 1;
@@ -37,6 +45,7 @@ message FrameObservation {
   double reachability_radius = 8;         // Robot maximum kinematic reach radius in meters
   repeated double joint_positions = 9;    // Franka Panda joint positions [q1..q7] (rad)
   map<int32, LabelCategory> label_categories = 10; // Handle -> category; empty: perception falls back to name keywords
+  map<int32, ObjectPhysics> object_physics = 11;   // Handle -> physical properties (objects only; may be empty)
 }
 
 // Acknowledgment for streamed observations

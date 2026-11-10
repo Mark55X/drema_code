@@ -71,6 +71,7 @@ class CoppeliaEnvironment(Environment):
         self.actuation_mode = actuation
         self.semantic_labels: Dict[str, int] = {}
         self.label_categories: Dict[int, str] = {}
+        self.object_physics: Dict[int, Dict[str, Any]] = {}
         self.task_description = ""
         self.video_recorder = None
         self.sim_steps = 0
@@ -356,7 +357,7 @@ class CoppeliaEnvironment(Environment):
         task_base = getattr(self.task, '_task', self.task).get_base()
         task_handles = {o.get_handle() for o in task_base.get_objects_in_tree(object_type=ObjectType.SHAPE)}
         handles = sim.simGetObjectsInTree(sim.sim_handle_scene, sim.sim_object_shape_type, 0)
-        labels, categories = {}, {}
+        labels, categories, physics = {}, {}, {}
         filter_names = ["DefaultCamera", "ResizableFloor", "Floor", "Wall", "Ceiling"]
         for h in handles:
             try:
@@ -369,11 +370,32 @@ class CoppeliaEnvironment(Environment):
                 labels[name] = int(h)
                 categories[int(h)] = ('robot' if h in robot_handles else
                                       'object' if h in task_handles else 'background')
+                if categories[int(h)] == 'object':
+                    physics[int(h)] = self._shape_physics(shape)
             except Exception:
                 pass
         self.semantic_labels = labels
         self.label_categories = categories
+        self.object_physics = {h: p for h, p in physics.items() if p}
         return labels
+
+    @staticmethod
+    def _shape_physics(shape) -> Dict[str, Any]:
+        """Mass, Bullet friction and static flag of the respondable shape a labelled shape belongs to ({} if none)."""
+        from pyrep.backend import sim
+        from pyrep.objects.shape import Shape
+        node = shape
+        while node is not None:
+            handle = node.get_handle()
+            if sim.simGetObjectType(handle) == sim.sim_object_shape_type and Shape(handle).is_respondable():
+                body = Shape(handle)
+                try:
+                    return {'mass': float(body.get_mass()), 'friction': float(body.get_bullet_friction()),
+                            'static': not body.is_dynamic()}
+                except Exception:
+                    return {}
+            node = node.get_parent()
+        return {}
 
     @staticmethod
     def _pixel_centre_intrinsics(sensor) -> np.ndarray:

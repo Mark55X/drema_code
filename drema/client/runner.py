@@ -160,7 +160,8 @@ class ClosedLoopRunner:
                 joint_positions=scan.joint_positions,
                 chunk_size=self.scan_chunk_size,
                 chunk_timeout_s=self.scan_chunk_timeout,
-                label_categories=self.env.label_categories
+                label_categories=self.env.label_categories,
+                object_physics=getattr(self.env, 'object_physics', None) or {}
             )
         except Exception as e:
             print(f"[{self.tag} Error] Initial scan failed: {e}")

@@ -77,6 +77,26 @@ def unpack_label_categories(obs: drema_comm_pb2.FrameObservation) -> Dict[int, s
             if c != drema_comm_pb2.CATEGORY_UNSPECIFIED}
 
 
+def pack_object_physics(physics: Optional[Dict[int, Dict[str, Any]]]) -> Dict[int, Any]:
+    """Handle -> {'mass', 'friction', 'static'} into ObjectPhysics messages (missing values: 0 / False)."""
+    return {int(h): drema_comm_pb2.ObjectPhysics(mass=float(p.get('mass') or 0.0), friction=float(p.get('friction') or 0.0),
+                                                 is_static=bool(p.get('static', False)))
+            for h, p in (physics or {}).items()}
+
+
+def unpack_object_physics(obs: drema_comm_pb2.FrameObservation) -> Dict[int, Dict[str, Any]]:
+    """ObjectPhysics of an observation back into handle -> {'mass', 'friction', 'static'}; 0 (unknown) is left out."""
+    out = {}
+    for h, p in obs.object_physics.items():
+        entry: Dict[str, Any] = {'static': bool(p.is_static)}
+        if p.mass > 0.0:
+            entry['mass'] = float(p.mass)
+        if p.friction > 0.0:
+            entry['friction'] = float(p.friction)
+        out[int(h)] = entry
+    return out
+
+
 def unpack_camera_frame(frame: drema_comm_pb2.CameraFrame) -> Tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, float, float, Optional[np.ndarray]]:
     """
     Deserializes a Protobuf CameraFrame into numpy arrays, clipping planes, and optional segmentation mask.
@@ -261,13 +281,15 @@ class DremaGrpcClient:
         chunk_size: int = 2,
         chunk_timeout_s: float = 180.0,
         max_chunk_retries: int = 3,
-        label_categories: Optional[Dict[int, str]] = None
+        label_categories: Optional[Dict[int, str]] = None,
+        object_physics: Optional[Dict[int, Dict[str, Any]]] = None
     ) -> Optional[drema_comm_pb2.StreamStatus]:
         """
         Pushes the 360° orbital scan frames to DREMA suite in chunks to avoid gRPC payload overflow.
         Includes automatic retry logic and configurable per-chunk timeouts for reliable transfer over SSH tunnels.
         Each camera item: (name, rgb, depth, extrinsics, intrinsics[, near_clip, far_clip, mask])
         label_categories: handle -> 'robot' / 'object' / 'background' for the labelled shapes
+        object_physics: handle -> {'mass', 'friction', 'static'} of the objects, when the environment knows them
         """
         total_views = len(cameras_list)
         if total_views == 0:
@@ -306,6 +328,7 @@ class DremaGrpcClient:
                 is_scan_finished=is_last,
                 semantic_labels=semantic_labels if is_last else {},
                 label_categories=pack_label_categories(label_categories) if is_last else {},
+                object_physics=pack_object_physics(object_physics) if is_last else {},
                 robot_base_pos=(robot_base_pos or [0.0, 0.0, 0.0]) if is_last else [],
                 reachability_radius=float(reachability_radius),
                 joint_positions=(joint_positions or []) if is_last else []

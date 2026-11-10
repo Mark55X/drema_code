@@ -63,7 +63,7 @@ def aggregate_gvm_costs(
     K, E, _ = Q_eval.shape
     coll_p = np.zeros((K * E, n_groups), dtype=np.float64)
     coll_gvm = np.zeros((K * E, n_groups), dtype=np.float64)
-    if rec_d:
+    if len(rec_d):
         d = np.asarray(rec_d, dtype=np.float64)
         phi = np.where(d < sigma_1, 1.0, np.where(d <= sigma_2, np.exp(-kappa * (d - sigma_1)), 0.0))
         keep = phi > 1e-4
@@ -129,6 +129,14 @@ class BaseDigitalTwin(ABC):
         self.attachments: Dict[int, np.ndarray] = {}
         self._attach_kin: Any = None
         self._surface_points: Dict[str, np.ndarray] = {}
+        # Physical properties sent by the environment (object id -> {'mass', 'friction', 'static'}). Only physics
+        # rollouts use them: the present-state twin keeps its tracking bodies as before.
+        self.object_physics: Dict[int, Dict[str, Any]] = {}
+
+    def set_object_physics(self, physics: Dict[int, Dict[str, Any]]) -> None:
+        """Replaces the physical properties of the objects; missing fields fall back to the defaults."""
+        with self.state_lock:
+            self.object_physics = {int(k): dict(v) for k, v in (physics or {}).items()}
 
     # -------------------------------------------------------------------------
     # Object roles (shared by every backend)

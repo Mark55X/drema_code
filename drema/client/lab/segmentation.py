@@ -33,6 +33,10 @@ class ObjectSegmenter:
     def segment(self, camera: str, rgb: np.ndarray, depth: np.ndarray) -> Optional[np.ndarray]:
         return None
 
+    def physics(self) -> Dict[int, Dict]:
+        """Object id -> {'mass' [kg], 'friction', 'static'} from the model that estimates them; {} when unknown."""
+        return {}
+
     def reset(self) -> None:
         pass
 
@@ -126,6 +130,10 @@ class LabSegmentation:
         if self.robot_renderer is not None:
             categories[ROBOT_ID] = 'robot'
         return categories
+
+    @property
+    def object_physics(self) -> Dict[int, Dict]:
+        return dict(self.objects.physics())
 
     def start(self, frames: Dict[str, Dict]) -> None:
         self.object_labels = dict(self.objects.start(frames))

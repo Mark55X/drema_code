@@ -38,6 +38,10 @@ per camera. Each camera has its own port and its own entry in `configs/environme
   labels only, so it reconstructs the objects without instance ids and cannot track them.
   `drema/client/lab/segmentation.py:ObjectSegmenter` is the interface to fill (planned: SAM3 prompts on the scan,
   then a video tracker).
+- **Physical properties**: `ObjectSegmenter.physics()` returns object id -> `{'mass', 'friction', 'static'}` from
+  whatever model estimates them, and the scan sends it to the server (`FrameObservation.object_physics`). Only the
+  physics rollouts of the `mujoco_warp` twin use it; unknown values fall back to `digital_twin.imagination`
+  defaults. It returns `{}` for now.
 - **Robot**: `ee_pose: measured` sends the hand pose the robot reports. The server's profile self-check therefore
   compares it with its own kinematic model, and a wrong TCP stops the control before any motion. Client and server
   use the same robot profile, `configs/robots/fr3_real.yaml` (see below).

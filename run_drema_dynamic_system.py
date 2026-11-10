@@ -32,11 +32,12 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(
 
 from drema.config import load_config, ConfigDict
 from drema.communication.grpc_server import DremaGrpcServer
-from drema.communication.grpc_client import unpack_camera_frame, unpack_label_categories
+from drema.communication.grpc_client import unpack_camera_frame, unpack_label_categories, unpack_object_physics
 from drema.communication.proto import drema_comm_pb2
 from drema.simulation.base_twin import BaseDigitalTwin
 from drema.simulation.pybullet_digital_twin import PyBulletDigitalTwin
 from drema.simulation.mujoco_digital_twin import MuJoCoDigitalTwin
+from drema.simulation.mujoco_warp_twin import MuJoCoWarpDigitalTwin
 from drema.perception.base_perception import BasePerceptionModule, InitialScanResult, StreamingUpdateResult
 from drema.perception.vg_mapping_perception import VGMappingPerceptionModule
 from drema.controller.mpc_controller import MPCController
@@ -230,9 +231,18 @@ class DremaDynamicSystem:
                 joint_limits=self.joint_limits
             )
             print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: PyBullet, Tracking: {tracking_mode}) initialized.")
-        elif twin_engine in ["mujoco", "mjx"]:
+        elif twin_engine in ["mujoco", "mjx", "mujoco_warp"]:
             enable_mjx = bool(config.get_nested("digital_twin.enable_mjx", False)) or (twin_engine == "mjx")
-            self.digital_twin: BaseDigitalTwin = MuJoCoDigitalTwin(
+            warp_kwargs = {}
+            twin_cls = MuJoCoDigitalTwin
+            if twin_engine == "mujoco_warp":
+                twin_cls = MuJoCoWarpDigitalTwin
+                warp_cfg = config.get_nested("digital_twin.warp", {}) or {}
+                warp_kwargs = dict(warp_device=str(warp_cfg.get("device", "auto")),
+                                   collision_backend=str(warp_cfg.get("collision_backend", "auto")),
+                                   contacts_per_world=int(warp_cfg.get("contacts_per_world", 32)),
+                                   imagination=config.get_nested("digital_twin.imagination", {}) or {})
+            self.digital_twin: BaseDigitalTwin = twin_cls(
                 visualize=twin_gui,
                 table_z=table_z,
                 robot_model_path=mujoco_model_path,
@@ -250,12 +260,15 @@ class DremaDynamicSystem:
                 vhacd_concavity=float(config.get_nested("digital_twin.vhacd_concavity", 0.05)),
                 ee_offset=self.tcp_offset,
                 joint_limits=self.joint_limits,
-                hand_bodies=hand_bodies
+                hand_bodies=hand_bodies,
+                **warp_kwargs
             )
-            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: MuJoCo (MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
+            print(f"[DREMA DYNAMIC SYSTEM] ✓ Submodule 2 (Digital Twin: {'MuJoCo Warp' if warp_kwargs else 'MuJoCo'} "
+                  f"(MJX: {enable_mjx}), Tracking: {tracking_mode}) initialized.")
 
         else:
-            raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported digital twin engine: '{twin_engine}' (expected 'pybullet', 'mujoco')")
+            raise ValueError(f"[DREMA DYNAMIC SYSTEM] Unsupported digital twin engine: '{twin_engine}' "
+                             f"(expected 'pybullet', 'mujoco', 'mujoco_warp')")
 
         # 2. Initialize Controller with Digital Twin reference
         ctrl_cfg = config.get_nested("controller", {})
@@ -528,7 +541,8 @@ class DremaDynamicSystem:
     def _process_initial_scene_scan(
         self,
         semantic_labels: Optional[Dict[str, int]] = None,
-        label_categories: Optional[Dict[int, str]] = None
+        label_categories: Optional[Dict[int, str]] = None,
+        object_physics: Optional[Dict[int, Dict[str, Any]]] = None
     ) -> bool:
         """Processes initial 360 scene reconstruction or restores from pre-computed cache."""
         try:
@@ -566,6 +580,10 @@ class DremaDynamicSystem:
             # Update initial 3D Gaussians in Viser
             self._update_viser_gaussians()
 
+            self.digital_twin.set_object_physics(object_physics or {})
+            if object_physics:
+                print(f"[DREMA DYNAMIC SYSTEM] Physical properties from the environment for {len(object_physics)} objects")
+
             # Load Franka Panda in Digital Twin using REAL initial joint angles
             if len(self.robot_joint_positions) > 0 and len(self.robot_base_pos) >= 3:
                 self.digital_twin.load_robot(
@@ -583,6 +601,7 @@ class DremaDynamicSystem:
                         'scan_frames': self.accumulated_scan_frames,
                         'semantic_labels': semantic_labels or {},
                         'label_categories': label_categories or {},
+                        'object_physics': object_physics or {},
                         'robot_base_pos': self.robot_base_pos,
                         'robot_joint_positions': self.robot_joint_positions,
                         'reachability_radius': self.reachability_radius
@@ -639,7 +658,8 @@ class DremaDynamicSystem:
             if obs.is_scan_finished:
                 semantic_labels = dict(obs.semantic_labels) if obs.semantic_labels else None
                 success = self._process_initial_scene_scan(semantic_labels=semantic_labels,
-                                                           label_categories=unpack_label_categories(obs))
+                                                           label_categories=unpack_label_categories(obs),
+                                                           object_physics=unpack_object_physics(obs))
                 return drema_comm_pb2.StreamStatus(
                     success=success,
                     message="Initial 360° scan processed and Digital Twin populated" if success else "Scan processing failed",
@@ -1502,6 +1522,7 @@ class DremaDynamicSystem:
                     self.accumulated_scan_frames = loaded['scan_frames']
                     sem_labels = loaded.get('semantic_labels', {})
                     categories = loaded.get('label_categories', {})
+                    physics = loaded.get('object_physics', {})
                     if 'robot_base_pos' in loaded and len(loaded['robot_base_pos']) >= 3:
                         self.robot_base_pos = np.array(loaded['robot_base_pos'], dtype=np.float32)
                     if 'robot_joint_positions' in loaded and len(loaded['robot_joint_positions']) > 0:
@@ -1510,14 +1531,15 @@ class DremaDynamicSystem:
                         self.reachability_radius = float(loaded['reachability_radius'])
                 elif isinstance(loaded, list):
                     self.accumulated_scan_frames = loaded
-                    sem_labels, categories = {}, {}
+                    sem_labels, categories, physics = {}, {}, {}
                 else:
                     return False
 
                 # Temporarily disable perception cache loading so it re-runs reconstruction algorithm
                 old_cache_enabled = self.perception.cache_enabled
                 self.perception.cache_enabled = False
-                success = self._process_initial_scene_scan(semantic_labels=sem_labels, label_categories=categories)
+                success = self._process_initial_scene_scan(semantic_labels=sem_labels, label_categories=categories,
+                                                           object_physics=physics)
                 self.perception.cache_enabled = old_cache_enabled
                 return success
             except Exception as e:
@@ -1583,8 +1605,8 @@ def parse_args():
 
     # Networking & Visualization Overrides
     parser.add_argument("--port", type=int, default=None, help="gRPC Server port (overrides config)")
-    parser.add_argument("--twin_engine", "--engine", choices=["pybullet", "mujoco", "mjx"], default=None,
-                        help="Digital Twin Physics Engine: 'pybullet' or 'mujoco'/'mjx' (overrides config)")
+    parser.add_argument("--twin_engine", "--engine", choices=["pybullet", "mujoco", "mjx", "mujoco_warp"], default=None,
+                        help="Digital Twin Physics Engine: 'pybullet', 'mujoco'/'mjx' or 'mujoco_warp' (overrides config)")
     parser.add_argument("--enable_mjx", dest="enable_mjx", action="store_true", default=None,
                         help="Enable MJX GPU-accelerated parallel rollout bridge for MuJoCo")
     parser.add_argument("--no_mjx", dest="enable_mjx", action="store_false",

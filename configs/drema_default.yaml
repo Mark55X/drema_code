@@ -154,7 +154,7 @@ robot:
 # 4. Digital Twin Engine
 # ------------------------------------------------------------------------------
 digital_twin:
-  engine: "pybullet"                 # Physics engine backend: "pybullet" or "mujoco"
+  engine: "pybullet"                 # Physics engine backend: "pybullet", "mujoco" or "mujoco_warp" (MuJoCo + batched work on MuJoCo Warp)
   enable_mjx: false                  # Enable MJX GPU-accelerated parallel rollout bridge for MuJoCo
   gui: true                          # Show native physics visualizer window (GLFW for MuJoCo, OpenGL for PyBullet)
 
@@ -171,6 +171,25 @@ digital_twin:
   obstacle_convex_decomposition: true  # Split obstacle meshes into convex parts (V-HACD) in both twins, otherwise concave shapes collide as their convex hull
   vhacd_resolution: 100000           # V-HACD voxel resolution
   vhacd_concavity: 0.05              # V-HACD max concavity per part (higher = fewer, coarser parts; 0.05 -> ~11 parts, ~5 mm error on the tunnel)
+  warp:                              # engine "mujoco_warp": present state and per-cycle queries stay on MuJoCo C
+    device: "auto"                   # Warp device ("auto": first CUDA GPU, else "cpu")
+    collision_backend: "auto"        # MPPI collision queries: "mjwarp" or "mujoco_c" ("auto": mjwarp only on a GPU)
+    contacts_per_world: 32           # Initial contact buffer per collision world (grown when exceeded)
+  imagination:                       # Physics rollouts of the mujoco_warp twin (drema/simulation/imagination.py)
+    backend: "auto"                  # "mjwarp" or "mujoco_c" (mujoco.rollout on CPU threads); "auto": mjwarp only on a GPU
+    held_object: "weld"              # Held object in the rollouts: "weld" (rigid to the hand) or "grasp" (fingers and friction)
+    grasp_force: 70.0                # [N] finger squeeze in "grasp" mode (Franka Hand continuous grasp force)
+    timestep: null                   # [s] physics step; null: the robot model's
+    cpu_threads: 4                   # Threads of the mujoco_c backend
+    nconmax_per_world: 128           # Contact buffer per world of the mjwarp backend (doubled once on overflow)
+    njmax_per_world: 1500            # Constraint rows per world of the mjwarp backend
+    default_mass: 1.0                # [kg] objects the environment sent no mass for
+    default_friction: 0.5            # Objects the environment sent no friction for
+    penetration_exclude_depth: 0.005 # [m] object pairs overlapping deeper at the start (pose errors) do not collide with each other
+    randomization:                   # Physical worlds 1..R-1 of every sample; world 0 is nominal
+      mass_scale: [0.7, 1.3]         # Uniform scale of each object's mass
+      friction_scale: [0.7, 1.3]     # Uniform scale of each object's friction
+      position_noise: 0.0            # [m] std of the initial horizontal object position noise
 
 # ------------------------------------------------------------------------------
 # 5. Controller (MP-PMPPI / Future GPU MuJoCo Rollouts)
